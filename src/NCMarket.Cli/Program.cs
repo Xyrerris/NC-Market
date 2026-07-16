@@ -50,7 +50,8 @@ async Task<int> FetchAsync()
     var planet = GetPlanet();
     var order = GetOrder();
     var limit = GetInt("limit", 20);
-    var names = await LoadNamesAsync();
+    var names = await LoadItemNamesAsync();
+    var skillNames = await LoadSkillNamesAsync();
 
     using var client = new MarketClient(planet);
     var page = await client.GetProductsPageAsync(type!.Value, limit, GetInt("offset", 0), order);
@@ -60,7 +61,16 @@ async Task<int> FetchAsync()
         : $"prime {page.ItemProducts.Count} inserzioni";
     Console.WriteLine($"Mercato {planet.Name} — {type.Value} — {totalInfo}, ordinate per '{order}':");
     Console.WriteLine();
-    PrintProducts(page.ItemProducts, names);
+
+    if (options.ContainsKey("details"))
+    {
+        PrintProductDetails(page.ItemProducts, names, skillNames);
+    }
+    else
+    {
+        PrintProducts(page.ItemProducts, names, skillNames);
+    }
+
     return 0;
 }
 
@@ -159,7 +169,7 @@ int History()
     using var db = new MarketDb(options.GetValueOrDefault("db"));
     var rows = db.GetItemHistory(itemId, planet.Name);
 
-    var names = LoadNamesAsync().GetAwaiter().GetResult();
+    var names = LoadItemNamesAsync().GetAwaiter().GetResult();
     Console.WriteLine($"Storico prezzi — {names.GetName(itemId)} (item {itemId}) su {planet.Name}:");
     Console.WriteLine();
 
@@ -203,7 +213,7 @@ int Stats()
     }
 
     var rows = db.GetSnapshotStats(snapshotId.Value, type);
-    var names = LoadNamesAsync().GetAwaiter().GetResult();
+    var names = LoadItemNamesAsync().GetAwaiter().GetResult();
 
     var scope = type is null ? "tutti gli equipaggiamenti" : type.Value.ToString();
     Console.WriteLine(
@@ -317,10 +327,13 @@ bool TryGetType(bool required, out EquipmentType? type)
     return true;
 }
 
-async Task<ItemNameProvider> LoadNamesAsync() =>
-    options.ContainsKey("no-names") ? ItemNameProvider.Empty : await ItemNameProvider.LoadAsync();
+async Task<NameProvider> LoadItemNamesAsync() =>
+    options.ContainsKey("no-names") ? NameProvider.Empty : await NameProvider.LoadItemNamesAsync();
 
-void PrintProducts(IReadOnlyList<ItemProduct> products, ItemNameProvider names)
+async Task<NameProvider> LoadSkillNamesAsync() =>
+    options.ContainsKey("no-names") ? NameProvider.Empty : await NameProvider.LoadSkillNamesAsync();
+
+void PrintProducts(IReadOnlyList<ItemProduct> products, NameProvider names, NameProvider skillNames)
 {
     if (products.Count == 0)
     {
@@ -329,8 +342,8 @@ void PrintProducts(IReadOnlyList<ItemProduct> products, ItemNameProvider names)
     }
 
     PrintTable(
-        new[] { "#", "ItemId", "Nome", "Grado", "Lv", "CP", "Opz", "Elem", "Prezzo NCG", "Skill", "Venditore" },
-        new[] { true, true, false, true, true, true, true, false, true, true, false },
+        new[] { "#", "ItemId", "Nome", "Grado", "Lv", "CP", "Opz", "Elem", "Prezzo NCG", "Statistiche", "Skill", "Venditore" },
+        new[] { true, true, false, true, true, true, true, false, true, false, false, false },
         products.Select((p, i) => new[]
         {
             (i + 1).ToString(culture),
@@ -342,9 +355,40 @@ void PrintProducts(IReadOnlyList<ItemProduct> products, ItemNameProvider names)
             p.OptionCountFromCombination.ToString(culture),
             GameEnums.ElementalTypeName(p.ElementalType),
             p.Price.ToString("N2", culture),
-            p.SkillModels.Count.ToString(culture),
+            Truncate(ProductFormat.StatsSummary(p.StatModels), 40),
+            Truncate(ProductFormat.SkillsSummary(p.SkillModels, skillNames), 36),
             p.SellerAvatarAddress.Length >= 8 ? "0x" + p.SellerAvatarAddress[..8] : p.SellerAvatarAddress,
         }).ToList());
+}
+
+void PrintProductDetails(IReadOnlyList<ItemProduct> products, NameProvider names, NameProvider skillNames)
+{
+    if (products.Count == 0)
+    {
+        Console.WriteLine("Nessuna inserzione trovata.");
+        return;
+    }
+
+    for (var i = 0; i < products.Count; i++)
+    {
+        var p = products[i];
+        Console.WriteLine(
+            $"[{i + 1}] {names.GetName(p.ItemId)} (item {p.ItemId}) — " +
+            $"grado {p.Grade}, +{p.Level}, CP {p.CombatPoint.ToString("N0", culture)}, " +
+            $"{GameEnums.ElementalTypeName(p.ElementalType)}");
+        Console.WriteLine(
+            $"    Prezzo: {p.Price.ToString("N2", culture)} NCG — " +
+            $"opzioni {p.OptionCountFromCombination}, cristalli {p.Crystal.ToString("N0", culture)}" +
+            (p.ByCustomCraft ? ", custom craft" : ""));
+        Console.WriteLine($"    Statistiche: {ProductFormat.StatsSummary(p.StatModels)}");
+        foreach (var skill in p.SkillModels)
+        {
+            Console.WriteLine($"    Skill: {ProductFormat.SkillDetail(skill, skillNames)}");
+        }
+
+        Console.WriteLine($"    Venditore: 0x{p.SellerAvatarAddress} — prodotto {p.ProductId}");
+        Console.WriteLine();
+    }
 }
 
 void PrintTable(string[] headers, bool[] rightAlign, List<string[]> rows)
@@ -389,6 +433,9 @@ void PrintHelp()
                                               crystal_per_price, crystal_per_price_desc)
                        --limit <n>           default: 20
                        --offset <n>          default: 0
+                       --details             scheda completa per inserzione: statistiche
+                                             (ATK, HP, DEF, ...) base e bonus, skill con
+                                             probabilità/potenza, cristalli, venditore
 
           snapshot   Scarica e storicizza il listino nel database SQLite
                        --types w,a,...       default: tutti e cinque i tipi
@@ -406,10 +453,11 @@ void PrintHelp()
         Opzioni comuni:
           --planet odin|heimdall   default: odin
           --db <percorso>          database SQLite (default: %LOCALAPPDATA%\NCMarket\ncmarket.db)
-          --no-names               non risolvere i nomi degli item
+          --no-names               non risolvere i nomi di item e skill
 
         Esempi:
           ncmarket fetch --type weapon --order price --limit 10
+          ncmarket fetch --type ring --order cp_desc --limit 5 --details
           ncmarket snapshot --planet odin
           ncmarket history --item 10152001
           ncmarket stats --type ring --top 20

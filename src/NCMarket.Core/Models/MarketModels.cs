@@ -102,4 +102,31 @@ public static class GameEnums
         4 => "Wind",
         _ => $"Elem{value}",
     };
+
+    /// <summary>lib9c <c>Nekoyume.Model.Skill.SkillCategory</c>.</summary>
+    public static string SkillCategoryName(int value) => value switch
+    {
+        0 => "NormalAttack",
+        1 => "BlowAttack",
+        2 => "DoubleAttack",
+        3 => "AreaAttack",
+        4 => "BuffRemovalAttack",
+        5 => "ShatterStrike",
+        6 => "Heal",
+        7 => "HPBuff",
+        8 => "AttackBuff",
+        9 => "DefenseBuff",
+        10 => "CriticalBuff",
+        11 => "HitBuff",
+        12 => "SpeedBuff",
+        13 => "DamageReductionBuff",
+        14 => "CriticalDamageBuff",
+        15 => "Buff",
+        16 => "Debuff",
+        17 => "TickDamage",
+        18 => "Focus",
+        19 => "Dispel",
+        20 => "FullBuffRemovalAttack",
+        _ => $"Skill{value}",
+    };
 }

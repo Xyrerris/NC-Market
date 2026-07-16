@@ -48,9 +48,16 @@ Note operative rilevate sul servizio in produzione:
 - pagine da 1000 elementi sono un buon compromesso (5000 richiede ~96 s e rischia
   timeout); su Odin le sole Weapon contano ~60.000 inserzioni.
 
-I prezzi sono espressi in **NCG**. I nomi degli item vengono risolti scaricando (con cache
-locale) il file `item_name.csv` dal repo ufficiale del client
-([NineChronicles/.../Localization/item_name.csv](https://github.com/planetarium/NineChronicles/blob/main/nekoyume/Assets/StreamingAssets/Localization/item_name.csv)).
+I prezzi sono espressi in **NCG**. I nomi di item e skill vengono risolti scaricando (con
+cache locale) i file `item_name.csv` e `skill_name.csv` dal repo ufficiale del client
+([NineChronicles/.../Localization](https://github.com/planetarium/NineChronicles/tree/main/nekoyume/Assets/StreamingAssets/Localization)).
+Gli id introdotti dopo l'ultimo aggiornamento dei CSV su `main` (item/skill molto recenti)
+non hanno ancora un nome e vengono mostrati come valore numerico.
+
+Ogni inserzione include le **statistiche dell'equipaggiamento**: per ogni stat (HP, ATK,
+DEF, CRI, HIT, SPD, DRV, DRR, CDMG, ...) il valore base e il bonus delle opzioni di
+crafting (`additional`), più le eventuali **skill** con categoria, elemento, probabilità,
+potenza, ratio sulla stat di riferimento, colpi e cooldown.
 
 ## Architettura
 
@@ -64,7 +71,8 @@ NC-Market/
     │   ├── EquipmentType.cs    Enum equipaggiamenti + parsing
     │   ├── Models/             DTO della risposta del market service
     │   ├── MarketClient.cs     Client HTTP con paginazione automatica
-    │   ├── ItemNameProvider.cs Risoluzione itemId -> nome (cache locale)
+    │   ├── NameProvider.cs     Risoluzione id -> nome per item e skill (cache locale)
+    │   ├── ProductFormat.cs    Formattazione statistiche e skill delle inserzioni
     │   └── MarketDb.cs         Storicizzazione su SQLite + query analitiche
     └── NCMarket.Cli/           Applicazione console
         └── Program.cs          Comandi: fetch, snapshot, snapshots, history, stats
@@ -115,8 +123,13 @@ consecutivi è quindi possibile (step futuro) dedurre vendite e cancellazioni.
 ## Comandi CLI
 
 ```powershell
-# Interrogazione live del mercato (senza salvare nulla)
+# Interrogazione live del mercato (senza salvare nulla); la tabella include
+# statistiche (base + bonus opzioni) e skill di ogni inserzione
 dotnet run --project src/NCMarket.Cli -- fetch --type weapon --order price --limit 20
+
+# Scheda completa per inserzione: tutte le statistiche e il dettaglio delle skill
+# (categoria, elemento, probabilità, potenza, cooldown)
+dotnet run --project src/NCMarket.Cli -- fetch --type ring --order cp_desc --limit 5 --details
 
 # Storicizza il listino completo dei 5 equipaggiamenti su Odin
 dotnet run --project src/NCMarket.Cli -- snapshot
@@ -135,7 +148,7 @@ dotnet run --project src/NCMarket.Cli -- stats --type weapon
 ```
 
 Opzioni comuni: `--planet odin|heimdall` (default `odin`), `--db <percorso>` per il
-database, `--no-names` per saltare la risoluzione dei nomi.
+database, `--no-names` per saltare la risoluzione dei nomi di item e skill.
 
 ## Piano di sviluppo
 
@@ -146,6 +159,8 @@ database, `--no-names` per saltare la risoluzione dei nomi.
 3. **Storicizzazione** ✅ — `MarketDb` con snapshot immutabili su SQLite.
 4. **CLI** ✅ — comandi `fetch`, `snapshot`, `snapshots`, `history`, `stats`.
 5. **Risoluzione nomi item** ✅ — cache di `item_name.csv` (TTL 7 giorni).
+6. **Statistiche equipaggiamento** ✅ — stat (ATK, HP, DEF, ...) e skill di ogni
+   inserzione nella tabella `fetch`, vista `--details`, nomi skill da `skill_name.csv`.
 
 ### Step 2 — Automazione e arricchimento (prossimi sviluppi)
 - **Raccolta schedulata**: esecuzione periodica di `snapshot` (Task Scheduler di Windows
