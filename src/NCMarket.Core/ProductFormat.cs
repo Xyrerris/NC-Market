@@ -10,6 +10,45 @@ namespace NCMarket.Core;
 public static class ProductFormat
 {
     /// <summary>
+    /// Display name of a listed item. Ids missing from the localization CSV (items newer
+    /// than the last update of the file on GitHub) fall back to the series names used by
+    /// the game — "Valkyrie …" for grade 7, "Transcendent …" for grade 8 — and to the
+    /// numeric id otherwise. With an empty provider (<c>--no-names</c>, offline without
+    /// cache) ids stay numeric.
+    /// </summary>
+    public static string ItemDisplayName(int itemId, int grade, int itemSubType, NameProvider itemNames)
+    {
+        if (itemNames.TryGetName(itemId, out var name))
+        {
+            return name;
+        }
+
+        var id = itemId.ToString(CultureInfo.InvariantCulture);
+        if (itemNames.Count == 0)
+        {
+            return id;
+        }
+
+        var series = grade switch
+        {
+            7 => "Valkyrie",
+            8 => "Transcendent",
+            _ => null,
+        };
+        var equipment = (EquipmentType)itemSubType switch
+        {
+            EquipmentType.Weapon => "Sword",
+            EquipmentType.Armor => "Armor",
+            EquipmentType.Belt => "Belt",
+            EquipmentType.Necklace => "Necklace",
+            EquipmentType.Ring => "Ring",
+            _ => null,
+        };
+
+        return series is not null && equipment is not null ? $"{series} {equipment}" : id;
+    }
+
+    /// <summary>
     /// One-line stat summary, e.g. <c>"ATK 39548 (+1974) · SPD +820"</c>. Base and
     /// additional (crafting option) values of the same stat are merged into one entry:
     /// the base value first, the additional bonus in parentheses.

@@ -211,6 +211,8 @@ public sealed class MarketDb : IDisposable
         return result;
     }
 
+    public SnapshotInfo? GetSnapshot(long id) => GetSnapshots().FirstOrDefault(s => s.Id == id);
+
     public long? GetLatestSnapshotId(string planet)
     {
         using var cmd = _conn.CreateCommand();
@@ -286,6 +288,70 @@ public sealed class MarketDb : IDisposable
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Reads back the full listings of a snapshot (stats and skills included),
+    /// optionally filtered by equipment type.
+    /// </summary>
+    public IReadOnlyList<ItemProduct> GetSnapshotProducts(long snapshotId, EquipmentType? type = null)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT product_id, item_sub_type, item_id, icon_id, grade, level, combat_point,
+                   elemental_type, price, quantity, unit_price, crystal, crystal_per_price,
+                   option_count, by_custom_craft, seller_agent, seller_avatar,
+                   registered_block_index, legacy, stats_json, skills_json
+            FROM products
+            WHERE snapshot_id = $snapshotId
+              AND ($subType IS NULL OR item_sub_type = $subType)
+            ORDER BY item_sub_type, item_id, unit_price;
+            """;
+        cmd.Parameters.AddWithValue("$snapshotId", snapshotId);
+        cmd.Parameters.AddWithValue("$subType", type is null ? DBNull.Value : (int)type.Value);
+
+        var result = new List<ItemProduct>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            result.Add(new ItemProduct
+            {
+                ProductId = Guid.Parse(reader.GetString(0)),
+                ItemSubType = reader.GetInt32(1),
+                ItemId = reader.GetInt32(2),
+                IconId = reader.GetInt32(3),
+                Grade = reader.GetInt32(4),
+                Level = reader.GetInt32(5),
+                CombatPoint = reader.GetInt32(6),
+                ElementalType = reader.GetInt32(7),
+                Price = (decimal)reader.GetDouble(8),
+                Quantity = (decimal)reader.GetDouble(9),
+                UnitPrice = (decimal)reader.GetDouble(10),
+                Crystal = reader.GetInt64(11),
+                CrystalPerPrice = reader.GetInt64(12),
+                OptionCountFromCombination = reader.GetInt32(13),
+                ByCustomCraft = reader.GetInt32(14) != 0,
+                SellerAgentAddress = reader.IsDBNull(15) ? "" : reader.GetString(15),
+                SellerAvatarAddress = reader.IsDBNull(16) ? "" : reader.GetString(16),
+                RegisteredBlockIndex = reader.GetInt64(17),
+                Legacy = reader.GetInt32(18) != 0,
+                StatModels = DeserializeOrEmpty<StatModel>(reader, 19),
+                SkillModels = DeserializeOrEmpty<SkillModel>(reader, 20),
+            });
+        }
+
+        return result;
+    }
+
+    private static List<T> DeserializeOrEmpty<T>(SqliteDataReader reader, int ordinal)
+    {
+        if (reader.IsDBNull(ordinal))
+        {
+            return new List<T>();
+        }
+
+        return JsonSerializer.Deserialize<List<T>>(reader.GetString(ordinal), JsonOptions)
+               ?? new List<T>();
     }
 
     private static DateTime ParseUtc(string iso) =>

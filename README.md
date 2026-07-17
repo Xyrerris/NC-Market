@@ -52,7 +52,9 @@ I prezzi sono espressi in **NCG**. I nomi di item e skill vengono risolti scaric
 cache locale) i file `item_name.csv` e `skill_name.csv` dal repo ufficiale del client
 ([NineChronicles/.../Localization](https://github.com/planetarium/NineChronicles/tree/main/nekoyume/Assets/StreamingAssets/Localization)).
 Gli id introdotti dopo l'ultimo aggiornamento dei CSV su `main` (item/skill molto recenti)
-non hanno ancora un nome e vengono mostrati come valore numerico.
+non hanno ancora un nome: per gli **item** si usa il nome della serie dedotto dalla rarità
+— grado 7 = "Valkyrie …", grado 8 = "Transcendent …" (es. "Transcendent Sword" per una
+weapon di grado 8) — mentre le **skill** restano con l'id numerico.
 
 Ogni inserzione include le **statistiche dell'equipaggiamento**: per ogni stat (HP, ATK,
 DEF, CRI, HIT, SPD, DRV, DRR, CDMG, ...) il valore base e il bonus delle opzioni di
@@ -73,9 +75,10 @@ NC-Market/
     │   ├── MarketClient.cs     Client HTTP con paginazione automatica
     │   ├── NameProvider.cs     Risoluzione id -> nome per item e skill (cache locale)
     │   ├── ProductFormat.cs    Formattazione statistiche e skill delle inserzioni
+    │   ├── SnapshotCsvExporter.cs  Export CSV flat di uno snapshot
     │   └── MarketDb.cs         Storicizzazione su SQLite + query analitiche
     └── NCMarket.Cli/           Applicazione console
-        └── Program.cs          Comandi: fetch, snapshot, snapshots, history, stats
+        └── Program.cs          Comandi: fetch, snapshot, snapshots, history, stats, export
 ```
 
 Scelte progettuali:
@@ -145,7 +148,16 @@ dotnet run --project src/NCMarket.Cli -- history --item 10152001
 
 # Statistiche aggregate per item sull'ultimo snapshot
 dotnet run --project src/NCMarket.Cli -- stats --type weapon
+
+# Export CSV "flat" di uno snapshot: una riga per inserzione, statistiche in colonne
+# <stat>_base/<stat>_bonus (hp, atk, def, cri, hit, spd, drv, drr, cdmg, armorpen,
+# thorn) e skill in colonne skill1_*/skill2_* (id, nome, categoria, elemento,
+# probabilità, potenza, ratio, colpi, cooldown)
+dotnet run --project src/NCMarket.Cli -- export                       # ultimo snapshot
+dotnet run --project src/NCMarket.Cli -- export --snapshot 2 --type weapon --sep ";"
 ```
+
+Per aprire il CSV con Excel in italiano usare `--sep ";"`; il file è UTF-8 con BOM.
 
 Opzioni comuni: `--planet odin|heimdall` (default `odin`), `--db <percorso>` per il
 database, `--no-names` per saltare la risoluzione dei nomi di item e skill.
@@ -161,6 +173,8 @@ database, `--no-names` per saltare la risoluzione dei nomi di item e skill.
 5. **Risoluzione nomi item** ✅ — cache di `item_name.csv` (TTL 7 giorni).
 6. **Statistiche equipaggiamento** ✅ — stat (ATK, HP, DEF, ...) e skill di ogni
    inserzione nella tabella `fetch`, vista `--details`, nomi skill da `skill_name.csv`.
+7. **Export CSV flat** ✅ — comando `export`: uno snapshot in CSV con statistiche e
+   skill appiattite in colonne, pronto per Excel/analisi.
 
 ### Step 2 — Automazione e arricchimento (prossimi sviluppi)
 - **Raccolta schedulata**: esecuzione periodica di `snapshot` (Task Scheduler di Windows
@@ -174,7 +188,8 @@ database, `--no-names` per saltare la risoluzione dei nomi di item e skill.
 - **Motore di pricing**: prezzo equo stimato per item/level/opzioni sulla base della
   serie storica (mediane mobili, percentili per grade/CP).
 - **Segnalazione occasioni**: inserzioni sotto la valutazione stimata.
-- **Reportistica**: export CSV/Excel e dashboard (es. grafici andamento prezzi).
+- **Reportistica**: dashboard e grafici andamento prezzi (l'export CSV è già disponibile
+  con il comando `export`).
 
 ## Requisiti
 

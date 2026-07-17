@@ -24,6 +24,7 @@ try
         "snapshots" => ListSnapshots(),
         "history" => History(),
         "stats" => Stats(),
+        "export" => await ExportAsync(),
         _ => Unknown(),
     };
 }
@@ -227,7 +228,7 @@ int Stats()
         rows.Take(top).Select(r => new[]
         {
             r.ItemId.ToString(culture),
-            Truncate(names.GetName(r.ItemId), 28),
+            Truncate(ProductFormat.ItemDisplayName(r.ItemId, r.Grade, r.ItemSubType, names), 28),
             ((EquipmentType)r.ItemSubType).ToString(),
             r.Grade.ToString(culture),
             r.Listings.ToString("N0", culture),
@@ -237,6 +238,73 @@ int Stats()
             r.MaxCombatPoint.ToString("N0", culture),
             r.MaxLevel.ToString(culture),
         }).ToList());
+    return 0;
+}
+
+async Task<int> ExportAsync()
+{
+    if (!TryGetType(required: false, out var type))
+    {
+        return 2;
+    }
+
+    var separator = options.GetValueOrDefault("sep", ",").ToLowerInvariant() switch
+    {
+        "," => ',',
+        ";" => ';',
+        "tab" => '\t',
+        var s => throw new ArgumentException($"Separatore non valido: '{s}'. Usa ',', ';' o 'tab'."),
+    };
+
+    using var db = new MarketDb(options.GetValueOrDefault("db"));
+
+    SnapshotInfo? snapshot;
+    if (options.TryGetValue("snapshot", out var snapshotRaw))
+    {
+        if (!long.TryParse(snapshotRaw, NumberStyles.Integer, culture, out var snapshotId))
+        {
+            Console.Error.WriteLine($"Id snapshot non valido: '{snapshotRaw}'.");
+            return 2;
+        }
+
+        snapshot = db.GetSnapshot(snapshotId);
+        if (snapshot is null)
+        {
+            Console.Error.WriteLine($"Snapshot #{snapshotId} non trovato. Usa 'snapshots' per l'elenco.");
+            return 2;
+        }
+    }
+    else
+    {
+        var planet = GetPlanet();
+        var latest = db.GetLatestSnapshotId(planet.Name);
+        if (latest is null)
+        {
+            Console.WriteLine($"Nessuno snapshot per {planet.Name}. Esegui prima 'snapshot'.");
+            return 0;
+        }
+
+        snapshot = db.GetSnapshot(latest.Value)!;
+    }
+
+    var products = db.GetSnapshotProducts(snapshot.Id, type);
+    var itemNames = await LoadItemNamesAsync();
+    var skillNames = await LoadSkillNamesAsync();
+
+    var defaultName = $"ncmarket-{snapshot.Planet}-s{snapshot.Id}" +
+                      (type is null ? "" : $"-{type.Value.ToString().ToLowerInvariant()}") + ".csv";
+    var outPath = options.GetValueOrDefault("out", defaultName);
+
+    // UTF-8 with BOM so Excel detects the encoding (accented item names).
+    await using (var writer = new StreamWriter(outPath, append: false, new UTF8Encoding(true)))
+    {
+        SnapshotCsvExporter.Write(writer, snapshot, products, itemNames, skillNames, separator);
+    }
+
+    var scope = type is null ? "tutti gli equipaggiamenti" : type.Value.ToString();
+    Console.WriteLine(
+        $"Esportate {products.Count} inserzioni (snapshot #{snapshot.Id}, {snapshot.Planet}, {scope}) " +
+        $"in {Path.GetFullPath(outPath)}");
     return 0;
 }
 
@@ -348,7 +416,7 @@ void PrintProducts(IReadOnlyList<ItemProduct> products, NameProvider names, Name
         {
             (i + 1).ToString(culture),
             p.ItemId.ToString(culture),
-            Truncate(names.GetName(p.ItemId), 28),
+            Truncate(ProductFormat.ItemDisplayName(p.ItemId, p.Grade, p.ItemSubType, names), 28),
             p.Grade.ToString(culture),
             p.Level.ToString(culture),
             p.CombatPoint.ToString("N0", culture),
@@ -373,7 +441,7 @@ void PrintProductDetails(IReadOnlyList<ItemProduct> products, NameProvider names
     {
         var p = products[i];
         Console.WriteLine(
-            $"[{i + 1}] {names.GetName(p.ItemId)} (item {p.ItemId}) — " +
+            $"[{i + 1}] {ProductFormat.ItemDisplayName(p.ItemId, p.Grade, p.ItemSubType, names)} (item {p.ItemId}) — " +
             $"grado {p.Grade}, +{p.Level}, CP {p.CombatPoint.ToString("N0", culture)}, " +
             $"{GameEnums.ElementalTypeName(p.ElementalType)}");
         Console.WriteLine(
@@ -450,6 +518,15 @@ void PrintHelp()
                        --type <tipo>         filtro opzionale
                        --top <n>             default: 30
 
+          export     Esporta uno snapshot in CSV flat: una riga per inserzione,
+                     statistiche in colonne <stat>_base/<stat>_bonus e skill in
+                     colonne skill1_*/skill2_*
+                       --snapshot <id>       default: ultimo snapshot del pianeta
+                       --type <tipo>         filtro opzionale
+                       --out <file>          default: ncmarket-<pianeta>-s<id>[-tipo].csv
+                       --sep ,|;|tab         separatore CSV (default: ','; per Excel
+                                             in italiano usare ';')
+
         Opzioni comuni:
           --planet odin|heimdall   default: odin
           --db <percorso>          database SQLite (default: %LOCALAPPDATA%\NCMarket\ncmarket.db)
@@ -461,5 +538,7 @@ void PrintHelp()
           ncmarket snapshot --planet odin
           ncmarket history --item 10152001
           ncmarket stats --type ring --top 20
+          ncmarket export --type weapon --sep ;
+          ncmarket export --snapshot 2 --out listino.csv
         """);
 }
