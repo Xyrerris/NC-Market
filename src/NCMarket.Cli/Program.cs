@@ -24,6 +24,7 @@ try
         "snapshots" => ListSnapshots(),
         "history" => History(),
         "stats" => Stats(),
+        "deals" => await DealsAsync(),
         "export" => await ExportAsync(),
         _ => Unknown(),
     };
@@ -237,6 +238,110 @@ int Stats()
             r.MaxPrice.ToString("N2", culture),
             r.MaxCombatPoint.ToString("N0", culture),
             r.MaxLevel.ToString(culture),
+        }).ToList());
+    return 0;
+}
+
+async Task<int> DealsAsync()
+{
+    if (!TryGetType(required: false, out var type))
+    {
+        return 2;
+    }
+
+    var planet = GetPlanet();
+    var discount = GetInt("discount", 25);
+    var minSamples = GetInt("min-samples", 5);
+    var days = GetInt("days", 0);
+    var sinceUtc = days > 0 ? DateTime.UtcNow.AddDays(-days) : (DateTime?)null;
+    var top = GetInt("top", 30);
+    var maxPerType = options.TryGetValue("max-per-type", out var maxRaw)
+        ? int.Parse(maxRaw, culture)
+        : (int?)null;
+
+    using var db = new MarketDb(options.GetValueOrDefault("db"));
+    var baselines = db.GetPriceBaselines(planet.Name, type, sinceUtc);
+    if (baselines.Count == 0)
+    {
+        Console.WriteLine($"Nessuno storico prezzi per {planet.Name}. Esegui prima 'snapshot'.");
+        return 0;
+    }
+
+    List<ItemProduct> current;
+    if (options.ContainsKey("from-snapshot"))
+    {
+        var snapshotId = db.GetLatestSnapshotId(planet.Name);
+        if (snapshotId is null)
+        {
+            Console.WriteLine($"Nessuno snapshot per {planet.Name}. Esegui prima 'snapshot'.");
+            return 0;
+        }
+
+        current = db.GetSnapshotProducts(snapshotId.Value, type).ToList();
+        Console.WriteLine($"Offerte correnti: snapshot #{snapshotId} ({planet.Name})");
+    }
+    else
+    {
+        var types = type is null ? EquipmentTypes.All : new[] { type.Value };
+        using var client = new MarketClient(planet);
+        current = new List<ItemProduct>();
+        Console.WriteLine($"Offerte correnti: mercato live ({planet.Name})");
+        foreach (var t in types)
+        {
+            Console.Write($"  {t,-9}: recupero...");
+            var products = await client.GetAllProductsAsync(
+                t,
+                maxItems: maxPerType,
+                progress: (done, total) => Console.Write(
+                    $"\r  {t,-9}: {done}{(total > 0 ? "/" + total : "")} scaricate...      "));
+            current.AddRange(products);
+            Console.WriteLine($"\r  {t,-9}: {products.Count} inserzioni      ");
+        }
+    }
+
+    var deals = DealFinder.FindDeals(current, baselines, discount, minSamples);
+    Console.WriteLine();
+    if (deals.Count == 0)
+    {
+        Console.WriteLine("Nessuna occasione trovata con i criteri correnti.");
+        return 0;
+    }
+
+    var names = await LoadItemNamesAsync();
+    var window = days > 0 ? $", ultimi {days} giorni" : "";
+    Console.WriteLine(
+        $"Occasioni su {planet.Name} — sconto ≥ {discount}% sulla mediana storica del " +
+        $"rapporto prezzo/CP per item+livello (campioni ≥ {minSamples}{window}) — " +
+        $"prime {Math.Min(top, deals.Count)} di {deals.Count}:");
+    Console.WriteLine();
+
+    // Price/CP ratios are tiny (often < 1e-4): the inverse CP-per-NCG is shown
+    // instead, matching the market service's own crystal_per_price convention.
+    PrintTable(
+        new[]
+        {
+            "#", "ItemId", "Nome", "Tipo", "Lv", "CP", "Prezzo NCG",
+            "CP/NCG", "Med CP/NCG", "Sconto%", "Sconto prezzo%", "Camp.",
+        },
+        new[] { true, true, false, false, true, true, true, true, true, true, true, true },
+        deals.Take(top).Select((d, i) => new[]
+        {
+            (i + 1).ToString(culture),
+            d.Product.ItemId.ToString(culture),
+            Truncate(
+                ProductFormat.ItemDisplayName(
+                    d.Product.ItemId, d.Product.Grade, d.Product.ItemSubType, names), 28),
+            ((EquipmentType)d.Product.ItemSubType).ToString(),
+            d.Product.Level.ToString(culture),
+            d.Product.CombatPoint.ToString("N0", culture),
+            d.Product.Price.ToString("N2", culture),
+            d.PricePerCp is double ppc ? (1 / ppc).ToString("N0", culture) : "-",
+            d.UsedCpMetric
+                ? (1 / d.Baseline.MedianPricePerCp!.Value).ToString("N0", culture)
+                : "-",
+            d.DiscountPercent.ToString("N1", culture),
+            d.PriceDiscountPercent.ToString("N1", culture),
+            d.Baseline.Samples.ToString("N0", culture),
         }).ToList());
     return 0;
 }
@@ -518,6 +623,16 @@ void PrintHelp()
                        --type <tipo>         filtro opzionale
                        --top <n>             default: 30
 
+          deals      Occasioni: inserzioni correnti sotto la mediana storica del
+                     database (metrica primaria: NCG per punto CP, per item+livello)
+                       --type <tipo>         filtro opzionale (default: tutti i tipi)
+                       --discount <pct>      sconto minimo percentuale, default: 25
+                       --min-samples <n>     inserzioni storiche minime per confronto, default: 5
+                       --days <n>            finestra storica in giorni (default: tutto lo storico)
+                       --from-snapshot       confronta l'ultimo snapshot invece del mercato live
+                       --max-per-type <n>    limite prodotti per tipo (solo live)
+                       --top <n>             default: 30
+
           export     Esporta uno snapshot in CSV flat: una riga per inserzione,
                      statistiche in colonne <stat>_base/<stat>_bonus e skill in
                      colonne skill1_*/skill2_*
@@ -538,6 +653,8 @@ void PrintHelp()
           ncmarket snapshot --planet odin
           ncmarket history --item 10152001
           ncmarket stats --type ring --top 20
+          ncmarket deals --discount 30
+          ncmarket deals --type ring --from-snapshot --min-samples 3
           ncmarket export --type weapon --sep ;
           ncmarket export --snapshot 2 --out listino.csv
         """);
