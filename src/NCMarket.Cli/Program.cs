@@ -342,7 +342,7 @@ Dictionary<string, string> ParseOptions(string[] rest)
 
 Planet GetPlanet()
 {
-    var name = options.GetValueOrDefault("planet", "odin");
+    var name = options.GetValueOrDefault("planet", Planet.Default.Name);
     if (!Planet.TryGet(name, out var planet))
     {
         throw new ArgumentException(
@@ -528,7 +528,7 @@ void PrintHelp()
                                              in italiano usare ';')
 
         Opzioni comuni:
-          --planet odin|heimdall   default: odin
+          --planet odin|heimdall   default: heimdall
           --db <percorso>          database SQLite (default: %LOCALAPPDATA%\NCMarket\ncmarket.db)
           --no-names               non risolvere i nomi di item e skill
 

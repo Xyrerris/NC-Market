@@ -12,6 +12,9 @@ public sealed record Planet(string Name, string MarketBaseUrl)
 
     public static readonly Planet[] All = { Odin, Heimdall };
 
+    /// <summary>Planet used when none is specified on the command line.</summary>
+    public static readonly Planet Default = Heimdall;
+
     public static bool TryGet(string name, out Planet planet)
     {
         foreach (var p in All)

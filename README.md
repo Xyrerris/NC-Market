@@ -14,8 +14,8 @@ sono:
 
 | Pianeta | Endpoint |
 |---|---|
+| Heimdall (pianeta di default) | `https://b.9capi.com/marketProviderHeimdall` |
 | Odin (mainnet principale) | `https://b.9capi.com/marketProviderOdin` |
-| Heimdall | `https://b.9capi.com/marketProviderHeimdall` |
 
 Rotta principale utilizzata:
 
@@ -69,7 +69,7 @@ NC-Market/
 ├── README.md
 └── src/
     ├── NCMarket.Core/          Libreria riusabile
-    │   ├── Planet.cs           Registro pianeti/endpoint (Odin, Heimdall)
+    │   ├── Planet.cs           Registro pianeti/endpoint (Odin, Heimdall; default Heimdall)
     │   ├── EquipmentType.cs    Enum equipaggiamenti + parsing
     │   ├── Models/             DTO della risposta del market service
     │   ├── MarketClient.cs     Client HTTP con paginazione automatica
@@ -134,11 +134,11 @@ dotnet run --project src/NCMarket.Cli -- fetch --type weapon --order price --lim
 # (categoria, elemento, probabilità, potenza, cooldown)
 dotnet run --project src/NCMarket.Cli -- fetch --type ring --order cp_desc --limit 5 --details
 
-# Storicizza il listino completo dei 5 equipaggiamenti su Odin
+# Storicizza il listino completo dei 5 equipaggiamenti su Heimdall (pianeta di default)
 dotnet run --project src/NCMarket.Cli -- snapshot
 
-# Solo alcuni tipi, su Heimdall, limitando i prodotti per tipo
-dotnet run --project src/NCMarket.Cli -- snapshot --types weapon,ring --planet heimdall --max-per-type 500
+# Solo alcuni tipi, su Odin, limitando i prodotti per tipo
+dotnet run --project src/NCMarket.Cli -- snapshot --types weapon,ring --planet odin --max-per-type 500
 
 # Elenco degli snapshot salvati
 dotnet run --project src/NCMarket.Cli -- snapshots
@@ -159,7 +159,7 @@ dotnet run --project src/NCMarket.Cli -- export --snapshot 2 --type weapon --sep
 
 Per aprire il CSV con Excel in italiano usare `--sep ";"`; il file è UTF-8 con BOM.
 
-Opzioni comuni: `--planet odin|heimdall` (default `odin`), `--db <percorso>` per il
+Opzioni comuni: `--planet odin|heimdall` (default `heimdall`), `--db <percorso>` per il
 database, `--no-names` per saltare la risoluzione dei nomi di item e skill.
 
 ## Piano di sviluppo
