@@ -17,6 +17,16 @@ public sealed record ItemStatsRow(
     double MinPrice, double AvgPrice, double MaxPrice, int MaxCombatPoint, int MaxLevel);
 
 /// <summary>
+/// Historical price baseline for a bucket of comparable listings (same item_id and
+/// level): median price and median price-per-CP over the distinct listings observed
+/// across snapshots. <see cref="MedianPricePerCp"/> is null when no sample in the
+/// bucket has a positive combat point (<see cref="CpSamples"/> is 0).
+/// </summary>
+public sealed record PriceBaseline(
+    int ItemId, int Level, int Samples, double MedianPrice,
+    int CpSamples, double? MedianPricePerCp);
+
+/// <summary>
 /// SQLite storage for market snapshots. Each snapshot is an immutable copy of the
 /// listings observed at a given time; analyses compare snapshots over time.
 /// </summary>
@@ -341,6 +351,76 @@ public sealed class MarketDb : IDisposable
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Per-(item_id, level) historical price baselines over the snapshots of a planet.
+    /// Each listing (product_id) is counted once even when it persists across several
+    /// snapshots, so stale listings do not dominate the medians. Rows with a
+    /// non-positive combat point contribute to the price median only. Listings from
+    /// the latest snapshot are part of the baseline as well; with a reasonable
+    /// minimum sample size their effect on the median is negligible.
+    /// </summary>
+    public IReadOnlyDictionary<(int ItemId, int Level), PriceBaseline> GetPriceBaselines(
+        string planet, EquipmentType? type = null, DateTime? sinceUtc = null)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT DISTINCT p.product_id, p.item_id, p.level, p.price, p.combat_point
+            FROM products p
+            JOIN snapshots s ON s.id = p.snapshot_id
+            WHERE s.planet = $planet
+              AND ($subType IS NULL OR p.item_sub_type = $subType)
+              AND ($since IS NULL OR s.taken_at_utc >= $since);
+            """;
+        cmd.Parameters.AddWithValue("$planet", planet);
+        cmd.Parameters.AddWithValue("$subType", type is null ? DBNull.Value : (int)type.Value);
+        cmd.Parameters.AddWithValue(
+            "$since",
+            sinceUtc is null
+                ? DBNull.Value
+                : sinceUtc.Value.ToString("O", CultureInfo.InvariantCulture));
+
+        var buckets = new Dictionary<(int ItemId, int Level), (List<double> Prices, List<double> PricesPerCp)>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            var key = (reader.GetInt32(1), reader.GetInt32(2));
+            var price = reader.GetDouble(3);
+            var combatPoint = reader.GetInt32(4);
+            if (!buckets.TryGetValue(key, out var bucket))
+            {
+                bucket = (new List<double>(), new List<double>());
+                buckets[key] = bucket;
+            }
+
+            bucket.Prices.Add(price);
+            if (combatPoint > 0)
+            {
+                bucket.PricesPerCp.Add(price / combatPoint);
+            }
+        }
+
+        var result = new Dictionary<(int ItemId, int Level), PriceBaseline>(buckets.Count);
+        foreach (var ((itemId, level), (prices, pricesPerCp)) in buckets)
+        {
+            result[(itemId, level)] = new PriceBaseline(
+                itemId,
+                level,
+                prices.Count,
+                Median(prices),
+                pricesPerCp.Count,
+                pricesPerCp.Count > 0 ? Median(pricesPerCp) : null);
+        }
+
+        return result;
+    }
+
+    private static double Median(List<double> values)
+    {
+        values.Sort();
+        var n = values.Count;
+        return n % 2 == 1 ? values[n / 2] : (values[n / 2 - 1] + values[n / 2]) / 2.0;
     }
 
     private static List<T> DeserializeOrEmpty<T>(SqliteDataReader reader, int ordinal)
