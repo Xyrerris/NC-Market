@@ -1,0 +1,4 @@
+#!/bin/sh
+# Wrapper della CLI, per poter scrivere `ncmarket snapshot` invece di
+# `dotnet /app/NCMarket.Cli.dll snapshot`.
+exec dotnet /app/NCMarket.Cli.dll "$@"

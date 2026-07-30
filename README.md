@@ -177,6 +177,41 @@ Per aprire il CSV con Excel in italiano usare `--sep ";"`; il file è UTF-8 con 
 Opzioni comuni: `--planet odin|heimdall` (default `heimdall`), `--db <percorso>` per il
 database, `--no-names` per saltare la risoluzione dei nomi di item e skill.
 
+## Deploy su server (Docker + Coolify)
+
+Il repository contiene un `Dockerfile` multi-stage (build con l'SDK .NET 9, runtime su
+`mcr.microsoft.com/dotnet/runtime:9.0`) pensato per far girare gli snapshot periodici su un
+server, tipicamente tramite [Coolify](https://coolify.io/).
+
+Punti chiave:
+
+- l'immagine imposta `XDG_DATA_HOME=/data`: su Linux .NET risolve `LocalApplicationData`
+  con quella variabile, quindi database e cache dei nomi item/skill finiscono in
+  `/data/NCMarket` senza bisogno di passare `--db`. **Montare un volume persistente su
+  `/data`**, altrimenti i dati si perdono a ogni redeploy;
+- comando di default `idle`: il container resta vivo senza fare nulla, in attesa che lo
+  scheduler (Scheduled Task di Coolify) esegua i comandi al suo interno. Qualsiasi altro
+  argomento viene passato alla CLI, quindi `docker run <immagine> snapshot --planet odin`
+  funziona anche in esecuzione one-shot;
+- lo script `docker/snapshot-job` è il job da schedulare: esegue `snapshot` e, se
+  `NCMARKET_EXPORT=1`, anche l'`export` CSV in `/data/NCMarket/exports`. Esce con codice
+  diverso da zero in caso di errore, così lo scheduler può notificare il fallimento.
+
+```bash
+# build ed esecuzione one-shot in locale
+docker build -t ncmarket .
+docker run --rm -v ncmarket-data:/data ncmarket snapshot --planet heimdall
+docker run --rm -v ncmarket-data:/data ncmarket snapshots
+```
+
+Configurazione su Coolify: risorsa *Application* con build pack `Dockerfile`, nessun FQDN,
+health check disabilitato (non è un servizio web), storage persistente montato su `/data`,
+variabili `NCMARKET_PLANET` e `NCMARKET_EXPORT`, e uno *Scheduled Task* con comando
+`snapshot-job` alla frequenza desiderata (es. `0 */6 * * *`).
+
+Ogni snapshot salva l'intero listino: su Heimdall sono circa 10-20 MB di database per
+esecuzione, da tenere presente nel dimensionamento del disco e nella scelta della frequenza.
+
 ## Piano di sviluppo
 
 ### Step 1 — Fondamenta (questo repository)
@@ -192,8 +227,9 @@ database, `--no-names` per saltare la risoluzione dei nomi di item e skill.
    skill appiattite in colonne, pronto per Excel/analisi.
 
 ### Step 2 — Automazione e arricchimento (prossimi sviluppi)
-- **Raccolta schedulata**: esecuzione periodica di `snapshot` (Task Scheduler di Windows
-  o servizio worker .NET) per costruire una serie storica fitta.
+- **Raccolta schedulata** ✅ — immagine Docker e job `snapshot-job` per l'esecuzione
+  periodica di `snapshot` su server (vedi *Deploy su server*); manca un comando di
+  retention (`prune`) per limitare la crescita del database.
 - **Rilevazione vendite**: confronto tra snapshot consecutivi per distinguere item
   venduti da item ritirati (incrocio con le transazioni `BuyProduct` via 9cscan/mimir).
 - **Filtri avanzati**: il servizio supporta anche `stat`, `itemIds[]`, `iconIds[]`,
