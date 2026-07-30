@@ -160,6 +160,10 @@ dotnet run --project src/NCMarket.Cli -- deals --discount 30
 # Occasioni sull'ultimo snapshot (senza download live), con soglie personalizzate
 dotnet run --project src/NCMarket.Cli -- deals --type ring --from-snapshot --min-samples 3 --days 14
 
+# Solo le rarità indicate (numero 1-8 o nome lib9c: normal, rare, epic, unique,
+# legendary, divinity, mythic, transcendent)
+dotnet run --project src/NCMarket.Cli -- deals --grade legendary,mythic
+
 # Export CSV "flat" di uno snapshot: una riga per inserzione, statistiche in colonne
 # <stat>_base/<stat>_bonus (hp, atk, def, cri, hit, spd, drv, drr, cdmg, armorpen,
 # thorn) e skill in colonne skill1_*/skill2_* (id, nome, categoria, elemento,

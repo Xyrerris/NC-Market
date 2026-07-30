@@ -259,6 +259,24 @@ async Task<int> DealsAsync()
         ? int.Parse(maxRaw, culture)
         : (int?)null;
 
+    HashSet<int>? grades = null;
+    if (options.TryGetValue("grade", out var gradesRaw))
+    {
+        grades = new HashSet<int>();
+        foreach (var token in gradesRaw.Split(',', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (!Grades.TryParse(token, out var grade))
+            {
+                Console.Error.WriteLine(
+                    $"Rarità non valida: '{token}'. Valori ammessi: 1-8 oppure " +
+                    "normal, rare, epic, unique, legendary, divinity, mythic, transcendent.");
+                return 2;
+            }
+
+            grades.Add((int)grade);
+        }
+    }
+
     using var db = new MarketDb(options.GetValueOrDefault("db"));
     var baselines = db.GetPriceBaselines(planet.Name, type, sinceUtc);
     if (baselines.Count == 0)
@@ -299,6 +317,11 @@ async Task<int> DealsAsync()
         }
     }
 
+    if (grades is not null)
+    {
+        current = current.Where(p => grades.Contains(p.Grade)).ToList();
+    }
+
     var deals = DealFinder.FindDeals(current, baselines, discount, minSamples);
     Console.WriteLine();
     if (deals.Count == 0)
@@ -309,9 +332,12 @@ async Task<int> DealsAsync()
 
     var names = await LoadItemNamesAsync();
     var window = days > 0 ? $", ultimi {days} giorni" : "";
+    var gradeScope = grades is null
+        ? ""
+        : ", rarità " + string.Join(",", grades.OrderBy(g => g).Select(g => (Grade)g));
     Console.WriteLine(
         $"Occasioni su {planet.Name} — sconto ≥ {discount}% sulla mediana storica del " +
-        $"rapporto prezzo/CP per item+livello (campioni ≥ {minSamples}{window}) — " +
+        $"rapporto prezzo/CP per item+livello (campioni ≥ {minSamples}{window}{gradeScope}) — " +
         $"prime {Math.Min(top, deals.Count)} di {deals.Count}:");
     Console.WriteLine();
 
@@ -320,10 +346,10 @@ async Task<int> DealsAsync()
     PrintTable(
         new[]
         {
-            "#", "ItemId", "Nome", "Tipo", "Lv", "CP", "Prezzo NCG",
+            "#", "ItemId", "Nome", "Tipo", "Gr", "Lv", "CP", "Prezzo NCG",
             "CP/NCG", "Med CP/NCG", "Sconto%", "Sconto prezzo%", "Camp.",
         },
-        new[] { true, true, false, false, true, true, true, true, true, true, true, true },
+        new[] { true, true, false, false, true, true, true, true, true, true, true, true, true },
         deals.Take(top).Select((d, i) => new[]
         {
             (i + 1).ToString(culture),
@@ -332,6 +358,7 @@ async Task<int> DealsAsync()
                 ProductFormat.ItemDisplayName(
                     d.Product.ItemId, d.Product.Grade, d.Product.ItemSubType, names), 28),
             ((EquipmentType)d.Product.ItemSubType).ToString(),
+            d.Product.Grade.ToString(culture),
             d.Product.Level.ToString(culture),
             d.Product.CombatPoint.ToString("N0", culture),
             d.Product.Price.ToString("N2", culture),
@@ -626,6 +653,9 @@ void PrintHelp()
           deals      Occasioni: inserzioni correnti sotto la mediana storica del
                      database (metrica primaria: NCG per punto CP, per item+livello)
                        --type <tipo>         filtro opzionale (default: tutti i tipi)
+                       --grade <g[,g...]>    filtro rarità: 1-8 o normal, rare, epic,
+                                             unique, legendary, divinity, mythic,
+                                             transcendent (default: tutte)
                        --discount <pct>      sconto minimo percentuale, default: 25
                        --min-samples <n>     inserzioni storiche minime per confronto, default: 5
                        --days <n>            finestra storica in giorni (default: tutto lo storico)
@@ -654,6 +684,7 @@ void PrintHelp()
           ncmarket history --item 10152001
           ncmarket stats --type ring --top 20
           ncmarket deals --discount 30
+          ncmarket deals --grade legendary,mythic
           ncmarket deals --type ring --from-snapshot --min-samples 3
           ncmarket export --type weapon --sep ;
           ncmarket export --snapshot 2 --out listino.csv
