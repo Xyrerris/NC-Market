@@ -76,9 +76,10 @@ NC-Market/
     │   ├── NameProvider.cs     Risoluzione id -> nome per item e skill (cache locale)
     │   ├── ProductFormat.cs    Formattazione statistiche e skill delle inserzioni
     │   ├── SnapshotCsvExporter.cs  Export CSV flat di uno snapshot
+    │   ├── DealFinder.cs       Rilevazione occasioni (confronto con le mediane storiche)
     │   └── MarketDb.cs         Storicizzazione su SQLite + query analitiche
     └── NCMarket.Cli/           Applicazione console
-        └── Program.cs          Comandi: fetch, snapshot, snapshots, history, stats, export
+        └── Program.cs          Comandi: fetch, snapshot, snapshots, history, stats, deals, export
 ```
 
 Scelte progettuali:
@@ -149,6 +150,16 @@ dotnet run --project src/NCMarket.Cli -- history --item 10152001
 # Statistiche aggregate per item sull'ultimo snapshot
 dotnet run --project src/NCMarket.Cli -- stats --type weapon
 
+# Occasioni: inserzioni correnti (mercato live) a prezzo conveniente rispetto agli
+# storici del database. Il confronto avviene tra item comparabili (stesso item e
+# livello) sulle inserzioni distinte viste negli snapshot; la metrica primaria è il
+# rapporto NCG/CP (un CP alto a basso prezzo è un'occasione), lo sconto sul prezzo
+# puro è mostrato come colonna secondaria
+dotnet run --project src/NCMarket.Cli -- deals --discount 30
+
+# Occasioni sull'ultimo snapshot (senza download live), con soglie personalizzate
+dotnet run --project src/NCMarket.Cli -- deals --type ring --from-snapshot --min-samples 3 --days 14
+
 # Export CSV "flat" di uno snapshot: una riga per inserzione, statistiche in colonne
 # <stat>_base/<stat>_bonus (hp, atk, def, cri, hit, spd, drv, drr, cdmg, armorpen,
 # thorn) e skill in colonne skill1_*/skill2_* (id, nome, categoria, elemento,
@@ -187,7 +198,9 @@ database, `--no-names` per saltare la risoluzione dei nomi di item e skill.
 ### Step 3 — Valutazioni (obiettivo finale)
 - **Motore di pricing**: prezzo equo stimato per item/level/opzioni sulla base della
   serie storica (mediane mobili, percentili per grade/CP).
-- **Segnalazione occasioni**: inserzioni sotto la valutazione stimata.
+- **Segnalazione occasioni** ✅ — comando `deals`: confronto tra le offerte correnti
+  (mercato live o ultimo snapshot) e le mediane storiche di prezzo e NCG/CP per
+  coppia (item, livello), con soglie di sconto e campioni minimi configurabili.
 - **Reportistica**: dashboard e grafici andamento prezzi (l'export CSV è già disponibile
   con il comando `export`).
 
