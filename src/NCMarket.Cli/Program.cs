@@ -26,6 +26,7 @@ try
         "stats" => Stats(),
         "deals" => await DealsAsync(),
         "export" => await ExportAsync(),
+        "prune" => Prune(),
         _ => Unknown(),
     };
 }
@@ -105,7 +106,7 @@ async Task<int> SnapshotAsync()
         types = EquipmentTypes.All;
     }
 
-    using var db = new MarketDb(options.GetValueOrDefault("db"));
+    using var db = OpenDb();
     using var client = new MarketClient(planet);
 
     var takenAt = DateTime.UtcNow;
@@ -135,7 +136,7 @@ async Task<int> SnapshotAsync()
 
 int ListSnapshots()
 {
-    using var db = new MarketDb(options.GetValueOrDefault("db"));
+    using var db = OpenDb();
     var planetFilter = options.TryGetValue("planet", out var p) ? p.ToLowerInvariant() : null;
     var snapshots = db.GetSnapshots(planetFilter);
     if (snapshots.Count == 0)
@@ -168,7 +169,7 @@ int History()
     }
 
     var planet = GetPlanet();
-    using var db = new MarketDb(options.GetValueOrDefault("db"));
+    using var db = OpenDb();
     var rows = db.GetItemHistory(itemId, planet.Name);
 
     var names = LoadItemNamesAsync().GetAwaiter().GetResult();
@@ -206,7 +207,7 @@ int Stats()
 
     var top = GetInt("top", 30);
 
-    using var db = new MarketDb(options.GetValueOrDefault("db"));
+    using var db = OpenDb();
     var snapshotId = db.GetLatestSnapshotId(planet.Name);
     if (snapshotId is null)
     {
@@ -277,7 +278,7 @@ async Task<int> DealsAsync()
         }
     }
 
-    using var db = new MarketDb(options.GetValueOrDefault("db"));
+    using var db = OpenDb();
     var baselines = db.GetPriceBaselines(planet.Name, type, sinceUtc);
     if (baselines.Count == 0)
     {
@@ -388,7 +389,7 @@ async Task<int> ExportAsync()
         var s => throw new ArgumentException($"Separatore non valido: '{s}'. Usa ',', ';' o 'tab'."),
     };
 
-    using var db = new MarketDb(options.GetValueOrDefault("db"));
+    using var db = OpenDb();
 
     SnapshotInfo? snapshot;
     if (options.TryGetValue("snapshot", out var snapshotRaw))
@@ -440,6 +441,40 @@ async Task<int> ExportAsync()
     return 0;
 }
 
+int Prune()
+{
+    var days = GetInt("days", 365);
+    if (days < 1)
+    {
+        Console.Error.WriteLine("Valore non valido per --days: deve essere almeno 1.");
+        return 2;
+    }
+
+    var dryRun = options.ContainsKey("dry-run");
+    var cutoffUtc = DateTime.UtcNow.AddDays(-days);
+
+    using var db = OpenDb();
+    var result = db.Prune(cutoffUtc, dryRun);
+
+    Console.WriteLine(
+        $"Retention su {db.DbPath}: rimozione delle inserzioni non più viste " +
+        $"da {days} giorni (prima del {cutoffUtc.ToString("yyyy-MM-dd HH:mm", culture)} UTC)" +
+        (dryRun ? " — prova, nessuna modifica" : "") + ":");
+    Console.WriteLine();
+
+    var invariant = dryRun ? "da rimuovere" : null;
+    Console.WriteLine($"  Inserzioni {invariant ?? "rimosse"}: {result.ListingsRemoved.ToString("N0", culture)}");
+    Console.WriteLine($"  Avvistamenti {invariant ?? "rimossi"}: {result.SightingsRemoved.ToString("N0", culture)}");
+    Console.WriteLine($"  Snapshot {invariant ?? "rimossi"}: {result.SnapshotsRemoved.ToString("N0", culture)}");
+    if (!dryRun)
+    {
+        Console.WriteLine(
+            $"  Dimensione database: {FormatBytes(result.BytesBefore)} -> {FormatBytes(result.BytesAfter)}");
+    }
+
+    return 0;
+}
+
 int Unknown()
 {
     Console.Error.WriteLine($"Comando sconosciuto: '{verb}'. Usa 'help' per l'elenco dei comandi.");
@@ -447,6 +482,28 @@ int Unknown()
 }
 
 // ---------------------------------------------------------------- helper
+
+MarketDb OpenDb()
+{
+    var db = new MarketDb(options.GetValueOrDefault("db"));
+    if (db.MigrationBackupPath is not null)
+    {
+        Console.WriteLine(
+            "Database migrato allo schema v2 (inserzioni deduplicate). " +
+            $"Backup del vecchio formato: {db.MigrationBackupPath}");
+        Console.WriteLine();
+    }
+
+    return db;
+}
+
+string FormatBytes(long bytes) => bytes switch
+{
+    >= 1L << 30 => (bytes / (double)(1L << 30)).ToString("N2", culture) + " GB",
+    >= 1L << 20 => (bytes / (double)(1L << 20)).ToString("N1", culture) + " MB",
+    >= 1L << 10 => (bytes / (double)(1L << 10)).ToString("N0", culture) + " KB",
+    _ => bytes.ToString("N0", culture) + " B",
+};
 
 Dictionary<string, string> ParseOptions(string[] rest)
 {
@@ -672,6 +729,12 @@ void PrintHelp()
                        --sep ,|;|tab         separatore CSV (default: ','; per Excel
                                              in italiano usare ';')
 
+          prune      Retention: elimina le inserzioni non più viste da N giorni
+                     (con i relativi avvistamenti e gli snapshot rimasti vuoti),
+                     poi compatta il database con VACUUM
+                       --days <n>            giorni di storico da conservare, default: 365
+                       --dry-run             mostra cosa verrebbe rimosso senza modificare nulla
+
         Opzioni comuni:
           --planet odin|heimdall   default: heimdall
           --db <percorso>          database SQLite (default: %LOCALAPPDATA%\NCMarket\ncmarket.db)
@@ -688,5 +751,7 @@ void PrintHelp()
           ncmarket deals --type ring --from-snapshot --min-samples 3
           ncmarket export --type weapon --sep ;
           ncmarket export --snapshot 2 --out listino.csv
+          ncmarket prune --dry-run
+          ncmarket prune --days 180
         """);
 }

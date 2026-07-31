@@ -79,7 +79,7 @@ NC-Market/
     │   ├── DealFinder.cs       Rilevazione occasioni (confronto con le mediane storiche)
     │   └── MarketDb.cs         Storicizzazione su SQLite + query analitiche
     └── NCMarket.Cli/           Applicazione console
-        └── Program.cs          Comandi: fetch, snapshot, snapshots, history, stats, deals, export
+        └── Program.cs          Comandi: fetch, snapshot, snapshots, history, stats, deals, export, prune
 ```
 
 Scelte progettuali:
@@ -91,10 +91,14 @@ Scelte progettuali:
 - **SQLite** (`Microsoft.Data.Sqlite`): zero amministrazione, file unico, adatto a
   storicizzazione e query aggregate. Percorso di default:
   `%LOCALAPPDATA%\NCMarket\ncmarket.db`, personalizzabile con `--db`.
-- **Snapshot immutabili**: ogni esecuzione di `snapshot` salva l'intero listino corrente
-  con timestamp; le analisi storiche confrontano gli snapshot tra loro.
+- **Snapshot immutabili, archiviazione deduplicata**: ogni esecuzione di `snapshot`
+  registra l'intero listino corrente con timestamp, ma ogni inserzione (`product_id`,
+  i cui attributi non cambiano mai: un cambio prezzo crea un nuovo prodotto) è salvata
+  una sola volta nella tabella `listings`; l'appartenenza ai singoli snapshot è
+  tracciata dalla tabella `sightings` (due interi per riga). Le analisi storiche
+  confrontano gli snapshot tra loro come prima.
 
-## Schema del database
+## Schema del database (v2)
 
 ```sql
 snapshots(
@@ -102,12 +106,13 @@ snapshots(
     planet TEXT,              -- odin | heimdall
     taken_at_utc TEXT,        -- ISO 8601
     item_sub_types TEXT,      -- sottotipi inclusi, es. "6,7,8,9,10"
-    product_count INTEGER     -- prodotti salvati
+    product_count INTEGER     -- inserzioni osservate al momento della cattura
 )
 
-products(
-    snapshot_id INTEGER FK -> snapshots.id,
-    product_id TEXT,          -- GUID dell'inserzione on-chain
+listings(                     -- una riga per inserzione unica, scritta una volta sola
+    id INTEGER PK,
+    product_id TEXT UNIQUE,   -- GUID dell'inserzione on-chain
+    planet TEXT,
     item_sub_type, item_id, icon_id, grade, level, combat_point, elemental_type,
     price REAL,               -- prezzo in NCG
     quantity REAL, unit_price REAL,
@@ -117,12 +122,29 @@ products(
     registered_block_index INTEGER, legacy INTEGER,
     stats_json TEXT,          -- statistiche (ATK, DEF, ...) in JSON
     skills_json TEXT,         -- skill in JSON
-    PRIMARY KEY(snapshot_id, product_id)
+    first_seen_snapshot_id INTEGER,  -- primo e ultimo snapshot in cui è apparsa
+    last_seen_snapshot_id INTEGER,
+    last_seen_at_utc TEXT     -- per la finestra --days e per la retention
+)
+
+sightings(                    -- appartenenza inserzione <-> snapshot: due interi
+    snapshot_id INTEGER FK -> snapshots.id  ON DELETE CASCADE,
+    listing_id INTEGER FK -> listings.id    ON DELETE CASCADE,
+    PRIMARY KEY(snapshot_id, listing_id)
 )
 ```
 
-`product_id` è stabile per tutta la vita di un'inserzione: confrontando snapshot
-consecutivi è quindi possibile (step futuro) dedurre vendite e cancellazioni.
+`product_id` è stabile e immutabile per tutta la vita di un'inserzione (un cambio di
+prezzo crea un nuovo prodotto): gli attributi vengono quindi salvati una sola volta e
+uno snapshot che riosserva un'inserzione già nota aggiunge solo una riga di
+`sightings` (~20 byte) e aggiorna il marcatore *last seen*. Confrontando snapshot
+consecutivi resta possibile (step futuro) dedurre vendite e cancellazioni.
+
+I database creati con lo schema v1 (una copia completa di ogni inserzione per
+snapshot) vengono **migrati automaticamente** alla prima apertura: viene lasciata una
+copia di sicurezza `<db>.v1.bak` accanto al file originale e il database viene
+compattato con `VACUUM`. Il database usa il journal WAL, quindi accanto al file
+possono comparire i file di servizio `-wal` e `-shm`.
 
 ## Comandi CLI
 
@@ -170,6 +192,11 @@ dotnet run --project src/NCMarket.Cli -- deals --grade legendary,mythic
 # probabilità, potenza, ratio, colpi, cooldown)
 dotnet run --project src/NCMarket.Cli -- export                       # ultimo snapshot
 dotnet run --project src/NCMarket.Cli -- export --snapshot 2 --type weapon --sep ";"
+
+# Retention: elimina le inserzioni non più viste da N giorni (default: 365) con i
+# relativi avvistamenti e gli snapshot rimasti vuoti, poi compatta il file con VACUUM
+dotnet run --project src/NCMarket.Cli -- prune --dry-run              # anteprima
+dotnet run --project src/NCMarket.Cli -- prune --days 180
 ```
 
 Per aprire il CSV con Excel in italiano usare `--sep ";"`; il file è UTF-8 con BOM.
@@ -209,8 +236,11 @@ health check disabilitato (non è un servizio web), storage persistente montato 
 variabili `NCMARKET_PLANET` e `NCMARKET_EXPORT`, e uno *Scheduled Task* con comando
 `snapshot-job` alla frequenza desiderata (es. `0 */6 * * *`).
 
-Ogni snapshot salva l'intero listino: su Heimdall sono circa 10-20 MB di database per
-esecuzione, da tenere presente nel dimensionamento del disco e nella scelta della frequenza.
+Grazie all'archiviazione deduplicata (schema v2) uno snapshot scrive per intero solo le
+inserzioni mai viste prima; quelle già note costano ~20 byte l'una. La crescita del
+database dipende quindi dal ricambio del mercato, non dalla frequenza degli snapshot.
+Per mettere un tetto allo storico si può schedulare anche `prune` (default: conserva
+365 giorni), ad esempio una volta a settimana con un secondo *Scheduled Task*.
 
 ## Piano di sviluppo
 
@@ -228,8 +258,11 @@ esecuzione, da tenere presente nel dimensionamento del disco e nella scelta dell
 
 ### Step 2 — Automazione e arricchimento (prossimi sviluppi)
 - **Raccolta schedulata** ✅ — immagine Docker e job `snapshot-job` per l'esecuzione
-  periodica di `snapshot` su server (vedi *Deploy su server*); manca un comando di
-  retention (`prune`) per limitare la crescita del database.
+  periodica di `snapshot` su server (vedi *Deploy su server*).
+- **Storico deduplicato e retention** ✅ — schema v2 (`listings` + `sightings`): le
+  inserzioni ripetute tra snapshot costano ~20 byte invece di una copia completa, con
+  migrazione automatica dei database v1; comando `prune` (default: 365 giorni) per
+  limitare la crescita del database.
 - **Rilevazione vendite**: confronto tra snapshot consecutivi per distinguere item
   venduti da item ritirati (incrocio con le transazioni `BuyProduct` via 9cscan/mimir).
 - **Filtri avanzati**: il servizio supporta anche `stat`, `itemIds[]`, `iconIds[]`,
