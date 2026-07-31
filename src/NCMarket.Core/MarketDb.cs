@@ -27,16 +27,36 @@ public sealed record PriceBaseline(
     int CpSamples, double? MedianPricePerCp);
 
 /// <summary>
-/// SQLite storage for market snapshots. Each snapshot is an immutable copy of the
-/// listings observed at a given time; analyses compare snapshots over time.
+/// Outcome of a retention pass: how many rows were (or, on a dry run, would be)
+/// removed and the database file size before/after the pass. On a dry run
+/// <see cref="BytesAfter"/> equals <see cref="BytesBefore"/>.
+/// </summary>
+public sealed record PruneResult(
+    int ListingsRemoved, int SightingsRemoved, int SnapshotsRemoved,
+    long BytesBefore, long BytesAfter);
+
+/// <summary>
+/// SQLite storage for market snapshots. Snapshots are logically immutable copies of
+/// the listings observed at a given time, but they are stored deduplicated (schema v2):
+/// each distinct listing (product_id, whose attributes never change on the market
+/// service — a price change creates a new product) is written once in
+/// <c>listings</c>, and per-snapshot membership is recorded in the two-integer
+/// <c>sightings</c> table. Version 1 databases, which stored a full copy of every
+/// listing per snapshot, are migrated automatically on open (a .v1.bak backup of the
+/// original file is left next to it, see <see cref="MigrationBackupPath"/>).
 /// </summary>
 public sealed class MarketDb : IDisposable
 {
+    private const long SchemaVersion = 2;
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     private readonly SqliteConnection _conn;
 
     public string DbPath { get; }
+
+    /// <summary>Path of the pre-migration backup, when opening this database migrated it.</summary>
+    public string? MigrationBackupPath { get; private set; }
 
     public MarketDb(string? dbPath = null)
     {
@@ -50,11 +70,21 @@ public sealed class MarketDb : IDisposable
         _conn = new SqliteConnection($"Data Source={DbPath}");
         _conn.Open();
         Execute("PRAGMA foreign_keys = ON;");
+        // The snapshot job and ad-hoc queries can overlap on the server.
+        Execute("PRAGMA busy_timeout = 5000;");
         EnsureSchema();
+        Execute("PRAGMA journal_mode = WAL;");
     }
 
     private void EnsureSchema()
     {
+        var version = (long)ExecuteScalar("PRAGMA user_version;")!;
+        if (version == 0 && TableExists("products"))
+        {
+            MigrateV1ToV2();
+            return;
+        }
+
         Execute("""
             CREATE TABLE IF NOT EXISTS snapshots(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,9 +94,10 @@ public sealed class MarketDb : IDisposable
                 product_count INTEGER NOT NULL DEFAULT 0
             );
 
-            CREATE TABLE IF NOT EXISTS products(
-                snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
-                product_id TEXT NOT NULL,
+            CREATE TABLE IF NOT EXISTS listings(
+                id INTEGER PRIMARY KEY,
+                product_id TEXT NOT NULL UNIQUE,
+                planet TEXT NOT NULL,
                 item_sub_type INTEGER NOT NULL,
                 item_id INTEGER NOT NULL,
                 icon_id INTEGER NOT NULL,
@@ -87,12 +118,122 @@ public sealed class MarketDb : IDisposable
                 legacy INTEGER NOT NULL,
                 stats_json TEXT,
                 skills_json TEXT,
-                PRIMARY KEY(snapshot_id, product_id)
+                -- Plain integers, not FKs: prune may drop old snapshot rows while the
+                -- listing survives.
+                first_seen_snapshot_id INTEGER NOT NULL,
+                last_seen_snapshot_id INTEGER NOT NULL,
+                last_seen_at_utc TEXT NOT NULL
             );
 
-            CREATE INDEX IF NOT EXISTS ix_products_item ON products(item_id, snapshot_id);
-            CREATE INDEX IF NOT EXISTS ix_products_subtype ON products(item_sub_type, snapshot_id);
+            CREATE TABLE IF NOT EXISTS sightings(
+                snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+                listing_id INTEGER NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+                PRIMARY KEY(snapshot_id, listing_id)
+            ) WITHOUT ROWID;
+
+            CREATE INDEX IF NOT EXISTS ix_listings_planet_subtype ON listings(planet, item_sub_type);
+            CREATE INDEX IF NOT EXISTS ix_listings_item ON listings(item_id);
+            CREATE INDEX IF NOT EXISTS ix_sightings_listing ON sightings(listing_id);
             """);
+
+        if (version < SchemaVersion)
+        {
+            Execute($"PRAGMA user_version = {SchemaVersion};");
+        }
+    }
+
+    /// <summary>
+    /// One-time in-place migration from schema v1 (a full copy of every listing per
+    /// snapshot) to v2. Attribute columns are immutable per product_id, so any row of
+    /// the group can provide them; first/last seen come from the snapshot id range.
+    /// </summary>
+    private void MigrateV1ToV2()
+    {
+        var backupPath = DbPath + ".v1.bak";
+        File.Copy(DbPath, backupPath, overwrite: true);
+
+        Execute("BEGIN IMMEDIATE;");
+        try
+        {
+            Execute("""
+                CREATE TABLE listings(
+                    id INTEGER PRIMARY KEY,
+                    product_id TEXT NOT NULL UNIQUE,
+                    planet TEXT NOT NULL,
+                    item_sub_type INTEGER NOT NULL,
+                    item_id INTEGER NOT NULL,
+                    icon_id INTEGER NOT NULL,
+                    grade INTEGER NOT NULL,
+                    level INTEGER NOT NULL,
+                    combat_point INTEGER NOT NULL,
+                    elemental_type INTEGER NOT NULL,
+                    price REAL NOT NULL,
+                    quantity REAL NOT NULL,
+                    unit_price REAL NOT NULL,
+                    crystal INTEGER NOT NULL,
+                    crystal_per_price INTEGER NOT NULL,
+                    option_count INTEGER NOT NULL,
+                    by_custom_craft INTEGER NOT NULL,
+                    seller_agent TEXT,
+                    seller_avatar TEXT,
+                    registered_block_index INTEGER NOT NULL,
+                    legacy INTEGER NOT NULL,
+                    stats_json TEXT,
+                    skills_json TEXT,
+                    first_seen_snapshot_id INTEGER NOT NULL,
+                    last_seen_snapshot_id INTEGER NOT NULL,
+                    last_seen_at_utc TEXT NOT NULL
+                );
+
+                CREATE TABLE sightings(
+                    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+                    listing_id INTEGER NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+                    PRIMARY KEY(snapshot_id, listing_id)
+                ) WITHOUT ROWID;
+
+                INSERT INTO listings(
+                    product_id, planet, item_sub_type, item_id, icon_id, grade, level,
+                    combat_point, elemental_type, price, quantity, unit_price, crystal,
+                    crystal_per_price, option_count, by_custom_craft, seller_agent,
+                    seller_avatar, registered_block_index, legacy, stats_json, skills_json,
+                    first_seen_snapshot_id, last_seen_snapshot_id, last_seen_at_utc)
+                SELECT
+                    p.product_id, s.planet, p.item_sub_type, p.item_id, p.icon_id, p.grade,
+                    p.level, p.combat_point, p.elemental_type, p.price, p.quantity,
+                    p.unit_price, p.crystal, p.crystal_per_price, p.option_count,
+                    p.by_custom_craft, p.seller_agent, p.seller_avatar,
+                    p.registered_block_index, p.legacy, p.stats_json, p.skills_json,
+                    MIN(p.snapshot_id), MAX(p.snapshot_id), ''
+                FROM products p
+                JOIN snapshots s ON s.id = p.snapshot_id
+                GROUP BY p.product_id;
+
+                UPDATE listings SET last_seen_at_utc =
+                    (SELECT taken_at_utc FROM snapshots
+                     WHERE snapshots.id = listings.last_seen_snapshot_id);
+
+                INSERT INTO sightings(snapshot_id, listing_id)
+                SELECT p.snapshot_id, l.id
+                FROM products p
+                JOIN listings l ON l.product_id = p.product_id;
+
+                DROP TABLE products;
+
+                CREATE INDEX ix_listings_planet_subtype ON listings(planet, item_sub_type);
+                CREATE INDEX ix_listings_item ON listings(item_id);
+                CREATE INDEX ix_sightings_listing ON sightings(listing_id);
+                """);
+            Execute($"PRAGMA user_version = {SchemaVersion};");
+            Execute("COMMIT;");
+        }
+        catch
+        {
+            Execute("ROLLBACK;");
+            throw;
+        }
+
+        Execute("VACUUM;");
+        MigrationBackupPath = backupPath;
     }
 
     /// <summary>Creates a new snapshot row and returns its id.</summary>
@@ -110,27 +251,52 @@ public sealed class MarketDb : IDisposable
         return (long)cmd.ExecuteScalar()!;
     }
 
-    /// <summary>Bulk-inserts listings into a snapshot inside a single transaction.</summary>
+    /// <summary>
+    /// Records the listings observed by a snapshot inside a single transaction.
+    /// Listings already known from previous snapshots only get their last-seen marker
+    /// refreshed plus a two-integer sighting row; new listings are stored in full.
+    /// Returns the number of distinct listings recorded for the snapshot.
+    /// </summary>
     public int AddProducts(long snapshotId, IEnumerable<ItemProduct> products)
     {
+        var (planet, takenAtUtc) = GetSnapshotKey(snapshotId);
+
         using var tx = _conn.BeginTransaction();
-        using var cmd = _conn.CreateCommand();
-        cmd.Transaction = tx;
-        cmd.CommandText = """
-            INSERT OR REPLACE INTO products(
-                snapshot_id, product_id, item_sub_type, item_id, icon_id, grade, level,
+
+        using var touch = _conn.CreateCommand();
+        touch.Transaction = tx;
+        touch.CommandText = """
+            UPDATE listings
+            SET last_seen_snapshot_id = $snapshotId, last_seen_at_utc = $takenAt
+            WHERE product_id = $productId
+            RETURNING id;
+            """;
+        touch.Parameters.AddWithValue("$snapshotId", snapshotId);
+        touch.Parameters.AddWithValue("$takenAt", takenAtUtc);
+        var touchId = touch.Parameters.Add("$productId", SqliteType.Text);
+
+        using var insert = _conn.CreateCommand();
+        insert.Transaction = tx;
+        insert.CommandText = """
+            INSERT INTO listings(
+                product_id, planet, item_sub_type, item_id, icon_id, grade, level,
                 combat_point, elemental_type, price, quantity, unit_price, crystal,
                 crystal_per_price, option_count, by_custom_craft, seller_agent,
-                seller_avatar, registered_block_index, legacy, stats_json, skills_json)
+                seller_avatar, registered_block_index, legacy, stats_json, skills_json,
+                first_seen_snapshot_id, last_seen_snapshot_id, last_seen_at_utc)
             VALUES(
-                $snapshotId, $productId, $itemSubType, $itemId, $iconId, $grade, $level,
+                $productId, $planet, $itemSubType, $itemId, $iconId, $grade, $level,
                 $cp, $elemental, $price, $quantity, $unitPrice, $crystal,
                 $crystalPerPrice, $optionCount, $byCustomCraft, $sellerAgent,
-                $sellerAvatar, $blockIndex, $legacy, $statsJson, $skillsJson);
+                $sellerAvatar, $blockIndex, $legacy, $statsJson, $skillsJson,
+                $snapshotId, $snapshotId, $takenAt)
+            RETURNING id;
             """;
 
-        var p = cmd.Parameters;
-        p.Add("$snapshotId", SqliteType.Integer);
+        var p = insert.Parameters;
+        p.AddWithValue("$snapshotId", snapshotId);
+        p.AddWithValue("$takenAt", takenAtUtc);
+        p.AddWithValue("$planet", planet);
         p.Add("$productId", SqliteType.Text);
         p.Add("$itemSubType", SqliteType.Integer);
         p.Add("$itemId", SqliteType.Integer);
@@ -153,32 +319,49 @@ public sealed class MarketDb : IDisposable
         p.Add("$statsJson", SqliteType.Text);
         p.Add("$skillsJson", SqliteType.Text);
 
+        using var sight = _conn.CreateCommand();
+        sight.Transaction = tx;
+        sight.CommandText = """
+            INSERT OR IGNORE INTO sightings(snapshot_id, listing_id)
+            VALUES($snapshotId, $listingId);
+            """;
+        sight.Parameters.AddWithValue("$snapshotId", snapshotId);
+        var sightId = sight.Parameters.Add("$listingId", SqliteType.Integer);
+
         var count = 0;
         foreach (var product in products)
         {
-            p["$snapshotId"].Value = snapshotId;
-            p["$productId"].Value = product.ProductId.ToString("D");
-            p["$itemSubType"].Value = product.ItemSubType;
-            p["$itemId"].Value = product.ItemId;
-            p["$iconId"].Value = product.IconId;
-            p["$grade"].Value = product.Grade;
-            p["$level"].Value = product.Level;
-            p["$cp"].Value = product.CombatPoint;
-            p["$elemental"].Value = product.ElementalType;
-            p["$price"].Value = (double)product.Price;
-            p["$quantity"].Value = (double)product.Quantity;
-            p["$unitPrice"].Value = (double)product.UnitPrice;
-            p["$crystal"].Value = product.Crystal;
-            p["$crystalPerPrice"].Value = product.CrystalPerPrice;
-            p["$optionCount"].Value = product.OptionCountFromCombination;
-            p["$byCustomCraft"].Value = product.ByCustomCraft ? 1 : 0;
-            p["$sellerAgent"].Value = product.SellerAgentAddress;
-            p["$sellerAvatar"].Value = product.SellerAvatarAddress;
-            p["$blockIndex"].Value = product.RegisteredBlockIndex;
-            p["$legacy"].Value = product.Legacy ? 1 : 0;
-            p["$statsJson"].Value = JsonSerializer.Serialize(product.StatModels, JsonOptions);
-            p["$skillsJson"].Value = JsonSerializer.Serialize(product.SkillModels, JsonOptions);
-            count += cmd.ExecuteNonQuery();
+            var productId = product.ProductId.ToString("D");
+            touchId.Value = productId;
+            var listingId = touch.ExecuteScalar();
+            if (listingId is null)
+            {
+                p["$productId"].Value = productId;
+                p["$itemSubType"].Value = product.ItemSubType;
+                p["$itemId"].Value = product.ItemId;
+                p["$iconId"].Value = product.IconId;
+                p["$grade"].Value = product.Grade;
+                p["$level"].Value = product.Level;
+                p["$cp"].Value = product.CombatPoint;
+                p["$elemental"].Value = product.ElementalType;
+                p["$price"].Value = (double)product.Price;
+                p["$quantity"].Value = (double)product.Quantity;
+                p["$unitPrice"].Value = (double)product.UnitPrice;
+                p["$crystal"].Value = product.Crystal;
+                p["$crystalPerPrice"].Value = product.CrystalPerPrice;
+                p["$optionCount"].Value = product.OptionCountFromCombination;
+                p["$byCustomCraft"].Value = product.ByCustomCraft ? 1 : 0;
+                p["$sellerAgent"].Value = product.SellerAgentAddress;
+                p["$sellerAvatar"].Value = product.SellerAvatarAddress;
+                p["$blockIndex"].Value = product.RegisteredBlockIndex;
+                p["$legacy"].Value = product.Legacy ? 1 : 0;
+                p["$statsJson"].Value = JsonSerializer.Serialize(product.StatModels, JsonOptions);
+                p["$skillsJson"].Value = JsonSerializer.Serialize(product.SkillModels, JsonOptions);
+                listingId = insert.ExecuteScalar()!;
+            }
+
+            sightId.Value = listingId;
+            count += sight.ExecuteNonQuery();
         }
 
         tx.Commit();
@@ -190,7 +373,7 @@ public sealed class MarketDb : IDisposable
     {
         Execute($"""
             UPDATE snapshots
-            SET product_count = (SELECT COUNT(*) FROM products WHERE snapshot_id = {snapshotId})
+            SET product_count = (SELECT COUNT(*) FROM sightings WHERE snapshot_id = {snapshotId})
             WHERE id = {snapshotId};
             """);
     }
@@ -238,10 +421,11 @@ public sealed class MarketDb : IDisposable
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
             SELECT s.id, s.taken_at_utc, COUNT(*) AS listings,
-                   MIN(p.price), AVG(p.price), MAX(p.price)
-            FROM products p
-            JOIN snapshots s ON s.id = p.snapshot_id
-            WHERE p.item_id = $itemId
+                   MIN(l.price), AVG(l.price), MAX(l.price)
+            FROM sightings g
+            JOIN snapshots s ON s.id = g.snapshot_id
+            JOIN listings l ON l.id = g.listing_id
+            WHERE l.item_id = $itemId
               AND ($planet IS NULL OR s.planet = $planet)
             GROUP BY s.id
             ORDER BY s.id;
@@ -270,13 +454,14 @@ public sealed class MarketDb : IDisposable
     {
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
-            SELECT item_id, item_sub_type, MAX(grade), COUNT(*) AS listings,
-                   MIN(price), AVG(price), MAX(price), MAX(combat_point), MAX(level)
-            FROM products
-            WHERE snapshot_id = $snapshotId
-              AND ($subType IS NULL OR item_sub_type = $subType)
-            GROUP BY item_id
-            ORDER BY listings DESC, item_id;
+            SELECT l.item_id, l.item_sub_type, MAX(l.grade), COUNT(*) AS listings,
+                   MIN(l.price), AVG(l.price), MAX(l.price), MAX(l.combat_point), MAX(l.level)
+            FROM sightings g
+            JOIN listings l ON l.id = g.listing_id
+            WHERE g.snapshot_id = $snapshotId
+              AND ($subType IS NULL OR l.item_sub_type = $subType)
+            GROUP BY l.item_id
+            ORDER BY listings DESC, l.item_id;
             """;
         cmd.Parameters.AddWithValue("$snapshotId", snapshotId);
         cmd.Parameters.AddWithValue("$subType", type is null ? DBNull.Value : (int)type.Value);
@@ -308,14 +493,16 @@ public sealed class MarketDb : IDisposable
     {
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
-            SELECT product_id, item_sub_type, item_id, icon_id, grade, level, combat_point,
-                   elemental_type, price, quantity, unit_price, crystal, crystal_per_price,
-                   option_count, by_custom_craft, seller_agent, seller_avatar,
-                   registered_block_index, legacy, stats_json, skills_json
-            FROM products
-            WHERE snapshot_id = $snapshotId
-              AND ($subType IS NULL OR item_sub_type = $subType)
-            ORDER BY item_sub_type, item_id, unit_price;
+            SELECT l.product_id, l.item_sub_type, l.item_id, l.icon_id, l.grade, l.level,
+                   l.combat_point, l.elemental_type, l.price, l.quantity, l.unit_price,
+                   l.crystal, l.crystal_per_price, l.option_count, l.by_custom_craft,
+                   l.seller_agent, l.seller_avatar, l.registered_block_index, l.legacy,
+                   l.stats_json, l.skills_json
+            FROM sightings g
+            JOIN listings l ON l.id = g.listing_id
+            WHERE g.snapshot_id = $snapshotId
+              AND ($subType IS NULL OR l.item_sub_type = $subType)
+            ORDER BY l.item_sub_type, l.item_id, l.unit_price;
             """;
         cmd.Parameters.AddWithValue("$snapshotId", snapshotId);
         cmd.Parameters.AddWithValue("$subType", type is null ? DBNull.Value : (int)type.Value);
@@ -354,9 +541,11 @@ public sealed class MarketDb : IDisposable
     }
 
     /// <summary>
-    /// Per-(item_id, level) historical price baselines over the snapshots of a planet.
-    /// Each listing (product_id) is counted once even when it persists across several
-    /// snapshots, so stale listings do not dominate the medians. Rows with a
+    /// Per-(item_id, level) historical price baselines over the listings of a planet.
+    /// Listings are stored deduplicated, so each one contributes a single sample no
+    /// matter how many snapshots observed it and stale listings do not dominate the
+    /// medians. The <paramref name="sinceUtc"/> window keeps a listing when it was
+    /// still on sale within the window (its last sighting is inside it). Rows with a
     /// non-positive combat point contribute to the price median only. Listings from
     /// the latest snapshot are part of the baseline as well; with a reasonable
     /// minimum sample size their effect on the median is negligible.
@@ -366,12 +555,11 @@ public sealed class MarketDb : IDisposable
     {
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
-            SELECT DISTINCT p.product_id, p.item_id, p.level, p.price, p.combat_point
-            FROM products p
-            JOIN snapshots s ON s.id = p.snapshot_id
-            WHERE s.planet = $planet
-              AND ($subType IS NULL OR p.item_sub_type = $subType)
-              AND ($since IS NULL OR s.taken_at_utc >= $since);
+            SELECT item_id, level, price, combat_point
+            FROM listings
+            WHERE planet = $planet
+              AND ($subType IS NULL OR item_sub_type = $subType)
+              AND ($since IS NULL OR last_seen_at_utc >= $since);
             """;
         cmd.Parameters.AddWithValue("$planet", planet);
         cmd.Parameters.AddWithValue("$subType", type is null ? DBNull.Value : (int)type.Value);
@@ -385,9 +573,9 @@ public sealed class MarketDb : IDisposable
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
         {
-            var key = (reader.GetInt32(1), reader.GetInt32(2));
-            var price = reader.GetDouble(3);
-            var combatPoint = reader.GetInt32(4);
+            var key = (reader.GetInt32(0), reader.GetInt32(1));
+            var price = reader.GetDouble(2);
+            var combatPoint = reader.GetInt32(3);
             if (!buckets.TryGetValue(key, out var bucket))
             {
                 bucket = (new List<double>(), new List<double>());
@@ -416,6 +604,108 @@ public sealed class MarketDb : IDisposable
         return result;
     }
 
+    /// <summary>
+    /// Retention pass: removes listings whose last sighting is older than
+    /// <paramref name="cutoffUtc"/> (their sightings cascade away) and snapshots taken
+    /// before the cutoff that are left with no sightings, then compacts the file with
+    /// VACUUM. With <paramref name="dryRun"/> nothing is modified and the result
+    /// reports what would be removed. The product_count of surviving snapshots is not
+    /// rewritten: it documents the size of the listing at capture time.
+    /// </summary>
+    public PruneResult Prune(DateTime cutoffUtc, bool dryRun = false)
+    {
+        var cutoff = cutoffUtc.ToString("O", CultureInfo.InvariantCulture);
+
+        // Fold the WAL into the main file so before/after sizes are comparable.
+        Execute("PRAGMA wal_checkpoint(TRUNCATE);");
+        var bytesBefore = new FileInfo(DbPath).Length;
+
+        var sightings = ScalarCount("""
+            SELECT COUNT(*)
+            FROM sightings g
+            JOIN listings l ON l.id = g.listing_id
+            WHERE l.last_seen_at_utc < $cutoff;
+            """, cutoff);
+        var listings = ScalarCount(
+            "SELECT COUNT(*) FROM listings WHERE last_seen_at_utc < $cutoff;", cutoff);
+        var snapshots = ScalarCount("""
+            SELECT COUNT(*)
+            FROM snapshots s
+            WHERE s.taken_at_utc < $cutoff
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM sightings g
+                  JOIN listings l ON l.id = g.listing_id
+                  WHERE g.snapshot_id = s.id AND l.last_seen_at_utc >= $cutoff);
+            """, cutoff);
+
+        if (dryRun)
+        {
+            return new PruneResult(listings, sightings, snapshots, bytesBefore, bytesBefore);
+        }
+
+        Execute("BEGIN IMMEDIATE;");
+        try
+        {
+            ExecuteWithCutoff("DELETE FROM listings WHERE last_seen_at_utc < $cutoff;", cutoff);
+            ExecuteWithCutoff("""
+                DELETE FROM snapshots
+                WHERE taken_at_utc < $cutoff
+                  AND NOT EXISTS (
+                      SELECT 1 FROM sightings WHERE sightings.snapshot_id = snapshots.id);
+                """, cutoff);
+            Execute("COMMIT;");
+        }
+        catch
+        {
+            Execute("ROLLBACK;");
+            throw;
+        }
+
+        Execute("VACUUM;");
+        Execute("PRAGMA wal_checkpoint(TRUNCATE);");
+        var bytesAfter = new FileInfo(DbPath).Length;
+        return new PruneResult(listings, sightings, snapshots, bytesBefore, bytesAfter);
+    }
+
+    private (string Planet, string TakenAtUtc) GetSnapshotKey(long snapshotId)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT planet, taken_at_utc FROM snapshots WHERE id = $id;";
+        cmd.Parameters.AddWithValue("$id", snapshotId);
+        using var reader = cmd.ExecuteReader();
+        if (!reader.Read())
+        {
+            throw new InvalidOperationException($"Snapshot #{snapshotId} not found.");
+        }
+
+        return (reader.GetString(0), reader.GetString(1));
+    }
+
+    private int ScalarCount(string sql, string cutoff)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = sql;
+        cmd.Parameters.AddWithValue("$cutoff", cutoff);
+        return (int)(long)cmd.ExecuteScalar()!;
+    }
+
+    private void ExecuteWithCutoff(string sql, string cutoff)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = sql;
+        cmd.Parameters.AddWithValue("$cutoff", cutoff);
+        cmd.ExecuteNonQuery();
+    }
+
+    private bool TableExists(string name)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = $name;";
+        cmd.Parameters.AddWithValue("$name", name);
+        return (long)cmd.ExecuteScalar()! > 0;
+    }
+
     private static double Median(List<double> values)
     {
         values.Sort();
@@ -436,6 +726,13 @@ public sealed class MarketDb : IDisposable
 
     private static DateTime ParseUtc(string iso) =>
         DateTime.Parse(iso, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+
+    private object? ExecuteScalar(string sql)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = sql;
+        return cmd.ExecuteScalar();
+    }
 
     private void Execute(string sql)
     {
