@@ -5,8 +5,24 @@ using NCMarket.Core.Models;
 
 namespace NCMarket.Core;
 
+/// <summary>
+/// Completeness of a snapshot. A snapshot is <see cref="Partial"/> from the moment it is
+/// created until <see cref="MarketDb.FinalizeSnapshot"/> marks it complete, so a capture
+/// interrupted halfway (a network failure on one of the equipment types) stays
+/// recognisable instead of silently passing for a full listing.
+/// </summary>
+public static class SnapshotStatus
+{
+    public const string Partial = "partial";
+    public const string Complete = "complete";
+}
+
 public sealed record SnapshotInfo(
-    long Id, string Planet, DateTime TakenAtUtc, string ItemSubTypes, int ProductCount);
+    long Id, string Planet, DateTime TakenAtUtc, string ItemSubTypes, int ProductCount,
+    string Status)
+{
+    public bool IsComplete => Status == SnapshotStatus.Complete;
+}
 
 public sealed record ItemHistoryRow(
     long SnapshotId, DateTime TakenAtUtc, int Listings,
@@ -43,11 +59,12 @@ public sealed record PruneResult(
 /// <c>listings</c>, and per-snapshot membership is recorded in the two-integer
 /// <c>sightings</c> table. Version 1 databases, which stored a full copy of every
 /// listing per snapshot, are migrated automatically on open (a .v1.bak backup of the
-/// original file is left next to it, see <see cref="MigrationBackupPath"/>).
+/// original file is left next to it, see <see cref="MigrationBackupPath"/>); version 2
+/// databases gain the <c>snapshots.status</c> column in place.
 /// </summary>
 public sealed class MarketDb : IDisposable
 {
-    private const long SchemaVersion = 2;
+    private const long SchemaVersion = 3;
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
@@ -82,16 +99,34 @@ public sealed class MarketDb : IDisposable
         if (version == 0 && TableExists("products"))
         {
             MigrateV1ToV2();
-            return;
+            version = 2;
         }
 
-        Execute("""
+        CreateSchema();
+
+        // A database that already carried a version predates the status column: it lives
+        // in the snapshots table, which no migration recreates, so it is added in place.
+        if (version is > 0 and < 3)
+        {
+            MigrateV2ToV3();
+        }
+
+        if (version < SchemaVersion)
+        {
+            Execute($"PRAGMA user_version = {SchemaVersion};");
+        }
+    }
+
+    private void CreateSchema()
+    {
+        Execute($"""
             CREATE TABLE IF NOT EXISTS snapshots(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 planet TEXT NOT NULL,
                 taken_at_utc TEXT NOT NULL,
                 item_sub_types TEXT NOT NULL,
-                product_count INTEGER NOT NULL DEFAULT 0
+                product_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT '{SnapshotStatus.Partial}'
             );
 
             CREATE TABLE IF NOT EXISTS listings(
@@ -134,21 +169,42 @@ public sealed class MarketDb : IDisposable
             CREATE INDEX IF NOT EXISTS ix_listings_planet_subtype ON listings(planet, item_sub_type);
             CREATE INDEX IF NOT EXISTS ix_listings_item ON listings(item_id);
             CREATE INDEX IF NOT EXISTS ix_sightings_listing ON sightings(listing_id);
+            -- Filter column of both Prune and the --days window of GetPriceBaselines.
+            CREATE INDEX IF NOT EXISTS ix_listings_last_seen ON listings(last_seen_at_utc);
             """);
+    }
 
-        if (version < SchemaVersion)
-        {
-            Execute($"PRAGMA user_version = {SchemaVersion};");
-        }
+    /// <summary>
+    /// Adds the completeness marker to a v2 database. Snapshots are considered complete
+    /// when they carry a product count, because <see cref="FinalizeSnapshot"/> was the
+    /// only writer of that column: a zero count is exactly the interrupted capture the
+    /// column exists to flag.
+    /// </summary>
+    private void MigrateV2ToV3()
+    {
+        Execute($"""
+            ALTER TABLE snapshots
+                ADD COLUMN status TEXT NOT NULL DEFAULT '{SnapshotStatus.Partial}';
+
+            UPDATE snapshots
+            SET status = '{SnapshotStatus.Complete}'
+            WHERE product_count > 0;
+            """);
     }
 
     /// <summary>
     /// One-time in-place migration from schema v1 (a full copy of every listing per
     /// snapshot) to v2. Attribute columns are immutable per product_id, so any row of
     /// the group can provide them; first/last seen come from the snapshot id range.
+    /// Indexes are left to <see cref="CreateSchema"/>, which runs right after.
     /// </summary>
     private void MigrateV1ToV2()
     {
+        // The copy is the only safety net of a destructive migration, and a v1 database
+        // left in WAL mode keeps its most recent writes outside the .db file: fold them
+        // in before taking the backup.
+        Execute("PRAGMA wal_checkpoint(TRUNCATE);");
+
         var backupPath = DbPath + ".v1.bak";
         File.Copy(DbPath, backupPath, overwrite: true);
 
@@ -218,12 +274,8 @@ public sealed class MarketDb : IDisposable
                 JOIN listings l ON l.product_id = p.product_id;
 
                 DROP TABLE products;
-
-                CREATE INDEX ix_listings_planet_subtype ON listings(planet, item_sub_type);
-                CREATE INDEX ix_listings_item ON listings(item_id);
-                CREATE INDEX ix_sightings_listing ON sightings(listing_id);
                 """);
-            Execute($"PRAGMA user_version = {SchemaVersion};");
+            Execute("PRAGMA user_version = 2;");
             Execute("COMMIT;");
         }
         catch
@@ -368,27 +420,68 @@ public sealed class MarketDb : IDisposable
         return count;
     }
 
-    /// <summary>Updates the cached product count of a snapshot.</summary>
+    /// <summary>
+    /// Caches the product count of a snapshot and marks it complete: until this runs the
+    /// snapshot stays <see cref="SnapshotStatus.Partial"/> and is ignored by
+    /// <see cref="GetLatestSnapshotId"/>.
+    /// </summary>
     public void FinalizeSnapshot(long snapshotId)
     {
-        Execute($"""
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = $"""
             UPDATE snapshots
-            SET product_count = (SELECT COUNT(*) FROM sightings WHERE snapshot_id = {snapshotId})
-            WHERE id = {snapshotId};
-            """);
+            SET product_count = (SELECT COUNT(*) FROM sightings WHERE snapshot_id = $id),
+                status = '{SnapshotStatus.Complete}'
+            WHERE id = $id;
+            """;
+        cmd.Parameters.AddWithValue("$id", snapshotId);
+        cmd.ExecuteNonQuery();
     }
 
     public IReadOnlyList<SnapshotInfo> GetSnapshots(string? planet = null)
     {
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
-            SELECT id, planet, taken_at_utc, item_sub_types, product_count
+            SELECT id, planet, taken_at_utc, item_sub_types, product_count, status
             FROM snapshots
             WHERE ($planet IS NULL OR planet = $planet)
             ORDER BY id;
             """;
         cmd.Parameters.AddWithValue("$planet", (object?)planet ?? DBNull.Value);
+        return ReadSnapshots(cmd);
+    }
 
+    public SnapshotInfo? GetSnapshot(long id)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT id, planet, taken_at_utc, item_sub_types, product_count, status
+            FROM snapshots
+            WHERE id = $id;
+            """;
+        cmd.Parameters.AddWithValue("$id", id);
+        return ReadSnapshots(cmd).FirstOrDefault();
+    }
+
+    /// <summary>
+    /// Id of the most recent <em>complete</em> snapshot of a planet. Interrupted captures
+    /// are skipped on purpose: they are missing entire equipment types, and reporting on
+    /// them would silently understate the market.
+    /// </summary>
+    public long? GetLatestSnapshotId(string planet)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = $"""
+            SELECT MAX(id) FROM snapshots
+            WHERE planet = $planet AND status = '{SnapshotStatus.Complete}';
+            """;
+        cmd.Parameters.AddWithValue("$planet", planet);
+        var value = cmd.ExecuteScalar();
+        return value is long id ? id : null;
+    }
+
+    private static List<SnapshotInfo> ReadSnapshots(SqliteCommand cmd)
+    {
         var result = new List<SnapshotInfo>();
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
@@ -398,21 +491,11 @@ public sealed class MarketDb : IDisposable
                 reader.GetString(1),
                 ParseUtc(reader.GetString(2)),
                 reader.GetString(3),
-                reader.GetInt32(4)));
+                reader.GetInt32(4),
+                reader.GetString(5)));
         }
 
         return result;
-    }
-
-    public SnapshotInfo? GetSnapshot(long id) => GetSnapshots().FirstOrDefault(s => s.Id == id);
-
-    public long? GetLatestSnapshotId(string planet)
-    {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT MAX(id) FROM snapshots WHERE planet = $planet;";
-        cmd.Parameters.AddWithValue("$planet", planet);
-        var value = cmd.ExecuteScalar();
-        return value is long id ? id : null;
     }
 
     /// <summary>Min/avg/max price of an item across snapshots (its market price history).</summary>

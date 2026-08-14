@@ -1,2 +1,21 @@
 bin/
 obj/
+
+# Database SQLite e file collegati (WAL, shm, lock, backup di migrazione)
+*.db
+*.db-wal
+*.db-shm
+*.db.lock
+*.bak
+
+# Esportazioni
+*.csv
+
+# Elenchi di productId grezzi, usati durante l'esplorazione iniziale dell'API
+p0.txt
+p1.txt
+
+# IDE
+.vs/
+.idea/
+*.user

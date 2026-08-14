@@ -66,20 +66,26 @@ potenza, ratio sulla stat di riferimento, colpi e cooldown.
 ```
 NC-Market/
 ├── NCMarket.sln
+├── global.json                 Versione dell'SDK .NET richiesta (9.0)
 ├── README.md
-└── src/
-    ├── NCMarket.Core/          Libreria riusabile
-    │   ├── Planet.cs           Registro pianeti/endpoint (Odin, Heimdall; default Heimdall)
-    │   ├── EquipmentType.cs    Enum equipaggiamenti + parsing
-    │   ├── Models/             DTO della risposta del market service
-    │   ├── MarketClient.cs     Client HTTP con paginazione automatica
-    │   ├── NameProvider.cs     Risoluzione id -> nome per item e skill (cache locale)
-    │   ├── ProductFormat.cs    Formattazione statistiche e skill delle inserzioni
-    │   ├── SnapshotCsvExporter.cs  Export CSV flat di uno snapshot
-    │   ├── DealFinder.cs       Rilevazione occasioni (confronto con le mediane storiche)
-    │   └── MarketDb.cs         Storicizzazione su SQLite + query analitiche
-    └── NCMarket.Cli/           Applicazione console
-        └── Program.cs          Comandi: fetch, snapshot, snapshots, history, stats, deals, export, prune
+├── .github/workflows/ci.yml    Build, test e build dell'immagine Docker su push e PR
+├── src/
+│   ├── NCMarket.Core/          Libreria riusabile
+│   │   ├── Planet.cs           Registro pianeti/endpoint (Odin, Heimdall; default Heimdall)
+│   │   ├── EquipmentType.cs    Enum equipaggiamenti + parsing
+│   │   ├── Models/             DTO della risposta del market service
+│   │   ├── MarketClient.cs     Client HTTP con paginazione automatica
+│   │   ├── NameProvider.cs     Risoluzione id -> nome per item e skill (cache locale)
+│   │   ├── ProductFormat.cs    Formattazione statistiche e skill delle inserzioni
+│   │   ├── SnapshotCsvExporter.cs  Export CSV flat di uno snapshot
+│   │   ├── DealFinder.cs       Rilevazione occasioni (confronto con le mediane storiche)
+│   │   ├── DbLock.cs           Mutua esclusione fra i comandi che scrivono sul database
+│   │   └── MarketDb.cs         Storicizzazione su SQLite + query analitiche
+│   └── NCMarket.Cli/           Applicazione console
+│       ├── CommandLine.cs      Opzioni ammesse per verbo e loro validazione
+│       └── Program.cs          Comandi: fetch, snapshot, snapshots, history, stats, deals, export, prune
+└── tests/
+    └── NCMarket.Tests/         xUnit: schema e migrazioni, baseline, prune, deals, CLI
 ```
 
 Scelte progettuali:
@@ -98,7 +104,7 @@ Scelte progettuali:
   tracciata dalla tabella `sightings` (due interi per riga). Le analisi storiche
   confrontano gli snapshot tra loro come prima.
 
-## Schema del database (v2)
+## Schema del database (v3)
 
 ```sql
 snapshots(
@@ -106,7 +112,8 @@ snapshots(
     planet TEXT,              -- odin | heimdall
     taken_at_utc TEXT,        -- ISO 8601
     item_sub_types TEXT,      -- sottotipi inclusi, es. "6,7,8,9,10"
-    product_count INTEGER     -- inserzioni osservate al momento della cattura
+    product_count INTEGER,    -- inserzioni osservate al momento della cattura
+    status TEXT               -- partial | complete
 )
 
 listings(                     -- una riga per inserzione unica, scritta una volta sola
@@ -140,11 +147,20 @@ uno snapshot che riosserva un'inserzione già nota aggiunge solo una riga di
 `sightings` (~20 byte) e aggiorna il marcatore *last seen*. Confrontando snapshot
 consecutivi resta possibile (step futuro) dedurre vendite e cancellazioni.
 
+Uno snapshot nasce `partial` e diventa `complete` solo quando la cattura arriva in
+fondo a tutti i tipi richiesti. Se il download di un tipo fallisce, i dati già raccolti
+restano consultabili per id, ma `stats`, `deals --from-snapshot` ed `export` continuano
+a usare **l'ultimo snapshot completo**, invece di lavorare in silenzio su un listino
+monco. Il comando `snapshots` mostra lo stato di ciascuno.
+
 I database creati con lo schema v1 (una copia completa di ogni inserzione per
 snapshot) vengono **migrati automaticamente** alla prima apertura: viene lasciata una
-copia di sicurezza `<db>.v1.bak` accanto al file originale e il database viene
-compattato con `VACUUM`. Il database usa il journal WAL, quindi accanto al file
-possono comparire i file di servizio `-wal` e `-shm`.
+copia di sicurezza `<db>.v1.bak` accanto al file originale (preceduta da un checkpoint
+WAL, così la copia contiene anche le ultime scritture) e il database viene compattato
+con `VACUUM`. I database v2 acquisiscono la colonna `status` in place, senza backup:
+la migrazione non è distruttiva. Il database usa il journal WAL, quindi accanto al file
+possono comparire i file di servizio `-wal` e `-shm`, più un file `.lock` vuoto usato
+per serializzare `snapshot` e `prune`.
 
 ## Comandi CLI
 
@@ -204,6 +220,17 @@ Per aprire il CSV con Excel in italiano usare `--sep ";"`; il file è UTF-8 con 
 Opzioni comuni: `--planet odin|heimdall` (default `heimdall`), `--db <percorso>` per il
 database, `--no-names` per saltare la risoluzione dei nomi di item e skill.
 
+Ogni comando accetta soltanto le proprie opzioni: un'opzione sconosciuta, ripetuta o
+priva di valore, un argomento senza `--` o un valore fuori intervallo fanno terminare la
+CLI con codice 2 senza eseguire nulla. Un refuso come `deals --dicount 30` è quindi un
+errore esplicito, non un filtro che non si applica.
+
+Test:
+
+```bash
+dotnet test
+```
+
 ## Deploy su server (Docker + Coolify)
 
 Il repository contiene un `Dockerfile` multi-stage (build con l'SDK .NET 9, runtime su
@@ -222,7 +249,12 @@ Punti chiave:
   funziona anche in esecuzione one-shot;
 - lo script `docker/snapshot-job` è il job da schedulare: esegue `snapshot` e, se
   `NCMARKET_EXPORT=1`, anche l'`export` CSV in `/data/NCMarket/exports`. Esce con codice
-  diverso da zero in caso di errore, così lo scheduler può notificare il fallimento.
+  diverso da zero in caso di errore, così lo scheduler può notificare il fallimento;
+- il container gira come utente non privilegiato (`app`, l'utente standard delle immagini
+  .NET): `/data` gli appartiene, e un volume Docker vuoto montato lì ne eredita i permessi.
+  Un volume che contiene già dati scritti da una versione precedente dell'immagine, quando
+  il processo girava come root, va reso accessibile una volta sola:
+  `docker run --rm -u 0 --entrypoint chown -v ncmarket-data:/data ncmarket -R app:app /data`.
 
 ```bash
 # build ed esecuzione one-shot in locale
@@ -240,7 +272,10 @@ Grazie all'archiviazione deduplicata (schema v2) uno snapshot scrive per intero 
 inserzioni mai viste prima; quelle già note costano ~20 byte l'una. La crescita del
 database dipende quindi dal ricambio del mercato, non dalla frequenza degli snapshot.
 Per mettere un tetto allo storico si può schedulare anche `prune` (default: conserva
-365 giorni), ad esempio una volta a settimana con un secondo *Scheduled Task*.
+365 giorni), ad esempio una volta a settimana con un secondo *Scheduled Task*. I due job
+non hanno bisogno di essere sfasati a mano: `snapshot` e `prune` prendono un lock su
+`<database>.lock`, quindi se si sovrappongono il secondo attende (fino a 30 minuti) invece
+di fallire sul `VACUUM`.
 
 ## Piano di sviluppo
 
@@ -263,6 +298,9 @@ Per mettere un tetto allo storico si può schedulare anche `prune` (default: con
   inserzioni ripetute tra snapshot costano ~20 byte invece di una copia completa, con
   migrazione automatica dei database v1; comando `prune` (default: 365 giorni) per
   limitare la crescita del database.
+- **Integrità dei dati raccolti** ✅ — schema v3: gli snapshot interrotti restano marcati
+  come parziali e non vengono più scelti come "ultimo snapshot"; la CLI rifiuta opzioni e
+  argomenti non riconosciuti; suite di test xUnit e CI su push e pull request.
 - **Rilevazione vendite**: confronto tra snapshot consecutivi per distinguere item
   venduti da item ritirati (incrocio con le transazioni `BuyProduct` via 9cscan/mimir).
 - **Filtri avanzati**: il servizio supporta anche `stat`, `itemIds[]`, `iconIds[]`,
