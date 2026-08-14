@@ -378,8 +378,8 @@ async Task<int> DealsAsync()
         : ", rarità " + string.Join(",", grades.OrderBy(g => g).Select(g => (Grade)g));
     Console.WriteLine(
         $"Occasioni su {planet.Name} — sconto ≥ {discount}% sulla mediana storica del " +
-        $"rapporto prezzo/CP per item+livello (campioni ≥ {minSamples}{window}{gradeScope}) — " +
-        $"prime {Math.Min(top, deals.Count)} di {deals.Count}:");
+        $"rapporto prezzo/CP per item+livello+opzioni (campioni ≥ {minSamples}{window}" +
+        $"{gradeScope}) — prime {Math.Min(top, deals.Count)} di {deals.Count}:");
     Console.WriteLine();
 
     // Price/CP ratios are tiny (often < 1e-4): the inverse CP-per-NCG is shown
@@ -387,10 +387,13 @@ async Task<int> DealsAsync()
     PrintTable(
         new[]
         {
-            "#", "ItemId", "Nome", "Tipo", "Gr", "Lv", "CP", "Prezzo NCG",
+            "#", "ItemId", "Nome", "Tipo", "Gr", "Lv", "Opz", "CP", "Prezzo NCG",
             "CP/NCG", "Med CP/NCG", "Sconto%", "Sconto prezzo%", "Camp.",
         },
-        new[] { true, true, false, false, true, true, true, true, true, true, true, true, true },
+        new[]
+        {
+            true, true, false, false, true, true, true, true, true, true, true, true, true, true,
+        },
         deals.Take(top).Select((d, i) => new[]
         {
             (i + 1).ToString(culture),
@@ -401,6 +404,7 @@ async Task<int> DealsAsync()
             ((EquipmentType)d.Product.ItemSubType).ToString(),
             d.Product.Grade.ToString(culture),
             d.Product.Level.ToString(culture),
+            d.Product.OptionCountFromCombination.ToString(culture),
             d.Product.CombatPoint.ToString("N0", culture),
             d.Product.Price.ToString("N2", culture),
             d.PricePerCp is double ppc ? (1 / ppc).ToString("N0", culture) : "-",

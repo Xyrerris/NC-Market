@@ -189,13 +189,16 @@ dotnet run --project src/NCMarket.Cli -- history --item 10152001
 dotnet run --project src/NCMarket.Cli -- stats --type weapon
 
 # Occasioni: inserzioni correnti (mercato live) a prezzo conveniente rispetto agli
-# storici del database. Il confronto avviene tra item comparabili (stesso item e
-# livello) sulle inserzioni distinte viste negli snapshot; la metrica primaria è il
-# rapporto NCG/CP (un CP alto a basso prezzo è un'occasione), lo sconto sul prezzo
-# puro è mostrato come colonna secondaria
+# storici del database. Il confronto avviene tra item comparabili — stesso item,
+# stesso livello e stesso numero di opzioni — sulle inserzioni distinte viste negli
+# snapshot; la metrica primaria è il rapporto NCG/CP (un CP alto a basso prezzo è
+# un'occasione), lo sconto sul prezzo puro è mostrato come colonna secondaria
 dotnet run --project src/NCMarket.Cli -- deals --discount 30
 
-# Occasioni sull'ultimo snapshot (senza download live), con soglie personalizzate
+# Occasioni sull'ultimo snapshot (senza download live), con soglie personalizzate.
+# Nota: i comparabili sono partizionati anche per numero di opzioni, quindi i bucket
+# sono più piccoli; sugli item poco scambiati può servire abbassare --min-samples
+# (default 5) o allargare la finestra --days per avere abbastanza campioni
 dotnet run --project src/NCMarket.Cli -- deals --type ring --from-snapshot --min-samples 3 --days 14
 
 # Solo le rarità indicate (numero 1-8 o nome lib9c: normal, rare, epic, unique,
@@ -311,7 +314,8 @@ di fallire sul `VACUUM`.
   serie storica (mediane mobili, percentili per grade/CP).
 - **Segnalazione occasioni** ✅ — comando `deals`: confronto tra le offerte correnti
   (mercato live o ultimo snapshot) e le mediane storiche di prezzo e NCG/CP per
-  coppia (item, livello), con soglie di sconto e campioni minimi configurabili.
+  terna (item, livello, numero di opzioni), con soglie di sconto e campioni minimi
+  configurabili.
 - **Reportistica**: dashboard e grafici andamento prezzi (l'export CSV è già disponibile
   con il comando `export`).
 

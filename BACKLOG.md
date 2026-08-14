@@ -6,7 +6,10 @@ come verificare che siano chiusi. Il piano di prodotto a lungo termine resta nel
 [README](README.md#piano-di-sviluppo); qui c'è il dettaglio operativo.
 
 **Aggiornato il 2026-08-13**: chiusi tutti i P0, più P2.1, P2.2, P2.3 e la maggior parte
-di P2.6. Restano aperti P1.1, P1.2, P2.4, P2.5.
+di P2.6.
+
+**Aggiornato il 2026-08-14**: chiuso P1.2 (bucket dei comparabili). Restano aperti P1.1,
+P2.4, P2.5 e l'ultimo punto di P2.6.
 
 Legenda priorità:
 
@@ -137,9 +140,9 @@ sistema operativo anche se il processo viene ucciso.
 
 ---
 
-## P1 — Il limite concettuale del motore `deals` (aperto)
+## P1 — Il limite concettuale del motore `deals`
 
-### P1.1 — I baseline usano prezzi richiesti, non prezzi di vendita
+### P1.1 — I baseline usano prezzi richiesti, non prezzi di vendita (aperto)
 
 **Dove**: [src/NCMarket.Core/MarketDb.cs](src/NCMarket.Core/MarketDb.cs) (`GetPriceBaselines`)
 
@@ -171,22 +174,40 @@ venditori, non i prezzi.
 **Fatto quando**: i baseline sono calcolabili sulle sole inserzioni concluse e `deals`
 espone su quale popolazione sta confrontando.
 
-### P1.2 — Bucket dei comparabili troppo grossolano
+### P1.2 — Bucket dei comparabili troppo grossolano ✅ FATTO
 
 **Dove**: [src/NCMarket.Core/DealFinder.cs](src/NCMarket.Core/DealFinder.cs),
 [src/NCMarket.Core/MarketDb.cs](src/NCMarket.Core/MarketDb.cs)
 
-La chiave di confronto è `(item_id, level)`: ignora `option_count`, tipo elementale e
+La chiave di confronto era `(item_id, level)`: ignorava `option_count`, tipo elementale e
 skill, che muovono il prezzo quanto il livello. Un +0 con 4 opzioni e un +0 con 1 opzione
-finiscono nello stesso bucket e si "scontano" a vicenda.
+finivano nello stesso bucket e si "scontavano" a vicenda.
 
-**Intervento**: aggiungere `option_count` alla chiave (costo quasi nullo, effetto
-immediato). In prospettiva, sostituire il bucketing con un modello di prezzo su
-`(item_id, level, option_count, grade)` normalizzato per CP, con statistiche robuste
-(mediana + MAD invece della sola mediana) e soglia minima di campioni per bucket.
+**Fatto**: la chiave è ora il tipo `BaselineKey(ItemId, Level, OptionCount)`, con il
+metodo `BaselineKey.Of(product)` come unico punto in cui la chiave viene derivata da
+un'inserzione — così i bucket costruiti da `GetPriceBaselines` e le ricerche fatte da
+`DealFinder` non possono divergere. `PriceBaseline` porta la chiave invece di
+`ItemId`/`Level` sciolti. Nessuna migrazione: `option_count` era già una colonna di
+`listings`, la query si limita a leggerla. Il comando `deals` mostra la colonna `Opz` e
+dichiara nell'intestazione che il confronto è per item+livello+opzioni.
 
-**Fatto quando**: due inserzioni dello stesso item e livello ma con numero di opzioni
-diverso non si confrontano fra loro.
+Il `grade` non è stato aggiunto alla chiave di proposito: è una proprietà dell'`item_id`,
+quindi non partizionerebbe nulla.
+
+**Conseguenza operativa**: i bucket sono più piccoli, quindi con `--min-samples 5` (il
+default) sugli item poco scambiati `deals` restituisce meno righe di prima. Sono meno ma
+valide: prima il numero era gonfiato da confronti fra pezzi non comparabili. Il README lo
+segnala accanto all'esempio del comando.
+
+**Resta aperto, in prospettiva** (non necessario a chiudere questa voce): sostituire il
+bucketing con un modello di prezzo normalizzato per CP e statistiche robuste (mediana +
+MAD invece della sola mediana). Ha senso affrontarlo dopo P1.1, quando i baseline saranno
+calcolati sulle inserzioni concluse: cambiare stimatore su una popolazione ancora
+sbagliata non migliora il risultato.
+
+**Verificato da**: `DealFinderTests.A_listing_is_not_compared_with_a_different_option_count`,
+`Each_option_count_is_measured_against_its_own_baseline`,
+`MarketDbTests.GetPriceBaselines_keeps_a_separate_bucket_per_option_count`.
 
 ---
 
@@ -194,15 +215,16 @@ diverso non si confrontano fra loro.
 
 ### P2.1 — Nessun test ✅ FATTO
 
-Progetto `tests/NCMarket.Tests` (xUnit), 35 test, nessuna dipendenza di rete:
+Progetto `tests/NCMarket.Tests` (xUnit), 38 test, nessuna dipendenza di rete:
 
 - `MarketDbTests` — stato degli snapshot, `GetLatestSnapshotId`, deduplicazione di
-  `AddProducts`, mediane e finestra `--days` di `GetPriceBaselines`, `Prune` con e senza
-  `--dry-run`, uso effettivo dell'indice via `EXPLAIN QUERY PLAN`;
+  `AddProducts`, mediane, partizionamento dei bucket e finestra `--days` di
+  `GetPriceBaselines`, `Prune` con e senza `--dry-run`, uso effettivo dell'indice via
+  `EXPLAIN QUERY PLAN`;
 - `MarketDbMigrationTests` — un database v2 costruito a mano viene migrato a v3
   conservando i dati e classificando correttamente snapshot completi e parziali;
 - `DealFinderTests` — soglie, campioni minimi, metrica CP contro metrica prezzo,
-  ordinamento;
+  comparabilità per numero di opzioni, ordinamento;
 - `DbLockTests` — il secondo detentore attende e poi rinuncia; il rilascio libera il lock;
 - `CommandLineTests` — tutti i modi in cui una riga di comando può essere sbagliata.
 
@@ -250,8 +272,11 @@ MIT è la scelta usuale; Apache-2.0 aggiunge una concessione esplicita di brevet
 - ✅ `MarketClient` imposta uno `User-Agent` che identifica il progetto e attende 250 ms
   fra una pagina e la successiva.
 - ⬜ `GetPriceBaselines` carica ancora tutte le righe in memoria per fare il bucketing in
-  C#. Accettabile oggi; da rivedere quando lo storico crescerà (l'alternativa è aggregare
-  in SQL). Da affrontare insieme a P1.2, che tocca comunque quella query.
+  C#. Accettabile oggi; da rivedere quando lo storico crescerà. Non è stato fatto insieme
+  a P1.2 come previsto: l'alternativa è aggregare in SQL, ma SQLite non ha una funzione
+  mediana e la versione con funzioni finestra è nettamente meno leggibile di quella in
+  C#, a fronte di un problema di prestazioni che oggi non si manifesta. Da riprendere
+  quando ci sarà una misura che lo giustifichi, o insieme al passaggio a mediana + MAD.
 
 ---
 
@@ -261,7 +286,7 @@ MIT è la scelta usuale; Apache-2.0 aggiunge una concessione esplicita di brevet
 |---|---|---|---|
 | 1 | Merge del branch su `main` | minimo | Allinea il repository e attiva la CI sul ramo principale |
 | 2 | Scelta del LICENSE (P2.5) | minimo | Serve una decisione, non del lavoro |
-| 3 | **P1.1** (rilevazione vendite) + P1.2 | medio-alto | Rende `deals` effettivamente affidabile; i prerequisiti sono chiusi |
+| 3 | **P1.1** (rilevazione vendite) | medio-alto | Rende `deals` effettivamente affidabile; i prerequisiti sono chiusi, P1.2 compreso |
 | 4 | Completare la copertura dei test (P2.1, parte residua) | basso | Export CSV e parsing nomi sono ancora senza asserzioni |
 | 5 | Notifica occasioni (webhook Telegram/Discord) dal job | basso | È il payoff del deploy su server: non si leggono CSV, si viene avvisati |
 | 6 | Filtri avanzati API (`stat`, `itemIds[]`, `isCustom`) + output `--json` | basso | Già in roadmap; il JSON abilita la dashboard |

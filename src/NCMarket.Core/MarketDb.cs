@@ -33,13 +33,33 @@ public sealed record ItemStatsRow(
     double MinPrice, double AvgPrice, double MaxPrice, int MaxCombatPoint, int MaxLevel);
 
 /// <summary>
-/// Historical price baseline for a bucket of comparable listings (same item_id and
-/// level): median price and median price-per-CP over the distinct listings observed
-/// across snapshots. <see cref="MedianPricePerCp"/> is null when no sample in the
-/// bucket has a positive combat point (<see cref="CpSamples"/> is 0).
+/// Identity of a bucket of comparable listings. Enhancement level is not the only
+/// attribute that moves the price: a piece that rolled four random options is worth
+/// considerably more than the same item at the same level with one, so the two are not
+/// comparables and must not discount each other. Grade is deliberately absent — it is a
+/// property of the item id, so it would partition nothing.
+/// </summary>
+public readonly record struct BaselineKey(int ItemId, int Level, int OptionCount)
+{
+    /// <summary>
+    /// The bucket a listing belongs to. Single source of the key, so the buckets built
+    /// by <see cref="MarketDb.GetPriceBaselines"/> and the lookups done by
+    /// <see cref="DealFinder"/> cannot drift apart.
+    /// </summary>
+    public static BaselineKey Of(ItemProduct product) =>
+        new(product.ItemId, product.Level, product.OptionCountFromCombination);
+
+    public override string ToString() => $"item {ItemId}, +{Level}, {OptionCount} opzioni";
+}
+
+/// <summary>
+/// Historical price baseline for a bucket of comparable listings (see
+/// <see cref="BaselineKey"/>): median price and median price-per-CP over the distinct
+/// listings observed across snapshots. <see cref="MedianPricePerCp"/> is null when no
+/// sample in the bucket has a positive combat point (<see cref="CpSamples"/> is 0).
 /// </summary>
 public sealed record PriceBaseline(
-    int ItemId, int Level, int Samples, double MedianPrice,
+    BaselineKey Key, int Samples, double MedianPrice,
     int CpSamples, double? MedianPricePerCp);
 
 /// <summary>
@@ -624,21 +644,21 @@ public sealed class MarketDb : IDisposable
     }
 
     /// <summary>
-    /// Per-(item_id, level) historical price baselines over the listings of a planet.
-    /// Listings are stored deduplicated, so each one contributes a single sample no
-    /// matter how many snapshots observed it and stale listings do not dominate the
+    /// Per-<see cref="BaselineKey"/> historical price baselines over the listings of a
+    /// planet. Listings are stored deduplicated, so each one contributes a single sample
+    /// no matter how many snapshots observed it and stale listings do not dominate the
     /// medians. The <paramref name="sinceUtc"/> window keeps a listing when it was
     /// still on sale within the window (its last sighting is inside it). Rows with a
     /// non-positive combat point contribute to the price median only. Listings from
     /// the latest snapshot are part of the baseline as well; with a reasonable
     /// minimum sample size their effect on the median is negligible.
     /// </summary>
-    public IReadOnlyDictionary<(int ItemId, int Level), PriceBaseline> GetPriceBaselines(
+    public IReadOnlyDictionary<BaselineKey, PriceBaseline> GetPriceBaselines(
         string planet, EquipmentType? type = null, DateTime? sinceUtc = null)
     {
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
-            SELECT item_id, level, price, combat_point
+            SELECT item_id, level, option_count, price, combat_point
             FROM listings
             WHERE planet = $planet
               AND ($subType IS NULL OR item_sub_type = $subType)
@@ -652,13 +672,13 @@ public sealed class MarketDb : IDisposable
                 ? DBNull.Value
                 : sinceUtc.Value.ToString("O", CultureInfo.InvariantCulture));
 
-        var buckets = new Dictionary<(int ItemId, int Level), (List<double> Prices, List<double> PricesPerCp)>();
+        var buckets = new Dictionary<BaselineKey, (List<double> Prices, List<double> PricesPerCp)>();
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
         {
-            var key = (reader.GetInt32(0), reader.GetInt32(1));
-            var price = reader.GetDouble(2);
-            var combatPoint = reader.GetInt32(3);
+            var key = new BaselineKey(reader.GetInt32(0), reader.GetInt32(1), reader.GetInt32(2));
+            var price = reader.GetDouble(3);
+            var combatPoint = reader.GetInt32(4);
             if (!buckets.TryGetValue(key, out var bucket))
             {
                 bucket = (new List<double>(), new List<double>());
@@ -672,12 +692,11 @@ public sealed class MarketDb : IDisposable
             }
         }
 
-        var result = new Dictionary<(int ItemId, int Level), PriceBaseline>(buckets.Count);
-        foreach (var ((itemId, level), (prices, pricesPerCp)) in buckets)
+        var result = new Dictionary<BaselineKey, PriceBaseline>(buckets.Count);
+        foreach (var (key, (prices, pricesPerCp)) in buckets)
         {
-            result[(itemId, level)] = new PriceBaseline(
-                itemId,
-                level,
+            result[key] = new PriceBaseline(
+                key,
                 prices.Count,
                 Median(prices),
                 pricesPerCp.Count,

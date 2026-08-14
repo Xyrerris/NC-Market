@@ -7,6 +7,11 @@ public sealed class MarketDbTests
 {
     private static readonly DateTime Now = new(2026, 8, 13, 12, 0, 0, DateTimeKind.Utc);
 
+    /// <summary>The comparables bucket of <see cref="TestData.Product"/>'s defaults.</summary>
+    private static BaselineKey Bucket(
+        int itemId = 10100000, int level = 0, int optionCount = 1) =>
+        new(itemId, level, optionCount);
+
     [Fact]
     public void A_snapshot_is_partial_until_it_is_finalized()
     {
@@ -87,7 +92,7 @@ public sealed class MarketDbTests
         Assert.Equal(2L, Scalar(conn, "SELECT COUNT(*) FROM sightings;"));
 
         // Una sola inserzione distinta: il baseline non deve contarla due volte.
-        var baseline = db.GetPriceBaselines("heimdall")[(10100000, 0)];
+        var baseline = db.GetPriceBaselines("heimdall")[Bucket()];
         Assert.Equal(1, baseline.Samples);
     }
 
@@ -107,12 +112,36 @@ public sealed class MarketDbTests
 
         var baselines = db.GetPriceBaselines("heimdall");
 
-        var level0 = baselines[(10100000, 0)];
+        var level0 = baselines[Bucket()];
         Assert.Equal(3, level0.Samples);
         Assert.Equal(200d, level0.MedianPrice);
         Assert.Equal(0.2d, level0.MedianPricePerCp);
 
-        Assert.Equal(900d, baselines[(10100000, 3)].MedianPrice);
+        Assert.Equal(900d, baselines[Bucket(level: 3)].MedianPrice);
+    }
+
+    [Fact]
+    public void GetPriceBaselines_keeps_a_separate_bucket_per_option_count()
+    {
+        using var temp = new TempDatabase();
+        using var db = temp.Open();
+
+        // Stesso item e stesso livello: senza l'option_count nella chiave le due
+        // popolazioni si mescolerebbero in un'unica mediana da 550 NCG.
+        TestData.AddCompleteSnapshot(db, Now, new[]
+        {
+            TestData.Product(optionCount: 1, price: 100m, combatPoint: 1000),
+            TestData.Product(optionCount: 1, price: 100m, combatPoint: 1000),
+            TestData.Product(optionCount: 4, price: 1000m, combatPoint: 1000),
+            TestData.Product(optionCount: 4, price: 1000m, combatPoint: 1000),
+        });
+
+        var baselines = db.GetPriceBaselines("heimdall");
+
+        Assert.Equal(2, baselines.Count);
+        Assert.Equal(100d, baselines[Bucket(optionCount: 1)].MedianPrice);
+        Assert.Equal(1000d, baselines[Bucket(optionCount: 4)].MedianPrice);
+        Assert.Equal(2, baselines[Bucket(optionCount: 4)].Samples);
     }
 
     [Fact]
@@ -127,7 +156,7 @@ public sealed class MarketDbTests
             TestData.Product(price: 200m, combatPoint: 0),
         });
 
-        var baseline = db.GetPriceBaselines("heimdall")[(10100000, 0)];
+        var baseline = db.GetPriceBaselines("heimdall")[Bucket()];
         Assert.Equal(0, baseline.CpSamples);
         Assert.Null(baseline.MedianPricePerCp);
     }
@@ -144,11 +173,11 @@ public sealed class MarketDbTests
             db, Now.AddDays(-1), new[] { TestData.Product(price: 100m) });
 
         var all = db.GetPriceBaselines("heimdall");
-        Assert.Equal(2, all[(10100000, 0)].Samples);
+        Assert.Equal(2, all[Bucket()].Samples);
 
         var recent = db.GetPriceBaselines("heimdall", sinceUtc: Now.AddDays(-7));
-        Assert.Equal(1, recent[(10100000, 0)].Samples);
-        Assert.Equal(100d, recent[(10100000, 0)].MedianPrice);
+        Assert.Equal(1, recent[Bucket()].Samples);
+        Assert.Equal(100d, recent[Bucket()].MedianPrice);
     }
 
     [Fact]

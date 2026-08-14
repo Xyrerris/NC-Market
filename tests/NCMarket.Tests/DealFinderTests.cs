@@ -4,16 +4,23 @@ namespace NCMarket.Tests;
 
 public sealed class DealFinderTests
 {
-    private static Dictionary<(int ItemId, int Level), PriceBaseline> Baselines(
+    private static Dictionary<BaselineKey, PriceBaseline> Baselines(
         params PriceBaseline[] baselines) =>
-        baselines.ToDictionary(b => (b.ItemId, b.Level));
+        baselines.ToDictionary(b => b.Key);
+
+    /// <summary>A baseline for the bucket of <see cref="TestData.Product"/>'s defaults.</summary>
+    private static PriceBaseline Baseline(
+        int samples, double medianPrice, int cpSamples, double? medianPricePerCp,
+        int itemId = 10100000, int level = 0, int optionCount = 1) =>
+        new(new BaselineKey(itemId, level, optionCount),
+            samples, medianPrice, cpSamples, medianPricePerCp);
 
     [Fact]
     public void A_listing_without_a_comparable_baseline_is_skipped()
     {
         var deals = DealFinder.FindDeals(
             new[] { TestData.Product(itemId: 10100000, level: 0, price: 1m) },
-            Baselines(new PriceBaseline(10100000, 3, 10, 1000, 10, 1)),
+            Baselines(Baseline(10, 1000, 10, 1, level: 3)),
             minDiscountPercent: 10,
             minSamples: 5);
 
@@ -21,11 +28,48 @@ public sealed class DealFinderTests
     }
 
     [Fact]
+    public void A_listing_is_not_compared_with_a_different_option_count()
+    {
+        // Stesso item e stesso livello, ma il baseline è quello dei pezzi con 4 opzioni:
+        // non sono comparabili, quindi l'inserzione resta senza riferimento e viene saltata.
+        var deals = DealFinder.FindDeals(
+            new[] { TestData.Product(optionCount: 1, price: 1m, combatPoint: 100) },
+            Baselines(Baseline(10, 1000, 10, 1, optionCount: 4)),
+            minDiscountPercent: 10,
+            minSamples: 5);
+
+        Assert.Empty(deals);
+    }
+
+    [Fact]
+    public void Each_option_count_is_measured_against_its_own_baseline()
+    {
+        var oneOption = TestData.Product(optionCount: 1, price: 60m, combatPoint: 100);
+        var fourOptions = TestData.Product(optionCount: 4, price: 60m, combatPoint: 100);
+
+        // Il mercato paga 4 NCG per CP i pezzi con 4 opzioni e 1 NCG per CP quelli con una:
+        // la stessa richiesta è un'occasione molto più grossa nel primo bucket.
+        var deals = DealFinder.FindDeals(
+            new[] { oneOption, fourOptions },
+            Baselines(
+                Baseline(10, 100, 10, 1, optionCount: 1),
+                Baseline(10, 400, 10, 4, optionCount: 4)),
+            minDiscountPercent: 10,
+            minSamples: 5);
+
+        Assert.Equal(
+            new[] { fourOptions.ProductId, oneOption.ProductId },
+            deals.Select(d => d.Product.ProductId));
+        Assert.Equal(85d, deals[0].DiscountPercent, precision: 6);
+        Assert.Equal(40d, deals[1].DiscountPercent, precision: 6);
+    }
+
+    [Fact]
     public void A_baseline_with_too_few_samples_is_skipped()
     {
         var deals = DealFinder.FindDeals(
             new[] { TestData.Product(price: 1m) },
-            Baselines(new PriceBaseline(10100000, 0, 4, 1000, 4, 1)),
+            Baselines(Baseline(4, 1000, 4, 1)),
             minDiscountPercent: 10,
             minSamples: 5);
 
@@ -39,7 +83,7 @@ public sealed class DealFinderTests
         // mentre sul solo prezzo lo sconto sarebbe l'88%.
         var deals = DealFinder.FindDeals(
             new[] { TestData.Product(price: 60m, combatPoint: 100) },
-            Baselines(new PriceBaseline(10100000, 0, 10, 500, 10, 1)),
+            Baselines(Baseline(10, 500, 10, 1)),
             minDiscountPercent: 30,
             minSamples: 5);
 
@@ -54,7 +98,7 @@ public sealed class DealFinderTests
     {
         var deals = DealFinder.FindDeals(
             new[] { TestData.Product(price: 60m, combatPoint: 0) },
-            Baselines(new PriceBaseline(10100000, 0, 10, 100, 0, null)),
+            Baselines(Baseline(10, 100, 0, null)),
             minDiscountPercent: 30,
             minSamples: 5);
 
@@ -68,7 +112,7 @@ public sealed class DealFinderTests
     {
         var deals = DealFinder.FindDeals(
             new[] { TestData.Product(price: 95m, combatPoint: 100) },
-            Baselines(new PriceBaseline(10100000, 0, 10, 100, 10, 1)),
+            Baselines(Baseline(10, 100, 10, 1)),
             minDiscountPercent: 10,
             minSamples: 5);
 
@@ -84,7 +128,7 @@ public sealed class DealFinderTests
 
         var deals = DealFinder.FindDeals(
             new[] { mid, tiedButPricier, cheap },
-            Baselines(new PriceBaseline(10100000, 0, 10, 100, 10, 1)),
+            Baselines(Baseline(10, 100, 10, 1)),
             minDiscountPercent: 10,
             minSamples: 5);
 
