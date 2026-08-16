@@ -15,6 +15,9 @@ P2.4, P2.5 e l'ultimo punto di P2.6.
 aperti P2.4, P2.5 e l'ultimo punto di P2.6: nessuno dei tre tocca la correttezza del
 motore di valutazione.
 
+**Aggiornato il 2026-08-16 (2)**: chiuso P2.4 (orchestrazione estratta in `NCMarket.Core`).
+Restano aperti P2.5 — che è una decisione, non del lavoro — e l'ultimo punto di P2.6.
+
 Legenda priorità:
 
 - **P0** — bug che corrompono i dati o li nascondono; da fare prima di aggiungere feature.
@@ -30,7 +33,7 @@ Legenda priorità:
 | Branch di lavoro | `feature/docker-deploy`, **10 commit avanti** su `origin/main` | invariato: il merge su `main` resta da fare |
 | `origin/main` | fermo ai commit iniziali | invariato |
 | Build locale | **fallisce**: SDK 8.0.204 contro target `net9.0` | ✅ verde (SDK 9.0.317, versione fissata da `global.json`) |
-| Test | nessuno | ✅ 46 test xUnit in `tests/NCMarket.Tests` (al 2026-08-16) |
+| Test | nessuno | ✅ 59 test xUnit in `tests/NCMarket.Tests` (al 2026-08-16) |
 | CI | nessuna | ✅ `.github/workflows/ci.yml`: build + test + build dell'immagine Docker |
 | File spuri tracciati | `p0.txt`, `p1.txt` | ✅ rimossi dal tracciamento, `.gitignore` esteso |
 
@@ -247,7 +250,7 @@ calcolano sulle inserzioni concluse, il prerequisito è soddisfatto.
 
 ### P2.1 — Nessun test ✅ FATTO
 
-Progetto `tests/NCMarket.Tests` (xUnit), 46 test, nessuna dipendenza di rete:
+Progetto `tests/NCMarket.Tests` (xUnit), 59 test, nessuna dipendenza di rete:
 
 - `MarketDbTests` — stato degli snapshot, `GetLatestSnapshotId`, deduplicazione di
   `AddProducts`, mediane, partizionamento dei bucket e finestra `--days` di
@@ -260,6 +263,12 @@ Progetto `tests/NCMarket.Tests` (xUnit), 46 test, nessuna dipendenza di rete:
   acquisendo la colonna `max_per_type`;
 - `DealFinderTests` — soglie, campioni minimi, metrica CP contro metrica prezzo,
   comparabilità per numero di opzioni, ordinamento;
+- `SnapshotServiceTests` — cattura completa e finalizzazione, cattura interrotta (i tipi
+  già scaricati restano, lo snapshot resta parziale), limite per tipo registrato,
+  rifiuto di una cattura senza tipi;
+- `DealServiceTests` — i quattro esiti possibili di una ricerca, confronto con l'ultimo
+  snapshot e con il mercato live, filtro rarità, sorgente di mercato mancante o del
+  pianeta sbagliato;
 - `DbLockTests` — il secondo detentore attende e poi rinuncia; il rilascio libera il lock;
 - `CommandLineTests` — tutti i modi in cui una riga di comando può essere sbagliata.
 
@@ -283,14 +292,47 @@ Aggiunti `chown -R $APP_UID:$APP_UID /data` e `USER $APP_UID`, sfruttando l'uten
 privilegiato `app` già presente nelle immagini .NET 8+. Il README documenta il caso del
 volume preesistente popolato da root.
 
-### P2.4 — `Program.cs` monolitico (aperto, ridotto)
+### P2.4 — `Program.cs` monolitico ✅ FATTO
 
-Il parsing degli argomenti è uscito da `Program.cs` ed è finito in `CommandLine.cs`.
-Resta il resto: orchestrazione (`SnapshotAsync`, `DealsAsync`) e presentazione a schermo
-mescolate nello stesso file. Finché la CLI è l'unico consumatore è sostenibile; nel
-momento in cui la roadmap introduce dashboard o servizio schedulato, l'orchestrazione va
-spostata in `NCMarket.Core` come servizi riusabili. Da fare **prima** del punto
-Reportistica della roadmap, non dopo.
+**Dove**: [src/NCMarket.Core/SnapshotService.cs](src/NCMarket.Core/SnapshotService.cs) (nuovo),
+[src/NCMarket.Core/DealService.cs](src/NCMarket.Core/DealService.cs) (nuovo),
+[src/NCMarket.Cli/ConsoleReport.cs](src/NCMarket.Cli/ConsoleReport.cs) (nuovo),
+[src/NCMarket.Cli/Program.cs](src/NCMarket.Cli/Program.cs)
+
+Il parsing degli argomenti era già uscito da `Program.cs` con `CommandLine.cs`; restavano
+orchestrazione e presentazione mescolate nello stesso file di 876 righe. Andava fatto
+**prima** del punto Reportistica della roadmap: una dashboard o un job schedulato
+avrebbero dovuto riscrivere `SnapshotAsync` e `DealsAsync`, non riusarli.
+
+**Fatto**: l'orchestrazione è in `NCMarket.Core` come due servizi che non scrivono nulla
+a schermo.
+
+- `SnapshotService.CaptureAsync` crea lo snapshot, scarica un tipo alla volta, salva ogni
+  tipo appena arriva e finalizza solo alla fine — l'ordine che rende recuperabile una
+  cattura interrotta (P0.1). Restituisce un `SnapshotReport` (id, composizione, totale).
+- `DealService.FindAsync` calcola le baseline, procura il listino da giudicare (mercato
+  live o ultimo snapshot), applica il filtro rarità e chiama `DealFinder`. I tre modi in
+  cui la domanda non ha risposta — niente storico, nessuna inserzione ancora conclusa,
+  nessuno snapshot completo — tornano come `DealStatus`, non come risultato vuoto: sono
+  situazioni diverse e nessuna significa "non c'è niente di conveniente".
+- L'avanzamento passa da `ICaptureProgress`: la CLI riscrive una riga per tipo, un job
+  schedulato scriverebbe su log. `IMarketListingSource` astrae il listino corrente
+  (`MarketClient` la implementa), il che rende i due servizi verificabili senza rete.
+
+Il lock resta fuori dai servizi: serializzare i processi è compito di chi lancia i
+comandi. In `NCMarket.Cli` ogni comando ora legge le proprie opzioni, chiama il servizio e
+passa il risultato a `ConsoleReport`, che raccoglie tutto ciò che va a schermo
+(`HelpText` per il manuale, `ConsoleProgress` per l'avanzamento). `Program.cs` passa da
+876 a 405 righe e l'output della CLI è invariato.
+
+**In più**: `snapshot --types ,,` creava uno snapshot senza alcun tipo, che veniva
+finalizzato come *completo* e diventava l'ultimo snapshot del pianeta, nascondendo il
+listino vero a `stats`, `deals` ed `export`. Ora è un errore con codice 2, e il servizio
+rifiuta comunque una cattura senza tipi.
+
+**Verificato da**: `SnapshotServiceTests` (4 casi: cattura completa, cattura interrotta,
+limite per tipo, nessun tipo) e `DealServiceTests` (9 casi: i quattro `DealStatus`,
+percorso snapshot e percorso live, filtro rarità, sorgente mancante, pianeta sbagliato).
 
 ### P2.5 — Manca il LICENSE (aperto, richiede una decisione)
 
@@ -323,10 +365,9 @@ MIT è la scelta usuale; Apache-2.0 aggiunge una concessione esplicita di brevet
 | 2 | Scelta del LICENSE (P2.5) | minimo | Serve una decisione, non del lavoro |
 | 3 | Taratura di `--sale-margin` su dati reali | basso | La soglia di default (20%) è una scelta ragionata, non una misura: con qualche giorno di snapshot si può verificare come si sposta la composizione della popolazione |
 | 4 | Completare la copertura dei test (P2.1, parte residua) | basso | Export CSV e parsing nomi sono ancora senza asserzioni |
-| 5 | Notifica occasioni (webhook Telegram/Discord) dal job | basso | È il payoff del deploy su server: non si leggono CSV, si viene avvisati |
+| 5 | Notifica occasioni (webhook Telegram/Discord) dal job | basso | È il payoff del deploy su server: non si leggono CSV, si viene avvisati. `DealService` è già richiamabile senza CLI |
 | 6 | Filtri avanzati API (`stat`, `itemIds[]`, `isCustom`) + output `--json` | basso | Già in roadmap; il JSON abilita la dashboard |
-| 7 | P2.4 (estrarre l'orchestrazione in Core) | medio | Prima di dashboard o servizio schedulato, non dopo |
-| 8 | Mediana + MAD, o vendite on-chain via 9cscan/mimir | medio-alto | I due modi di migliorare ancora la stima, ora che la popolazione è quella giusta |
+| 7 | Mediana + MAD, o vendite on-chain via 9cscan/mimir | medio-alto | I due modi di migliorare ancora la stima, ora che la popolazione è quella giusta |
 
 Con P1.1 chiuso non restano interventi che cambiano la correttezza del motore: i punti 1
 e 2 sono decisioni, il 3 è una misura da fare sui dati veri, gli altri sono estensioni.
