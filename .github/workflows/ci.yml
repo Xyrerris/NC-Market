@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: Build e test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # La versione dell'SDK è fissata da global.json: qui non va ripetuta, così
+      # non può divergere da quella usata in locale.
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test --configuration Release --no-build --verbosity normal
+
+  docker:
+    name: Immagine Docker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Solo build: l'immagine non viene pubblicata, serve a intercettare un
+      # Dockerfile rotto prima del deploy.
+      - name: Build dell'immagine
+        run: docker build --tag ncmarket:ci .

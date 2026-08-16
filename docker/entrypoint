@@ -1,0 +1,19 @@
+#!/bin/sh
+# Entrypoint del container NC-Market.
+#
+#   idle          il container resta vivo senza fare nulla: e' la modalita' usata
+#                 dagli Scheduled Task di Coolify, che eseguono i comandi via
+#                 `docker exec` dentro un container gia' in esecuzione.
+#   <comando>     qualsiasi altra cosa viene passata alla CLI, cosi' che
+#                 `docker run <immagine> snapshot --planet odin` funzioni.
+set -e
+
+case "$1" in
+  idle)
+    echo "NC-Market pronto. In attesa degli Scheduled Task (dati in ${XDG_DATA_HOME:-/data}/NCMarket)."
+    exec sleep infinity
+    ;;
+  *)
+    exec ncmarket "$@"
+    ;;
+esac

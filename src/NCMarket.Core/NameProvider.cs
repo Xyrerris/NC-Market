@@ -3,43 +3,64 @@ using System.Text;
 namespace NCMarket.Core;
 
 /// <summary>
-/// Resolves item ids to English item names using the official client localization file
-/// (<c>item_name.csv</c> from the planetarium/NineChronicles repository), cached locally.
+/// Resolves numeric game ids to English names using the official client localization files
+/// (<c>item_name.csv</c>, <c>skill_name.csv</c> from the planetarium/NineChronicles
+/// repository), cached locally.
 /// </summary>
-public sealed class ItemNameProvider
+public sealed class NameProvider
 {
-    public const string CsvUrl =
+    private const string LocalizationBaseUrl =
         "https://raw.githubusercontent.com/planetarium/NineChronicles/main/" +
-        "nekoyume/Assets/StreamingAssets/Localization/item_name.csv";
+        "nekoyume/Assets/StreamingAssets/Localization/";
 
-    private const string KeyPrefix = "ITEM_NAME_";
+    public const string ItemCsvUrl = LocalizationBaseUrl + "item_name.csv";
+    public const string SkillCsvUrl = LocalizationBaseUrl + "skill_name.csv";
 
     private readonly Dictionary<int, string> _names;
 
-    private ItemNameProvider(Dictionary<int, string> names) => _names = names;
+    private NameProvider(Dictionary<int, string> names) => _names = names;
 
     public int Count => _names.Count;
 
-    public string GetName(int itemId) =>
-        _names.TryGetValue(itemId, out var name) ? name : itemId.ToString();
+    public string GetName(int id) =>
+        _names.TryGetValue(id, out var name) ? name : id.ToString();
 
-    public bool TryGetName(int itemId, out string name) => _names.TryGetValue(itemId, out name!);
+    public bool TryGetName(int id, out string name) => _names.TryGetValue(id, out name!);
 
     /// <summary>Returns a provider that resolves every id to its numeric string.</summary>
-    public static ItemNameProvider Empty { get; } = new(new Dictionary<int, string>());
+    public static NameProvider Empty { get; } = new(new Dictionary<int, string>());
+
+    /// <summary>Loads item names (<c>ITEM_NAME_*</c> keys from <c>item_name.csv</c>).</summary>
+    public static Task<NameProvider> LoadItemNamesAsync(
+        string? cachePath = null,
+        TimeSpan? maxAge = null,
+        HttpClient? http = null,
+        CancellationToken ct = default) =>
+        LoadAsync(ItemCsvUrl, "ITEM_NAME_", cachePath ?? AppPaths.ItemNameCachePath,
+            maxAge, http, ct);
+
+    /// <summary>Loads skill names (<c>SKILL_NAME_*</c> keys from <c>skill_name.csv</c>).</summary>
+    public static Task<NameProvider> LoadSkillNamesAsync(
+        string? cachePath = null,
+        TimeSpan? maxAge = null,
+        HttpClient? http = null,
+        CancellationToken ct = default) =>
+        LoadAsync(SkillCsvUrl, "SKILL_NAME_", cachePath ?? AppPaths.SkillNameCachePath,
+            maxAge, http, ct);
 
     /// <summary>
-    /// Loads the name map from the local cache, refreshing it from GitHub when missing or
+    /// Loads a name map from the local cache, refreshing it from GitHub when missing or
     /// older than <paramref name="maxAge"/> (default 7 days). Falls back to a stale cache,
     /// then to an empty provider, when the download fails.
     /// </summary>
-    public static async Task<ItemNameProvider> LoadAsync(
-        string? cachePath = null,
+    public static async Task<NameProvider> LoadAsync(
+        string csvUrl,
+        string keyPrefix,
+        string cachePath,
         TimeSpan? maxAge = null,
         HttpClient? http = null,
         CancellationToken ct = default)
     {
-        cachePath ??= AppPaths.ItemNameCachePath;
         maxAge ??= TimeSpan.FromDays(7);
 
         var cacheIsFresh = File.Exists(cachePath) &&
@@ -51,7 +72,7 @@ public sealed class ItemNameProvider
             http ??= new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
             try
             {
-                var csv = await http.GetStringAsync(CsvUrl, ct);
+                var csv = await http.GetStringAsync(csvUrl, ct);
                 Directory.CreateDirectory(Path.GetDirectoryName(cachePath)!);
                 await File.WriteAllTextAsync(cachePath, csv, Encoding.UTF8, ct);
             }
@@ -76,23 +97,23 @@ public sealed class ItemNameProvider
         var names = new Dictionary<int, string>();
         foreach (var line in await File.ReadAllLinesAsync(cachePath, Encoding.UTF8, ct))
         {
-            if (!line.StartsWith(KeyPrefix, StringComparison.Ordinal))
+            if (!line.StartsWith(keyPrefix, StringComparison.Ordinal))
             {
                 continue;
             }
 
             var fields = SplitCsvLine(line);
             if (fields.Count < 2 ||
-                !int.TryParse(fields[0].AsSpan(KeyPrefix.Length), out var itemId) ||
+                !int.TryParse(fields[0].AsSpan(keyPrefix.Length), out var id) ||
                 string.IsNullOrWhiteSpace(fields[1]))
             {
                 continue;
             }
 
-            names[itemId] = fields[1];
+            names[id] = fields[1];
         }
 
-        return new ItemNameProvider(names);
+        return new NameProvider(names);
     }
 
     /// <summary>Splits one CSV line honoring double-quoted fields (RFC 4180 style).</summary>

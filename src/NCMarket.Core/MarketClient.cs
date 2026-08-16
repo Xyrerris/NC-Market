@@ -23,6 +23,9 @@ public sealed class MarketClient : IDisposable
         "crystal_per_price", "crystal_per_price_desc",
     };
 
+    /// <summary>Courtesy pause between consecutive pages of the same collection.</summary>
+    private static readonly TimeSpan PageDelay = TimeSpan.FromMilliseconds(250);
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     private readonly HttpClient _http;
@@ -37,9 +40,22 @@ public sealed class MarketClient : IDisposable
         _baseUrl = planet.MarketBaseUrl.TrimEnd('/');
         _ownsHttp = http is null;
         _http = http ?? new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+
+        // The market service is a public endpoint: identify the caller so its operators
+        // can tell this traffic apart (and reach the project) instead of seeing an
+        // anonymous burst of requests.
+        if (!_http.DefaultRequestHeaders.UserAgent.Any())
+        {
+            _http.DefaultRequestHeaders.UserAgent.ParseAdd(
+                "NC-Market/1.0 (+https://github.com/Xyrerris/NC-Market)");
+        }
     }
 
-    /// <summary>Fetches a single page of listings for the given equipment type.</summary>
+    /// <summary>
+    /// Fetches a single page of listings for the given equipment type. Only transient
+    /// failures (5xx, 408, 429, transport errors, timeouts) are retried; a definitive
+    /// answer such as 400 or 404 fails immediately, reporting its status code.
+    /// </summary>
     public async Task<MarketProductsPage> GetProductsPageAsync(
         EquipmentType type,
         int limit,
@@ -61,14 +77,22 @@ public sealed class MarketClient : IDisposable
             try
             {
                 using var response = await _http.GetAsync(url, ct);
-                if (IsTransient(response.StatusCode))
+                if (!response.IsSuccessStatusCode)
                 {
-                    lastError = new HttpRequestException(
-                        $"Il market service ha risposto {(int)response.StatusCode} per {url}");
-                    continue;
+                    if (IsTransient(response.StatusCode))
+                    {
+                        lastError = new HttpRequestException(
+                            $"Il market service ha risposto {(int)response.StatusCode} per {url}");
+                        continue;
+                    }
+
+                    // Not something a retry can fix: a wrong item type, a malformed
+                    // order, a moved endpoint. Fail now instead of after 6 seconds.
+                    throw new InvalidOperationException(
+                        $"Il market service ha risposto {(int)response.StatusCode} " +
+                        $"({response.ReasonPhrase}) per {url}.");
                 }
 
-                response.EnsureSuccessStatusCode();
                 await using var stream = await response.Content.ReadAsStreamAsync(ct);
                 var page = await JsonSerializer.DeserializeAsync<MarketProductsPage>(
                     stream, JsonOptions, ct);
@@ -144,6 +168,8 @@ public sealed class MarketClient : IDisposable
             {
                 break;
             }
+
+            await Task.Delay(PageDelay, ct);
         }
 
         if (maxItems is int max && results.Count > max)

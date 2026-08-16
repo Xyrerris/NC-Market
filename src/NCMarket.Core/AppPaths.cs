@@ -14,5 +14,7 @@ public static class AppPaths
 
     public static string ItemNameCachePath => Path.Combine(DataDir, "item_name.csv");
 
+    public static string SkillNameCachePath => Path.Combine(DataDir, "skill_name.csv");
+
     public static void EnsureDataDir() => Directory.CreateDirectory(DataDir);
 }

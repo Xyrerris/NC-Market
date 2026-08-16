@@ -1,0 +1,25 @@
+#!/bin/sh
+# Job periodico: storicizza il listino corrente e, opzionalmente, ne esporta il CSV.
+#
+# Variabili d'ambiente:
+#   NCMARKET_PLANET   pianeta da interrogare (default: heimdall)
+#   NCMARKET_EXPORT   1 per esportare anche il CSV dello snapshot (default: 0)
+#
+# Con `set -e` un errore fa uscire il job con codice != 0: Coolify segna lo
+# Scheduled Task come fallito e invia la notifica configurata.
+set -eu
+
+PLANET="${NCMARKET_PLANET:-heimdall}"
+DATA_DIR="${XDG_DATA_HOME:-/data}/NCMarket"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+
+echo "[$(date -u +%FT%TZ)] snapshot $PLANET - inizio"
+ncmarket snapshot --planet "$PLANET"
+
+if [ "${NCMARKET_EXPORT:-0}" = "1" ]; then
+  mkdir -p "$DATA_DIR/exports"
+  ncmarket export --planet "$PLANET" --sep ";" \
+    --out "$DATA_DIR/exports/ncmarket-$PLANET-$STAMP.csv"
+fi
+
+echo "[$(date -u +%FT%TZ)] snapshot $PLANET - fine"
