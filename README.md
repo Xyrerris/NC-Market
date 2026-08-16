@@ -66,20 +66,26 @@ potenza, ratio sulla stat di riferimento, colpi e cooldown.
 ```
 NC-Market/
 ├── NCMarket.sln
+├── global.json                 Versione dell'SDK .NET richiesta (9.0)
 ├── README.md
-└── src/
-    ├── NCMarket.Core/          Libreria riusabile
-    │   ├── Planet.cs           Registro pianeti/endpoint (Odin, Heimdall; default Heimdall)
-    │   ├── EquipmentType.cs    Enum equipaggiamenti + parsing
-    │   ├── Models/             DTO della risposta del market service
-    │   ├── MarketClient.cs     Client HTTP con paginazione automatica
-    │   ├── NameProvider.cs     Risoluzione id -> nome per item e skill (cache locale)
-    │   ├── ProductFormat.cs    Formattazione statistiche e skill delle inserzioni
-    │   ├── SnapshotCsvExporter.cs  Export CSV flat di uno snapshot
-    │   ├── DealFinder.cs       Rilevazione occasioni (confronto con le mediane storiche)
-    │   └── MarketDb.cs         Storicizzazione su SQLite + query analitiche
-    └── NCMarket.Cli/           Applicazione console
-        └── Program.cs          Comandi: fetch, snapshot, snapshots, history, stats, deals, export, prune
+├── .github/workflows/ci.yml    Build, test e build dell'immagine Docker su push e PR
+├── src/
+│   ├── NCMarket.Core/          Libreria riusabile
+│   │   ├── Planet.cs           Registro pianeti/endpoint (Odin, Heimdall; default Heimdall)
+│   │   ├── EquipmentType.cs    Enum equipaggiamenti + parsing
+│   │   ├── Models/             DTO della risposta del market service
+│   │   ├── MarketClient.cs     Client HTTP con paginazione automatica
+│   │   ├── NameProvider.cs     Risoluzione id -> nome per item e skill (cache locale)
+│   │   ├── ProductFormat.cs    Formattazione statistiche e skill delle inserzioni
+│   │   ├── SnapshotCsvExporter.cs  Export CSV flat di uno snapshot
+│   │   ├── DealFinder.cs       Rilevazione occasioni (confronto con le mediane storiche)
+│   │   ├── DbLock.cs           Mutua esclusione fra i comandi che scrivono sul database
+│   │   └── MarketDb.cs         Storicizzazione su SQLite, rilevazione vendite, query analitiche
+│   └── NCMarket.Cli/           Applicazione console
+│       ├── CommandLine.cs      Opzioni ammesse per verbo e loro validazione
+│       └── Program.cs          Comandi: fetch, snapshot, snapshots, history, stats, deals, export, prune
+└── tests/
+    └── NCMarket.Tests/         xUnit: schema e migrazioni, baseline, vendite, prune, deals, CLI
 ```
 
 Scelte progettuali:
@@ -98,7 +104,7 @@ Scelte progettuali:
   tracciata dalla tabella `sightings` (due interi per riga). Le analisi storiche
   confrontano gli snapshot tra loro come prima.
 
-## Schema del database (v2)
+## Schema del database (v4)
 
 ```sql
 snapshots(
@@ -106,7 +112,9 @@ snapshots(
     planet TEXT,              -- odin | heimdall
     taken_at_utc TEXT,        -- ISO 8601
     item_sub_types TEXT,      -- sottotipi inclusi, es. "6,7,8,9,10"
-    product_count INTEGER     -- inserzioni osservate al momento della cattura
+    product_count INTEGER,    -- inserzioni osservate al momento della cattura
+    status TEXT,              -- partial | complete
+    max_per_type INTEGER      -- NULL = cattura integrale; il limite --max-per-type altrimenti
 )
 
 listings(                     -- una riga per inserzione unica, scritta una volta sola
@@ -137,14 +145,31 @@ sightings(                    -- appartenenza inserzione <-> snapshot: due inter
 `product_id` è stabile e immutabile per tutta la vita di un'inserzione (un cambio di
 prezzo crea un nuovo prodotto): gli attributi vengono quindi salvati una sola volta e
 uno snapshot che riosserva un'inserzione già nota aggiunge solo una riga di
-`sightings` (~20 byte) e aggiorna il marcatore *last seen*. Confrontando snapshot
-consecutivi resta possibile (step futuro) dedurre vendite e cancellazioni.
+`sightings` (~20 byte) e aggiorna il marcatore *last seen*. È il confronto fra snapshot
+consecutivi a rendere osservabili le sparizioni, e quindi le vendite (vedi
+[Rilevazione delle vendite](#rilevazione-delle-vendite)).
+
+Uno snapshot nasce `partial` e diventa `complete` solo quando la cattura arriva in
+fondo a tutti i tipi richiesti. Se il download di un tipo fallisce, i dati già raccolti
+restano consultabili per id, ma `stats`, `deals --from-snapshot` ed `export` continuano
+a usare **l'ultimo snapshot completo**, invece di lavorare in silenzio su un listino
+monco. Il comando `snapshots` mostra lo stato di ciascuno.
+
+`max_per_type` registra le catture volutamente troncate (`snapshot --max-per-type N`):
+non coprono l'intero listino, quindi l'assenza di un'inserzione da uno di questi
+snapshot non prova che sia uscita dal mercato. Anche loro sono esclusi dalla rilevazione
+delle vendite.
 
 I database creati con lo schema v1 (una copia completa di ogni inserzione per
 snapshot) vengono **migrati automaticamente** alla prima apertura: viene lasciata una
-copia di sicurezza `<db>.v1.bak` accanto al file originale e il database viene
-compattato con `VACUUM`. Il database usa il journal WAL, quindi accanto al file
-possono comparire i file di servizio `-wal` e `-shm`.
+copia di sicurezza `<db>.v1.bak` accanto al file originale (preceduta da un checkpoint
+WAL, così la copia contiene anche le ultime scritture) e il database viene compattato
+con `VACUUM`. I database v2 e v3 acquisiscono le colonne `status` e `max_per_type` in
+place, senza backup: quelle migrazioni non sono distruttive. Gli snapshot già presenti
+valgono come catture integrali, che è ciò che `snapshot` fa quando `--max-per-type` non
+viene passato. Il database usa il journal WAL, quindi accanto al file
+possono comparire i file di servizio `-wal` e `-shm`, più un file `.lock` vuoto usato
+per serializzare `snapshot` e `prune`.
 
 ## Comandi CLI
 
@@ -173,13 +198,26 @@ dotnet run --project src/NCMarket.Cli -- history --item 10152001
 dotnet run --project src/NCMarket.Cli -- stats --type weapon
 
 # Occasioni: inserzioni correnti (mercato live) a prezzo conveniente rispetto agli
-# storici del database. Il confronto avviene tra item comparabili (stesso item e
-# livello) sulle inserzioni distinte viste negli snapshot; la metrica primaria è il
+# storici del database. Il confronto avviene tra item comparabili — stesso item,
+# stesso livello e stesso numero di opzioni — e per default sulle sole inserzioni
+# stimate vendute (vedi "Rilevazione delle vendite"); la metrica primaria è il
 # rapporto NCG/CP (un CP alto a basso prezzo è un'occasione), lo sconto sul prezzo
 # puro è mostrato come colonna secondaria
 dotnet run --project src/NCMarket.Cli -- deals --discount 30
 
-# Occasioni sull'ultimo snapshot (senza download live), con soglie personalizzate
+# Confronto con i prezzi richiesti invece che con le vendite stimate: utile finché
+# lo storico è corto, ma il riferimento è gonfiato dalle inserzioni mai comprate
+dotnet run --project src/NCMarket.Cli -- deals --baseline listed --discount 40
+
+# Euristica di vendita più severa: conta come venduta solo un'inserzione sparita
+# entro il +10% sulla mediana del proprio bucket (default: +20%)
+dotnet run --project src/NCMarket.Cli -- deals --sale-margin 10
+
+# Occasioni sull'ultimo snapshot (senza download live), con soglie personalizzate.
+# Nota: i comparabili sono partizionati anche per numero di opzioni e la popolazione
+# di riferimento sono le sole vendite stimate, quindi i bucket sono piccoli; sugli
+# item poco scambiati può servire abbassare --min-samples (default 5) o allargare la
+# finestra --days per avere abbastanza campioni
 dotnet run --project src/NCMarket.Cli -- deals --type ring --from-snapshot --min-samples 3 --days 14
 
 # Solo le rarità indicate (numero 1-8 o nome lib9c: normal, rare, epic, unique,
@@ -204,6 +242,45 @@ Per aprire il CSV con Excel in italiano usare `--sep ";"`; il file è UTF-8 con 
 Opzioni comuni: `--planet odin|heimdall` (default `heimdall`), `--db <percorso>` per il
 database, `--no-names` per saltare la risoluzione dei nomi di item e skill.
 
+Ogni comando accetta soltanto le proprie opzioni: un'opzione sconosciuta, ripetuta o
+priva di valore, un argomento senza `--` o un valore fuori intervallo fanno terminare la
+CLI con codice 2 senza eseguire nulla. Un refuso come `deals --dicount 30` è quindi un
+errore esplicito, non un filtro che non si applica.
+
+### Rilevazione delle vendite
+
+Un listino non è un mercato: la mediana di tutte le inserzioni osservate include quelle
+che **nessuno ha mai comprato**, che restano nel campione fino al `prune` e tengono alto
+il riferimento. `deals` per default confronta quindi con le sole inserzioni che risultano
+concluse, ricostruite in due passi dal confronto fra snapshot:
+
+1. **sparizione** — un'inserzione ha lasciato il mercato quando uno snapshot successivo
+   che *avrebbe potuto vederla* non l'ha vista: stesso pianeta, stesso tipo di
+   equipaggiamento, `complete` (non una cattura interrotta) e integrale (senza
+   `--max-per-type`). Tutto il resto resta "ancora in vendita": l'assenza da uno snapshot
+   parziale o troncato è un artefatto della cattura, non un fatto di mercato;
+2. **vendita o ritiro** — fra le sparite, chi chiedeva al più `--sale-margin` percento
+   sopra la mediana richiesta del proprio bucket conta come vendita; chi è sparito molto
+   sopra il prezzo corrente è quasi sempre un ritiro o una scadenza, e viene scartato.
+
+L'euristica è volutamente asimmetrica — le vendite si concentrano nella parte bassa del
+book — quindi un riferimento `sold` sta per costruzione sotto il corrispondente `listed`.
+Per questo `deals` dichiara in testa alla tabella su quale popolazione sta confrontando e
+come si è divisa (concluse / ancora in vendita / ritiri stimati): la tolleranza si giudica
+sui numeri, non si prende per buona. `--baseline listed` torna al comportamento
+precedente, `--sale-margin` regola la soglia.
+
+Serve almeno un secondo snapshot completo e integrale perché una sparizione sia
+osservabile: su un database appena creato `deals` lo dice invece di restituire una tabella
+vuota. Il passo successivo in accuratezza è sostituire l'euristica con le transazioni
+`BuyProduct` on-chain (9cscan/mimir), che sono il dato reale.
+
+Test:
+
+```bash
+dotnet test
+```
+
 ## Deploy su server (Docker + Coolify)
 
 Il repository contiene un `Dockerfile` multi-stage (build con l'SDK .NET 9, runtime su
@@ -222,7 +299,12 @@ Punti chiave:
   funziona anche in esecuzione one-shot;
 - lo script `docker/snapshot-job` è il job da schedulare: esegue `snapshot` e, se
   `NCMARKET_EXPORT=1`, anche l'`export` CSV in `/data/NCMarket/exports`. Esce con codice
-  diverso da zero in caso di errore, così lo scheduler può notificare il fallimento.
+  diverso da zero in caso di errore, così lo scheduler può notificare il fallimento;
+- il container gira come utente non privilegiato (`app`, l'utente standard delle immagini
+  .NET): `/data` gli appartiene, e un volume Docker vuoto montato lì ne eredita i permessi.
+  Un volume che contiene già dati scritti da una versione precedente dell'immagine, quando
+  il processo girava come root, va reso accessibile una volta sola:
+  `docker run --rm -u 0 --entrypoint chown -v ncmarket-data:/data ncmarket -R app:app /data`.
 
 ```bash
 # build ed esecuzione one-shot in locale
@@ -240,7 +322,10 @@ Grazie all'archiviazione deduplicata (schema v2) uno snapshot scrive per intero 
 inserzioni mai viste prima; quelle già note costano ~20 byte l'una. La crescita del
 database dipende quindi dal ricambio del mercato, non dalla frequenza degli snapshot.
 Per mettere un tetto allo storico si può schedulare anche `prune` (default: conserva
-365 giorni), ad esempio una volta a settimana con un secondo *Scheduled Task*.
+365 giorni), ad esempio una volta a settimana con un secondo *Scheduled Task*. I due job
+non hanno bisogno di essere sfasati a mano: `snapshot` e `prune` prendono un lock su
+`<database>.lock`, quindi se si sovrappongono il secondo attende (fino a 30 minuti) invece
+di fallire sul `VACUUM`.
 
 ## Piano di sviluppo
 
@@ -263,8 +348,16 @@ Per mettere un tetto allo storico si può schedulare anche `prune` (default: con
   inserzioni ripetute tra snapshot costano ~20 byte invece di una copia completa, con
   migrazione automatica dei database v1; comando `prune` (default: 365 giorni) per
   limitare la crescita del database.
-- **Rilevazione vendite**: confronto tra snapshot consecutivi per distinguere item
-  venduti da item ritirati (incrocio con le transazioni `BuyProduct` via 9cscan/mimir).
+- **Integrità dei dati raccolti** ✅ — schema v4: gli snapshot interrotti restano marcati
+  come parziali e non vengono più scelti come "ultimo snapshot", le catture troncate sono
+  riconoscibili; la CLI rifiuta opzioni e argomenti non riconosciuti; suite di test xUnit
+  e CI su push e pull request.
+- **Rilevazione vendite** ✅ — confronto tra snapshot consecutivi per distinguere item
+  venduti da item ritirati; `deals` calcola per default le mediane sulle sole inserzioni
+  concluse e dichiara la popolazione usata (vedi
+  [Rilevazione delle vendite](#rilevazione-delle-vendite)). Resta da fare l'incrocio con
+  le transazioni `BuyProduct` via 9cscan/mimir, che sostituirebbe l'euristica col dato
+  reale.
 - **Filtri avanzati**: il servizio supporta anche `stat`, `itemIds[]`, `iconIds[]`,
   `isCustom` sulla stessa rotta — esporli nella CLI.
 
@@ -273,7 +366,8 @@ Per mettere un tetto allo storico si può schedulare anche `prune` (default: con
   serie storica (mediane mobili, percentili per grade/CP).
 - **Segnalazione occasioni** ✅ — comando `deals`: confronto tra le offerte correnti
   (mercato live o ultimo snapshot) e le mediane storiche di prezzo e NCG/CP per
-  coppia (item, livello), con soglie di sconto e campioni minimi configurabili.
+  terna (item, livello, numero di opzioni), calcolate sulle inserzioni stimate vendute,
+  con soglie di sconto e campioni minimi configurabili.
 - **Reportistica**: dashboard e grafici andamento prezzi (l'export CSV è già disponibile
   con il comando `export`).
 

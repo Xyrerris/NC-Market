@@ -5,8 +5,32 @@ using NCMarket.Core.Models;
 
 namespace NCMarket.Core;
 
+/// <summary>
+/// Completeness of a snapshot. A snapshot is <see cref="Partial"/> from the moment it is
+/// created until <see cref="MarketDb.FinalizeSnapshot"/> marks it complete, so a capture
+/// interrupted halfway (a network failure on one of the equipment types) stays
+/// recognisable instead of silently passing for a full listing.
+/// </summary>
+public static class SnapshotStatus
+{
+    public const string Partial = "partial";
+    public const string Complete = "complete";
+}
+
 public sealed record SnapshotInfo(
-    long Id, string Planet, DateTime TakenAtUtc, string ItemSubTypes, int ProductCount);
+    long Id, string Planet, DateTime TakenAtUtc, string ItemSubTypes, int ProductCount,
+    string Status, int? MaxPerType)
+{
+    public bool IsComplete => Status == SnapshotStatus.Complete;
+
+    /// <summary>
+    /// True when the capture was cut short by an explicit per-type limit. Such a
+    /// snapshot is a sample of the market, not the whole listing, so a listing missing
+    /// from it is not proof that it left the market (see
+    /// <see cref="MarketDb.GetPriceBaselines"/>).
+    /// </summary>
+    public bool IsTruncated => MaxPerType is not null;
+}
 
 public sealed record ItemHistoryRow(
     long SnapshotId, DateTime TakenAtUtc, int Listings,
@@ -17,14 +41,70 @@ public sealed record ItemStatsRow(
     double MinPrice, double AvgPrice, double MaxPrice, int MaxCombatPoint, int MaxLevel);
 
 /// <summary>
-/// Historical price baseline for a bucket of comparable listings (same item_id and
-/// level): median price and median price-per-CP over the distinct listings observed
-/// across snapshots. <see cref="MedianPricePerCp"/> is null when no sample in the
-/// bucket has a positive combat point (<see cref="CpSamples"/> is 0).
+/// Identity of a bucket of comparable listings. Enhancement level is not the only
+/// attribute that moves the price: a piece that rolled four random options is worth
+/// considerably more than the same item at the same level with one, so the two are not
+/// comparables and must not discount each other. Grade is deliberately absent — it is a
+/// property of the item id, so it would partition nothing.
+/// </summary>
+public readonly record struct BaselineKey(int ItemId, int Level, int OptionCount)
+{
+    /// <summary>
+    /// The bucket a listing belongs to. Single source of the key, so the buckets built
+    /// by <see cref="MarketDb.GetPriceBaselines"/> and the lookups done by
+    /// <see cref="DealFinder"/> cannot drift apart.
+    /// </summary>
+    public static BaselineKey Of(ItemProduct product) =>
+        new(product.ItemId, product.Level, product.OptionCountFromCombination);
+
+    public override string ToString() => $"item {ItemId}, +{Level}, {OptionCount} opzioni";
+}
+
+/// <summary>
+/// Historical price baseline for a bucket of comparable listings (see
+/// <see cref="BaselineKey"/>): median price and median price-per-CP over the distinct
+/// listings observed across snapshots. <see cref="MedianPricePerCp"/> is null when no
+/// sample in the bucket has a positive combat point (<see cref="CpSamples"/> is 0).
 /// </summary>
 public sealed record PriceBaseline(
-    int ItemId, int Level, int Samples, double MedianPrice,
+    BaselineKey Key, int Samples, double MedianPrice,
     int CpSamples, double? MedianPricePerCp);
+
+/// <summary>
+/// Which listings a price baseline is computed from. The distinction is the difference
+/// between measuring what sellers ask and measuring what the market pays.
+/// </summary>
+public enum BaselinePopulation
+{
+    /// <summary>
+    /// Every distinct listing observed. These are asking prices: a piece nobody ever
+    /// bought stays in the sample until <see cref="MarketDb.Prune"/> removes it and
+    /// keeps the median up.
+    /// </summary>
+    Listed,
+
+    /// <summary>
+    /// Only the listings that left the market at a price compatible with a sale, as
+    /// classified by <see cref="MarketDb.GetPriceBaselines"/>.
+    /// </summary>
+    Sold,
+}
+
+/// <summary>
+/// How the listings in scope were classified. <see cref="Open"/> ones are still on sale
+/// (or their disappearance is not yet observable); the two that left the market are told
+/// apart by price. The three add up to <see cref="Total"/>.
+/// </summary>
+public sealed record ListingOutcomes(int Total, int Open, int LikelySold, int LikelyWithdrawn);
+
+/// <summary>
+/// The baselines of a query together with the population they were measured on, so a
+/// caller can state what it is comparing against instead of implying it.
+/// </summary>
+public sealed record BaselineSet(
+    BaselinePopulation Population,
+    ListingOutcomes Outcomes,
+    IReadOnlyDictionary<BaselineKey, PriceBaseline> Baselines);
 
 /// <summary>
 /// Outcome of a retention pass: how many rows were (or, on a dry run, would be)
@@ -43,11 +123,20 @@ public sealed record PruneResult(
 /// <c>listings</c>, and per-snapshot membership is recorded in the two-integer
 /// <c>sightings</c> table. Version 1 databases, which stored a full copy of every
 /// listing per snapshot, are migrated automatically on open (a .v1.bak backup of the
-/// original file is left next to it, see <see cref="MigrationBackupPath"/>).
+/// original file is left next to it, see <see cref="MigrationBackupPath"/>); version 2
+/// and 3 databases gain the <c>snapshots.status</c> and <c>snapshots.max_per_type</c>
+/// columns in place.
 /// </summary>
 public sealed class MarketDb : IDisposable
 {
-    private const long SchemaVersion = 2;
+    /// <summary>
+    /// Default tolerance of the sale heuristic, in percent: a listing that left the
+    /// market asking no more than this much above the median ask of its bucket is
+    /// counted as sold rather than withdrawn.
+    /// </summary>
+    public const int DefaultSaleMarginPercent = 20;
+
+    private const long SchemaVersion = 4;
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
@@ -82,16 +171,43 @@ public sealed class MarketDb : IDisposable
         if (version == 0 && TableExists("products"))
         {
             MigrateV1ToV2();
-            return;
+            version = 2;
         }
 
-        Execute("""
+        CreateSchema();
+
+        // Columns of the snapshots table, which no migration recreates: a database that
+        // already carried a version gets them added in place, one step at a time.
+        if (version is > 0 and < 3)
+        {
+            MigrateV2ToV3();
+        }
+
+        if (version is > 0 and < 4)
+        {
+            MigrateV3ToV4();
+        }
+
+        if (version < SchemaVersion)
+        {
+            Execute($"PRAGMA user_version = {SchemaVersion};");
+        }
+    }
+
+    private void CreateSchema()
+    {
+        Execute($"""
             CREATE TABLE IF NOT EXISTS snapshots(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 planet TEXT NOT NULL,
                 taken_at_utc TEXT NOT NULL,
                 item_sub_types TEXT NOT NULL,
-                product_count INTEGER NOT NULL DEFAULT 0
+                product_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT '{SnapshotStatus.Partial}',
+                -- NULL when the capture covered the whole listing of its types; the
+                -- --max-per-type limit otherwise. A truncated capture is not evidence
+                -- of what was on sale, so sale detection ignores it.
+                max_per_type INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS listings(
@@ -134,21 +250,51 @@ public sealed class MarketDb : IDisposable
             CREATE INDEX IF NOT EXISTS ix_listings_planet_subtype ON listings(planet, item_sub_type);
             CREATE INDEX IF NOT EXISTS ix_listings_item ON listings(item_id);
             CREATE INDEX IF NOT EXISTS ix_sightings_listing ON sightings(listing_id);
+            -- Filter column of both Prune and the --days window of GetPriceBaselines.
+            CREATE INDEX IF NOT EXISTS ix_listings_last_seen ON listings(last_seen_at_utc);
             """);
-
-        if (version < SchemaVersion)
-        {
-            Execute($"PRAGMA user_version = {SchemaVersion};");
-        }
     }
+
+    /// <summary>
+    /// Adds the completeness marker to a v2 database. Snapshots are considered complete
+    /// when they carry a product count, because <see cref="FinalizeSnapshot"/> was the
+    /// only writer of that column: a zero count is exactly the interrupted capture the
+    /// column exists to flag.
+    /// </summary>
+    private void MigrateV2ToV3()
+    {
+        Execute($"""
+            ALTER TABLE snapshots
+                ADD COLUMN status TEXT NOT NULL DEFAULT '{SnapshotStatus.Partial}';
+
+            UPDATE snapshots
+            SET status = '{SnapshotStatus.Complete}'
+            WHERE product_count > 0;
+            """);
+    }
+
+    /// <summary>
+    /// Adds the capture-limit marker to a v3 database. Existing rows keep NULL — a full
+    /// capture — because that is what <c>snapshot</c> does unless <c>--max-per-type</c>
+    /// is passed, and the opposite assumption would throw away the whole history for
+    /// sale detection over a limit that may never have been used.
+    /// </summary>
+    private void MigrateV3ToV4() =>
+        Execute("ALTER TABLE snapshots ADD COLUMN max_per_type INTEGER;");
 
     /// <summary>
     /// One-time in-place migration from schema v1 (a full copy of every listing per
     /// snapshot) to v2. Attribute columns are immutable per product_id, so any row of
     /// the group can provide them; first/last seen come from the snapshot id range.
+    /// Indexes are left to <see cref="CreateSchema"/>, which runs right after.
     /// </summary>
     private void MigrateV1ToV2()
     {
+        // The copy is the only safety net of a destructive migration, and a v1 database
+        // left in WAL mode keeps its most recent writes outside the .db file: fold them
+        // in before taking the backup.
+        Execute("PRAGMA wal_checkpoint(TRUNCATE);");
+
         var backupPath = DbPath + ".v1.bak";
         File.Copy(DbPath, backupPath, overwrite: true);
 
@@ -218,12 +364,8 @@ public sealed class MarketDb : IDisposable
                 JOIN listings l ON l.product_id = p.product_id;
 
                 DROP TABLE products;
-
-                CREATE INDEX ix_listings_planet_subtype ON listings(planet, item_sub_type);
-                CREATE INDEX ix_listings_item ON listings(item_id);
-                CREATE INDEX ix_sightings_listing ON sightings(listing_id);
                 """);
-            Execute($"PRAGMA user_version = {SchemaVersion};");
+            Execute("PRAGMA user_version = 2;");
             Execute("COMMIT;");
         }
         catch
@@ -236,18 +378,29 @@ public sealed class MarketDb : IDisposable
         MigrationBackupPath = backupPath;
     }
 
-    /// <summary>Creates a new snapshot row and returns its id.</summary>
-    public long CreateSnapshot(string planet, IEnumerable<EquipmentType> types, DateTime takenAtUtc)
+    /// <summary>
+    /// Creates a new snapshot row and returns its id. <paramref name="maxPerType"/>
+    /// records a capture deliberately cut short at that many listings per type, so that
+    /// <see cref="GetPriceBaselines"/> does not read the listings it never downloaded as
+    /// listings that left the market.
+    /// </summary>
+    public long CreateSnapshot(
+        string planet,
+        IEnumerable<EquipmentType> types,
+        DateTime takenAtUtc,
+        int? maxPerType = null)
     {
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO snapshots(planet, taken_at_utc, item_sub_types, product_count)
-            VALUES ($planet, $takenAt, $types, 0);
+            INSERT INTO snapshots(
+                planet, taken_at_utc, item_sub_types, product_count, max_per_type)
+            VALUES ($planet, $takenAt, $types, 0, $maxPerType);
             SELECT last_insert_rowid();
             """;
         cmd.Parameters.AddWithValue("$planet", planet);
         cmd.Parameters.AddWithValue("$takenAt", takenAtUtc.ToString("O", CultureInfo.InvariantCulture));
         cmd.Parameters.AddWithValue("$types", string.Join(",", types.Select(t => (int)t)));
+        cmd.Parameters.AddWithValue("$maxPerType", (object?)maxPerType ?? DBNull.Value);
         return (long)cmd.ExecuteScalar()!;
     }
 
@@ -368,27 +521,70 @@ public sealed class MarketDb : IDisposable
         return count;
     }
 
-    /// <summary>Updates the cached product count of a snapshot.</summary>
+    /// <summary>
+    /// Caches the product count of a snapshot and marks it complete: until this runs the
+    /// snapshot stays <see cref="SnapshotStatus.Partial"/> and is ignored by
+    /// <see cref="GetLatestSnapshotId"/>.
+    /// </summary>
     public void FinalizeSnapshot(long snapshotId)
     {
-        Execute($"""
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = $"""
             UPDATE snapshots
-            SET product_count = (SELECT COUNT(*) FROM sightings WHERE snapshot_id = {snapshotId})
-            WHERE id = {snapshotId};
-            """);
+            SET product_count = (SELECT COUNT(*) FROM sightings WHERE snapshot_id = $id),
+                status = '{SnapshotStatus.Complete}'
+            WHERE id = $id;
+            """;
+        cmd.Parameters.AddWithValue("$id", snapshotId);
+        cmd.ExecuteNonQuery();
     }
 
     public IReadOnlyList<SnapshotInfo> GetSnapshots(string? planet = null)
     {
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
-            SELECT id, planet, taken_at_utc, item_sub_types, product_count
+            SELECT id, planet, taken_at_utc, item_sub_types, product_count, status,
+                   max_per_type
             FROM snapshots
             WHERE ($planet IS NULL OR planet = $planet)
             ORDER BY id;
             """;
         cmd.Parameters.AddWithValue("$planet", (object?)planet ?? DBNull.Value);
+        return ReadSnapshots(cmd);
+    }
 
+    public SnapshotInfo? GetSnapshot(long id)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT id, planet, taken_at_utc, item_sub_types, product_count, status,
+                   max_per_type
+            FROM snapshots
+            WHERE id = $id;
+            """;
+        cmd.Parameters.AddWithValue("$id", id);
+        return ReadSnapshots(cmd).FirstOrDefault();
+    }
+
+    /// <summary>
+    /// Id of the most recent <em>complete</em> snapshot of a planet. Interrupted captures
+    /// are skipped on purpose: they are missing entire equipment types, and reporting on
+    /// them would silently understate the market.
+    /// </summary>
+    public long? GetLatestSnapshotId(string planet)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = $"""
+            SELECT MAX(id) FROM snapshots
+            WHERE planet = $planet AND status = '{SnapshotStatus.Complete}';
+            """;
+        cmd.Parameters.AddWithValue("$planet", planet);
+        var value = cmd.ExecuteScalar();
+        return value is long id ? id : null;
+    }
+
+    private static List<SnapshotInfo> ReadSnapshots(SqliteCommand cmd)
+    {
         var result = new List<SnapshotInfo>();
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
@@ -398,21 +594,12 @@ public sealed class MarketDb : IDisposable
                 reader.GetString(1),
                 ParseUtc(reader.GetString(2)),
                 reader.GetString(3),
-                reader.GetInt32(4)));
+                reader.GetInt32(4),
+                reader.GetString(5),
+                reader.IsDBNull(6) ? null : reader.GetInt32(6)));
         }
 
         return result;
-    }
-
-    public SnapshotInfo? GetSnapshot(long id) => GetSnapshots().FirstOrDefault(s => s.Id == id);
-
-    public long? GetLatestSnapshotId(string planet)
-    {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT MAX(id) FROM snapshots WHERE planet = $planet;";
-        cmd.Parameters.AddWithValue("$planet", planet);
-        var value = cmd.ExecuteScalar();
-        return value is long id ? id : null;
     }
 
     /// <summary>Min/avg/max price of an item across snapshots (its market price history).</summary>
@@ -541,21 +728,90 @@ public sealed class MarketDb : IDisposable
     }
 
     /// <summary>
-    /// Per-(item_id, level) historical price baselines over the listings of a planet.
-    /// Listings are stored deduplicated, so each one contributes a single sample no
-    /// matter how many snapshots observed it and stale listings do not dominate the
-    /// medians. The <paramref name="sinceUtc"/> window keeps a listing when it was
-    /// still on sale within the window (its last sighting is inside it). Rows with a
-    /// non-positive combat point contribute to the price median only. Listings from
-    /// the latest snapshot are part of the baseline as well; with a reasonable
-    /// minimum sample size their effect on the median is negligible.
+    /// Per-<see cref="BaselineKey"/> historical price baselines over the listings of a
+    /// planet. Listings are stored deduplicated, so each one contributes a single sample
+    /// no matter how many snapshots observed it and stale listings do not dominate the
+    /// medians. The <paramref name="sinceUtc"/> window keeps a listing when it was still
+    /// on sale within the window (its last sighting is inside it). Rows with a
+    /// non-positive combat point contribute to the price median only.
+    /// <para>
+    /// <paramref name="population"/> decides <em>what</em> is being measured.
+    /// <see cref="BaselinePopulation.Listed"/> takes every observed listing: those are
+    /// asking prices, and a piece nobody bought keeps its price in the sample until the
+    /// retention pass removes it. <see cref="BaselinePopulation.Sold"/> takes only the
+    /// listings that plausibly concluded, in two steps:
+    /// </para>
+    /// <list type="number">
+    /// <item>a listing has <em>left the market</em> when a later snapshot that could
+    /// have seen it did not: same planet, covering its equipment type, complete (not an
+    /// interrupted capture) and untruncated (no <c>--max-per-type</c>). Anything else is
+    /// still on sale as far as this database knows;</item>
+    /// <item>of those, one that asked no more than <paramref name="saleMarginPercent"/>
+    /// above the median ask of its own bucket is counted as a sale; a listing that
+    /// disappeared well above the going rate is far more likely to have been withdrawn
+    /// or to have expired, and is dropped.</item>
+    /// </list>
+    /// <para>
+    /// The heuristic is deliberately asymmetric — sales concentrate at the cheap end of
+    /// the book — so a sold baseline sits below the corresponding listed one by
+    /// construction; <see cref="BaselineSet.Outcomes"/> reports the split so the
+    /// tolerance can be judged instead of trusted. Replacing it with the on-chain
+    /// <c>BuyProduct</c> transactions is the next step up in accuracy.
+    /// </para>
     /// </summary>
-    public IReadOnlyDictionary<(int ItemId, int Level), PriceBaseline> GetPriceBaselines(
-        string planet, EquipmentType? type = null, DateTime? sinceUtc = null)
+    public BaselineSet GetPriceBaselines(
+        string planet,
+        EquipmentType? type = null,
+        DateTime? sinceUtc = null,
+        BaselinePopulation population = BaselinePopulation.Listed,
+        double saleMarginPercent = DefaultSaleMarginPercent)
+    {
+        var rows = ReadBaselineRows(planet, type, sinceUtc);
+        var listed = Aggregate(rows);
+        var frontier = GetCoverageFrontier(planet);
+        var tolerated = 1 + saleMarginPercent / 100;
+
+        var sold = new List<BaselineRow>();
+        var open = 0;
+        var withdrawn = 0;
+        foreach (var row in rows)
+        {
+            if (!frontier.TryGetValue(row.SubType, out var lastProof)
+                || lastProof <= row.LastSeenSnapshotId)
+            {
+                open++;
+                continue;
+            }
+
+            // No usable median means nothing to compare the asking price against: keep
+            // the listing rather than invent a reason to discard it.
+            var medianAsk = listed[row.Key].MedianPrice;
+            if (medianAsk > 0 && row.Price > medianAsk * tolerated)
+            {
+                withdrawn++;
+                continue;
+            }
+
+            sold.Add(row);
+        }
+
+        return new BaselineSet(
+            population,
+            new ListingOutcomes(rows.Count, open, sold.Count, withdrawn),
+            population == BaselinePopulation.Sold ? Aggregate(sold) : listed);
+    }
+
+    /// <summary>One listing, reduced to what a baseline is made of.</summary>
+    private readonly record struct BaselineRow(
+        BaselineKey Key, int SubType, long LastSeenSnapshotId, double Price, int CombatPoint);
+
+    private List<BaselineRow> ReadBaselineRows(
+        string planet, EquipmentType? type, DateTime? sinceUtc)
     {
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
-            SELECT item_id, level, price, combat_point
+            SELECT item_id, level, option_count, price, combat_point,
+                   item_sub_type, last_seen_snapshot_id
             FROM listings
             WHERE planet = $planet
               AND ($subType IS NULL OR item_sub_type = $subType)
@@ -569,32 +825,44 @@ public sealed class MarketDb : IDisposable
                 ? DBNull.Value
                 : sinceUtc.Value.ToString("O", CultureInfo.InvariantCulture));
 
-        var buckets = new Dictionary<(int ItemId, int Level), (List<double> Prices, List<double> PricesPerCp)>();
+        var rows = new List<BaselineRow>();
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
         {
-            var key = (reader.GetInt32(0), reader.GetInt32(1));
-            var price = reader.GetDouble(2);
-            var combatPoint = reader.GetInt32(3);
-            if (!buckets.TryGetValue(key, out var bucket))
+            rows.Add(new BaselineRow(
+                new BaselineKey(reader.GetInt32(0), reader.GetInt32(1), reader.GetInt32(2)),
+                reader.GetInt32(5),
+                reader.GetInt64(6),
+                reader.GetDouble(3),
+                reader.GetInt32(4)));
+        }
+
+        return rows;
+    }
+
+    private static Dictionary<BaselineKey, PriceBaseline> Aggregate(List<BaselineRow> rows)
+    {
+        var buckets = new Dictionary<BaselineKey, (List<double> Prices, List<double> PricesPerCp)>();
+        foreach (var row in rows)
+        {
+            if (!buckets.TryGetValue(row.Key, out var bucket))
             {
                 bucket = (new List<double>(), new List<double>());
-                buckets[key] = bucket;
+                buckets[row.Key] = bucket;
             }
 
-            bucket.Prices.Add(price);
-            if (combatPoint > 0)
+            bucket.Prices.Add(row.Price);
+            if (row.CombatPoint > 0)
             {
-                bucket.PricesPerCp.Add(price / combatPoint);
+                bucket.PricesPerCp.Add(row.Price / row.CombatPoint);
             }
         }
 
-        var result = new Dictionary<(int ItemId, int Level), PriceBaseline>(buckets.Count);
-        foreach (var ((itemId, level), (prices, pricesPerCp)) in buckets)
+        var result = new Dictionary<BaselineKey, PriceBaseline>(buckets.Count);
+        foreach (var (key, (prices, pricesPerCp)) in buckets)
         {
-            result[(itemId, level)] = new PriceBaseline(
-                itemId,
-                level,
+            result[key] = new PriceBaseline(
+                key,
                 prices.Count,
                 Median(prices),
                 pricesPerCp.Count,
@@ -602,6 +870,46 @@ public sealed class MarketDb : IDisposable
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Per equipment type, the id of the most recent snapshot of a planet that is proof
+    /// of what was on sale: complete, untruncated, and covering that type. A listing
+    /// last seen before its type's frontier is gone from the market; one last seen at or
+    /// after it may simply still be listed. Types never captured that way are absent
+    /// from the map, so nothing about them is inferred.
+    /// </summary>
+    private Dictionary<int, long> GetCoverageFrontier(string planet)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = $"""
+            SELECT id, item_sub_types
+            FROM snapshots
+            WHERE planet = $planet
+              AND status = '{SnapshotStatus.Complete}'
+              AND max_per_type IS NULL
+            ORDER BY id;
+            """;
+        cmd.Parameters.AddWithValue("$planet", planet);
+
+        var frontier = new Dictionary<int, long>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            var id = reader.GetInt64(0);
+            var types = reader.GetString(1).Split(',', StringSplitOptions.RemoveEmptyEntries);
+            foreach (var token in types)
+            {
+                if (int.TryParse(
+                        token, NumberStyles.Integer, CultureInfo.InvariantCulture, out var subType))
+                {
+                    // Rows arrive in id order, so the last write per type wins.
+                    frontier[subType] = id;
+                }
+            }
+        }
+
+        return frontier;
     }
 
     /// <summary>

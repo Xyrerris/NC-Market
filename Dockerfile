@@ -21,5 +21,11 @@ RUN chmod +x /usr/local/bin/ncmarket /usr/local/bin/snapshot-job /usr/local/bin/
 # dei nomi item/skill finiscono quindi in /data/NCMarket (vedi AppPaths.cs).
 ENV XDG_DATA_HOME=/data
 
+# Le immagini .NET 8+ portano l'utente non privilegiato 'app' (uid in $APP_UID):
+# /data deve appartenergli, altrimenti il processo non può creare il database.
+# Un volume Docker vuoto montato su /data eredita questi permessi.
+RUN chown -R $APP_UID:$APP_UID /data
+USER $APP_UID
+
 ENTRYPOINT ["/usr/local/bin/entrypoint"]
 CMD ["idle"]

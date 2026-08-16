@@ -5,9 +5,9 @@ namespace NCMarket.Core;
 /// <summary>
 /// A current listing priced below its historical baseline. The primary metric is the
 /// discount on price-per-CP (NCG per combat point) versus the historical median of the
-/// same (item_id, level) bucket; when the CP metric is not usable (listing or baseline
-/// without a positive combat point) the plain price discount is used instead, as
-/// signalled by <see cref="UsedCpMetric"/>.
+/// listing's own <see cref="BaselineKey"/> bucket; when the CP metric is not usable
+/// (listing or baseline without a positive combat point) the plain price discount is
+/// used instead, as signalled by <see cref="UsedCpMetric"/>.
 /// </summary>
 public sealed record Deal(
     ItemProduct Product,
@@ -22,22 +22,22 @@ public static class DealFinder
 {
     /// <summary>
     /// Filters <paramref name="listings"/> down to the deals: listings whose primary
-    /// discount versus the historical baseline of their (item_id, level) bucket is at
-    /// least <paramref name="minDiscountPercent"/>. Listings without a comparable
-    /// baseline, or whose baseline has fewer than <paramref name="minSamples"/>
-    /// distinct historical listings, are skipped. Results are sorted by discount
-    /// (descending), then by price (ascending).
+    /// discount versus the historical baseline of their own bucket (see
+    /// <see cref="BaselineKey"/>) is at least <paramref name="minDiscountPercent"/>.
+    /// Listings without a comparable baseline, or whose baseline has fewer than
+    /// <paramref name="minSamples"/> distinct historical listings, are skipped. Results
+    /// are sorted by discount (descending), then by price (ascending).
     /// </summary>
     public static IReadOnlyList<Deal> FindDeals(
         IEnumerable<ItemProduct> listings,
-        IReadOnlyDictionary<(int ItemId, int Level), PriceBaseline> baselines,
+        IReadOnlyDictionary<BaselineKey, PriceBaseline> baselines,
         double minDiscountPercent,
         int minSamples)
     {
         var deals = new List<Deal>();
         foreach (var product in listings)
         {
-            if (!baselines.TryGetValue((product.ItemId, product.Level), out var baseline))
+            if (!baselines.TryGetValue(BaselineKey.Of(product), out var baseline))
             {
                 continue;
             }

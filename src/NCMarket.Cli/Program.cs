@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using NCMarket.Cli;
 using NCMarket.Core;
 using NCMarket.Core.Models;
 
@@ -13,7 +14,14 @@ if (args.Length == 0 || args[0] is "help" or "--help" or "-h")
 }
 
 var verb = args[0].ToLowerInvariant();
-var options = ParseOptions(args.Skip(1).ToArray());
+if (!CommandLine.TryParse(verb, args.Skip(1).ToArray(), out var parsed, out var parseError))
+{
+    Console.Error.WriteLine(parseError);
+    Console.Error.WriteLine("Usa 'help' per l'elenco dei comandi e delle relative opzioni.");
+    return 2;
+}
+
+var options = parsed!;
 
 try
 {
@@ -27,8 +35,16 @@ try
         "deals" => await DealsAsync(),
         "export" => await ExportAsync(),
         "prune" => Prune(),
-        _ => Unknown(),
+        _ => throw new InvalidOperationException(
+            $"Comando '{verb}' dichiarato in CommandLine ma non implementato."),
     };
+}
+catch (ArgumentException e)
+{
+    // Valore di opzione rifiutato (pianeta, ordinamento, separatore, intervallo
+    // numerico): stesso esito di un'opzione sconosciuta.
+    Console.Error.WriteLine($"Errore: {e.Message}");
+    return 2;
 }
 catch (Exception e)
 {
@@ -52,12 +68,13 @@ async Task<int> FetchAsync()
 
     var planet = GetPlanet();
     var order = GetOrder();
-    var limit = GetInt("limit", 20);
+    var limit = options.GetInt("limit", 20, min: 1);
+    var offset = options.GetInt("offset", 0, min: 0);
     var names = await LoadItemNamesAsync();
     var skillNames = await LoadSkillNamesAsync();
 
     using var client = new MarketClient(planet);
-    var page = await client.GetProductsPageAsync(type!.Value, limit, GetInt("offset", 0), order);
+    var page = await client.GetProductsPageAsync(type!.Value, limit, offset, order);
 
     var totalInfo = page.TotalCount > 0
         ? $"{page.TotalCount} inserzioni totali"
@@ -80,9 +97,7 @@ async Task<int> FetchAsync()
 async Task<int> SnapshotAsync()
 {
     var planet = GetPlanet();
-    var maxPerType = options.TryGetValue("max-per-type", out var maxRaw)
-        ? int.Parse(maxRaw, culture)
-        : (int?)null;
+    var maxPerType = GetMaxPerType();
 
     EquipmentType[] types;
     if (options.TryGetValue("types", out var typesRaw))
@@ -106,26 +121,41 @@ async Task<int> SnapshotAsync()
         types = EquipmentTypes.All;
     }
 
+    using var dbLock = LockDb();
     using var db = OpenDb();
     using var client = new MarketClient(planet);
 
     var takenAt = DateTime.UtcNow;
-    var snapshotId = db.CreateSnapshot(planet.Name, types, takenAt);
+    var snapshotId = db.CreateSnapshot(planet.Name, types, takenAt, maxPerType);
     Console.WriteLine(
-        $"Snapshot #{snapshotId} — pianeta {planet.Name}, {takenAt.ToString("u", culture)}");
+        $"Snapshot #{snapshotId} — pianeta {planet.Name}, {takenAt.ToString("u", culture)}" +
+        (maxPerType is int limit ? $", limite {limit} inserzioni per tipo" : ""));
 
     var grandTotal = 0;
-    foreach (var type in types)
+    try
     {
-        Console.Write($"  {type,-9}: recupero...");
-        var products = await client.GetAllProductsAsync(
-            type,
-            maxItems: maxPerType,
-            progress: (done, total) => Console.Write(
-                $"\r  {type,-9}: {done}{(total > 0 ? "/" + total : "")} scaricate...      "));
-        var saved = db.AddProducts(snapshotId, products);
-        grandTotal += saved;
-        Console.WriteLine($"\r  {type,-9}: salvate {saved} inserzioni      ");
+        foreach (var type in types)
+        {
+            Console.Write($"  {type,-9}: recupero...");
+            var products = await client.GetAllProductsAsync(
+                type,
+                maxItems: maxPerType,
+                progress: (done, total) => Console.Write(
+                    $"\r  {type,-9}: {done}{(total > 0 ? "/" + total : "")} scaricate...      "));
+            var saved = db.AddProducts(snapshotId, products);
+            grandTotal += saved;
+            Console.WriteLine($"\r  {type,-9}: salvate {saved} inserzioni      ");
+        }
+    }
+    catch
+    {
+        // Lo snapshot resta 'partial': i tipi già scaricati sono conservati, ma stats,
+        // deals ed export continueranno a usare l'ultimo snapshot completo.
+        Console.Error.WriteLine();
+        Console.Error.WriteLine(
+            $"Snapshot #{snapshotId} interrotto: resta marcato come parziale e non verrà " +
+            "usato come ultimo snapshot da stats, deals ed export.");
+        throw;
     }
 
     db.FinalizeSnapshot(snapshotId);
@@ -137,7 +167,8 @@ async Task<int> SnapshotAsync()
 int ListSnapshots()
 {
     using var db = OpenDb();
-    var planetFilter = options.TryGetValue("planet", out var p) ? p.ToLowerInvariant() : null;
+    // Senza --planet si elencano tutti i pianeti; se c'è, va validato come altrove.
+    var planetFilter = options.ContainsKey("planet") ? GetPlanet().Name : null;
     var snapshots = db.GetSnapshots(planetFilter);
     if (snapshots.Count == 0)
     {
@@ -146,8 +177,8 @@ int ListSnapshots()
     }
 
     PrintTable(
-        new[] { "Id", "Pianeta", "Data (UTC)", "Tipi", "Prodotti" },
-        new[] { true, false, false, false, true },
+        new[] { "Id", "Pianeta", "Data (UTC)", "Tipi", "Prodotti", "Stato" },
+        new[] { true, false, false, false, true, false },
         snapshots.Select(s => new[]
         {
             s.Id.ToString(culture),
@@ -155,19 +186,40 @@ int ListSnapshots()
             s.TakenAtUtc.ToString("yyyy-MM-dd HH:mm:ss", culture),
             s.ItemSubTypes,
             s.ProductCount.ToString("N0", culture),
+            s.IsComplete
+                ? "completo" + (s.IsTruncated ? $" (limite {s.MaxPerType})" : "")
+                : "PARZIALE",
         }).ToList());
+
+    if (snapshots.Any(s => !s.IsComplete))
+    {
+        Console.WriteLine();
+        Console.WriteLine(
+            "Gli snapshot parziali sono catture interrotte a metà: restano consultabili " +
+            "per id, ma stats, deals ed export non li scelgono come ultimo snapshot.");
+    }
+
+    if (snapshots.Any(s => s.IsTruncated))
+    {
+        Console.WriteLine();
+        Console.WriteLine(
+            "Gli snapshot con un limite (--max-per-type) non coprono l'intero listino: " +
+            "la rilevazione delle vendite non li usa come prova che un'inserzione sia " +
+            "sparita dal mercato.");
+    }
+
     return 0;
 }
 
 int History()
 {
-    if (!options.TryGetValue("item", out var itemRaw) ||
-        !int.TryParse(itemRaw, NumberStyles.Integer, culture, out var itemId))
+    if (!options.ContainsKey("item"))
     {
         Console.Error.WriteLine("Specifica l'item: history --item <itemId> (es. --item 10152001)");
         return 2;
     }
 
+    var itemId = options.GetInt("item", 0, min: 1);
     var planet = GetPlanet();
     using var db = OpenDb();
     var rows = db.GetItemHistory(itemId, planet.Name);
@@ -205,13 +257,14 @@ int Stats()
         return 2;
     }
 
-    var top = GetInt("top", 30);
+    var top = options.GetInt("top", 30, min: 1);
 
     using var db = OpenDb();
     var snapshotId = db.GetLatestSnapshotId(planet.Name);
     if (snapshotId is null)
     {
-        Console.WriteLine($"Nessuno snapshot per {planet.Name}. Esegui prima 'snapshot'.");
+        Console.WriteLine(
+            $"Nessuno snapshot completo per {planet.Name}. Esegui prima 'snapshot'.");
         return 0;
     }
 
@@ -251,14 +304,33 @@ async Task<int> DealsAsync()
     }
 
     var planet = GetPlanet();
-    var discount = GetInt("discount", 25);
-    var minSamples = GetInt("min-samples", 5);
-    var days = GetInt("days", 0);
+    var discount = options.GetInt("discount", 25, min: 0, max: 100);
+    var minSamples = options.GetInt("min-samples", 5, min: 1);
+    var days = options.GetInt("days", 0, min: 0);
     var sinceUtc = days > 0 ? DateTime.UtcNow.AddDays(-days) : (DateTime?)null;
-    var top = GetInt("top", 30);
-    var maxPerType = options.TryGetValue("max-per-type", out var maxRaw)
-        ? int.Parse(maxRaw, culture)
-        : (int?)null;
+    var top = options.GetInt("top", 30, min: 1);
+    var maxPerType = GetMaxPerType();
+
+    var population = options.GetValueOrDefault("baseline", "sold").ToLowerInvariant() switch
+    {
+        "sold" => BaselinePopulation.Sold,
+        "listed" => BaselinePopulation.Listed,
+        var value => throw new ArgumentException(
+            $"Popolazione di confronto non valida: '{value}'. Valori ammessi: sold " +
+            "(inserzioni concluse) e listed (tutte le inserzioni osservate)."),
+    };
+
+    // Un'opzione che non ha effetto è un errore, non un default silenzioso.
+    if (options.ContainsKey("sale-margin") && population != BaselinePopulation.Sold)
+    {
+        Console.Error.WriteLine(
+            "L'opzione '--sale-margin' regola l'euristica di vendita e si applica " +
+            "soltanto a '--baseline sold'.");
+        return 2;
+    }
+
+    var saleMargin = options.GetInt(
+        "sale-margin", MarketDb.DefaultSaleMarginPercent, min: 0, max: 500);
 
     HashSet<int>? grades = null;
     if (options.TryGetValue("grade", out var gradesRaw))
@@ -279,10 +351,25 @@ async Task<int> DealsAsync()
     }
 
     using var db = OpenDb();
-    var baselines = db.GetPriceBaselines(planet.Name, type, sinceUtc);
-    if (baselines.Count == 0)
+    var baselineSet = db.GetPriceBaselines(planet.Name, type, sinceUtc, population, saleMargin);
+    var baselines = baselineSet.Baselines;
+    var outcomes = baselineSet.Outcomes;
+    if (outcomes.Total == 0)
     {
         Console.WriteLine($"Nessuno storico prezzi per {planet.Name}. Esegui prima 'snapshot'.");
+        return 0;
+    }
+
+    if (baselines.Count == 0)
+    {
+        // Storico c'è, ma nessuna inserzione risulta ancora conclusa: perché una
+        // sparizione sia osservabile serve uno snapshot completo successivo.
+        Console.WriteLine(
+            $"Nessuna vendita rilevata fra le {outcomes.Total.ToString("N0", culture)} " +
+            $"inserzioni storicizzate per {planet.Name}: perché la sparizione di " +
+            "un'inserzione sia osservabile serve un secondo snapshot completo e integrale " +
+            "(senza --max-per-type) dello stesso tipo. Usa '--baseline listed' per " +
+            "confrontare intanto con i prezzi richiesti.");
         return 0;
     }
 
@@ -292,7 +379,8 @@ async Task<int> DealsAsync()
         var snapshotId = db.GetLatestSnapshotId(planet.Name);
         if (snapshotId is null)
         {
-            Console.WriteLine($"Nessuno snapshot per {planet.Name}. Esegui prima 'snapshot'.");
+            Console.WriteLine(
+                $"Nessuno snapshot completo per {planet.Name}. Esegui prima 'snapshot'.");
             return 0;
         }
 
@@ -336,10 +424,11 @@ async Task<int> DealsAsync()
     var gradeScope = grades is null
         ? ""
         : ", rarità " + string.Join(",", grades.OrderBy(g => g).Select(g => (Grade)g));
+    Console.WriteLine(PopulationSummary(baselineSet, saleMargin));
     Console.WriteLine(
         $"Occasioni su {planet.Name} — sconto ≥ {discount}% sulla mediana storica del " +
-        $"rapporto prezzo/CP per item+livello (campioni ≥ {minSamples}{window}{gradeScope}) — " +
-        $"prime {Math.Min(top, deals.Count)} di {deals.Count}:");
+        $"rapporto prezzo/CP per item+livello+opzioni (campioni ≥ {minSamples}{window}" +
+        $"{gradeScope}) — prime {Math.Min(top, deals.Count)} di {deals.Count}:");
     Console.WriteLine();
 
     // Price/CP ratios are tiny (often < 1e-4): the inverse CP-per-NCG is shown
@@ -347,10 +436,13 @@ async Task<int> DealsAsync()
     PrintTable(
         new[]
         {
-            "#", "ItemId", "Nome", "Tipo", "Gr", "Lv", "CP", "Prezzo NCG",
+            "#", "ItemId", "Nome", "Tipo", "Gr", "Lv", "Opz", "CP", "Prezzo NCG",
             "CP/NCG", "Med CP/NCG", "Sconto%", "Sconto prezzo%", "Camp.",
         },
-        new[] { true, true, false, false, true, true, true, true, true, true, true, true, true },
+        new[]
+        {
+            true, true, false, false, true, true, true, true, true, true, true, true, true, true,
+        },
         deals.Take(top).Select((d, i) => new[]
         {
             (i + 1).ToString(culture),
@@ -361,6 +453,7 @@ async Task<int> DealsAsync()
             ((EquipmentType)d.Product.ItemSubType).ToString(),
             d.Product.Grade.ToString(culture),
             d.Product.Level.ToString(culture),
+            d.Product.OptionCountFromCombination.ToString(culture),
             d.Product.CombatPoint.ToString("N0", culture),
             d.Product.Price.ToString("N2", culture),
             d.PricePerCp is double ppc ? (1 / ppc).ToString("N0", culture) : "-",
@@ -392,19 +485,23 @@ async Task<int> ExportAsync()
     using var db = OpenDb();
 
     SnapshotInfo? snapshot;
-    if (options.TryGetValue("snapshot", out var snapshotRaw))
+    if (options.ContainsKey("snapshot"))
     {
-        if (!long.TryParse(snapshotRaw, NumberStyles.Integer, culture, out var snapshotId))
-        {
-            Console.Error.WriteLine($"Id snapshot non valido: '{snapshotRaw}'.");
-            return 2;
-        }
-
+        var snapshotId = options.GetLong("snapshot", 0, min: 1);
         snapshot = db.GetSnapshot(snapshotId);
         if (snapshot is null)
         {
             Console.Error.WriteLine($"Snapshot #{snapshotId} non trovato. Usa 'snapshots' per l'elenco.");
             return 2;
+        }
+
+        // Esportare uno snapshot parziale su richiesta esplicita è legittimo, purché
+        // sia chiaro che il listino non è completo.
+        if (!snapshot.IsComplete)
+        {
+            Console.WriteLine(
+                $"Attenzione: lo snapshot #{snapshot.Id} è parziale (cattura interrotta): " +
+                "il CSV non contiene l'intero listino.");
         }
     }
     else
@@ -413,7 +510,8 @@ async Task<int> ExportAsync()
         var latest = db.GetLatestSnapshotId(planet.Name);
         if (latest is null)
         {
-            Console.WriteLine($"Nessuno snapshot per {planet.Name}. Esegui prima 'snapshot'.");
+            Console.WriteLine(
+                $"Nessuno snapshot completo per {planet.Name}. Esegui prima 'snapshot'.");
             return 0;
         }
 
@@ -443,16 +541,13 @@ async Task<int> ExportAsync()
 
 int Prune()
 {
-    var days = GetInt("days", 365);
-    if (days < 1)
-    {
-        Console.Error.WriteLine("Valore non valido per --days: deve essere almeno 1.");
-        return 2;
-    }
-
+    var days = options.GetInt("days", 365, min: 1);
     var dryRun = options.ContainsKey("dry-run");
     var cutoffUtc = DateTime.UtcNow.AddDays(-days);
 
+    // Il VACUUM finale richiede accesso esclusivo: senza lock un prune schedulato che
+    // incrocia uno snapshot fallirebbe sul busy_timeout.
+    using var dbLock = LockDb();
     using var db = OpenDb();
     var result = db.Prune(cutoffUtc, dryRun);
 
@@ -475,22 +570,47 @@ int Prune()
     return 0;
 }
 
-int Unknown()
+// ---------------------------------------------------------------- helper
+
+/// Dichiara su quale popolazione sono state calcolate le mediane: la differenza fra
+/// misurare quanto chiedono i venditori e quanto il mercato paga davvero.
+string PopulationSummary(BaselineSet set, int saleMargin)
 {
-    Console.Error.WriteLine($"Comando sconosciuto: '{verb}'. Usa 'help' per l'elenco dei comandi.");
-    return 2;
+    var o = set.Outcomes;
+    string N(int value) => value.ToString("N0", culture);
+
+    return set.Population == BaselinePopulation.Sold
+        ? $"Riferimento: {N(o.LikelySold)} inserzioni concluse a un prezzo compatibile " +
+          $"con una vendita, su {N(o.Total)} osservate ({N(o.Open)} ancora in vendita, " +
+          $"{N(o.LikelyWithdrawn)} sparite oltre il +{saleMargin}% sulla mediana del " +
+          "proprio bucket e quindi considerate ritiri)."
+        : $"Riferimento: tutte le {N(o.Total)} inserzioni osservate — sono prezzi " +
+          $"richiesti, non di vendita ({N(o.LikelySold)} risultano concluse a un prezzo " +
+          "compatibile con una vendita: '--baseline sold' usa soltanto quelle).";
 }
 
-// ---------------------------------------------------------------- helper
+string DbPath() => options.GetValueOrDefault("db") ?? AppPaths.DefaultDbPath;
+
+/// Serializza i comandi che scrivono o compattano il database (snapshot, prune):
+/// sul server gli Scheduled Task prima o poi si sovrappongono.
+DbLock LockDb() =>
+    DbLock.Acquire(
+        DbPath(),
+        TimeSpan.FromMinutes(30),
+        () => Console.WriteLine(
+            "Database in uso da un altro comando NC-Market: attendo che termini..."));
+
+int? GetMaxPerType() =>
+    options.ContainsKey("max-per-type") ? options.GetInt("max-per-type", 0, min: 1) : null;
 
 MarketDb OpenDb()
 {
-    var db = new MarketDb(options.GetValueOrDefault("db"));
+    var db = new MarketDb(DbPath());
     if (db.MigrationBackupPath is not null)
     {
         Console.WriteLine(
-            "Database migrato allo schema v2 (inserzioni deduplicate). " +
-            $"Backup del vecchio formato: {db.MigrationBackupPath}");
+            "Database migrato dallo schema v1 (inserzioni deduplicate, stato degli " +
+            $"snapshot). Backup del vecchio formato: {db.MigrationBackupPath}");
         Console.WriteLine();
     }
 
@@ -504,30 +624,6 @@ string FormatBytes(long bytes) => bytes switch
     >= 1L << 10 => (bytes / (double)(1L << 10)).ToString("N0", culture) + " KB",
     _ => bytes.ToString("N0", culture) + " B",
 };
-
-Dictionary<string, string> ParseOptions(string[] rest)
-{
-    var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-    for (var i = 0; i < rest.Length; i++)
-    {
-        if (!rest[i].StartsWith("--", StringComparison.Ordinal))
-        {
-            continue;
-        }
-
-        var key = rest[i][2..];
-        if (i + 1 < rest.Length && !rest[i + 1].StartsWith("--", StringComparison.Ordinal))
-        {
-            result[key] = rest[++i];
-        }
-        else
-        {
-            result[key] = "true"; // flag senza valore, es. --no-names
-        }
-    }
-
-    return result;
-}
 
 Planet GetPlanet()
 {
@@ -554,9 +650,6 @@ string GetOrder()
 
     return order;
 }
-
-int GetInt(string key, int fallback) =>
-    options.TryGetValue(key, out var raw) ? int.Parse(raw, culture) : fallback;
 
 bool TryGetType(bool required, out EquipmentType? type)
 {
@@ -698,7 +791,10 @@ void PrintHelp()
                        --types w,a,...       default: tutti e cinque i tipi
                        --max-per-type <n>    limite prodotti per tipo (default: tutti)
 
-          snapshots  Elenca gli snapshot salvati
+          snapshots  Elenca gli snapshot salvati, con lo stato di ciascuno: gli snapshot
+                     'PARZIALE' sono catture interrotte a metà e non vengono usati come
+                     ultimo snapshot da stats, deals ed export
+                       --planet <pianeta>    filtro opzionale (default: tutti i pianeti)
 
           history    Storico prezzi di un item attraverso gli snapshot
                        --item <itemId>       (obbligatorio, es. 10152001)
@@ -708,14 +804,27 @@ void PrintHelp()
                        --top <n>             default: 30
 
           deals      Occasioni: inserzioni correnti sotto la mediana storica del
-                     database (metrica primaria: NCG per punto CP, per item+livello)
+                     database (metrica primaria: NCG per punto CP, per item+livello+opzioni)
                        --type <tipo>         filtro opzionale (default: tutti i tipi)
                        --grade <g[,g...]>    filtro rarità: 1-8 o normal, rare, epic,
                                              unique, legendary, divinity, mythic,
                                              transcendent (default: tutte)
-                       --discount <pct>      sconto minimo percentuale, default: 25
+                       --discount <pct>      sconto minimo percentuale (0-100), default: 25
                        --min-samples <n>     inserzioni storiche minime per confronto, default: 5
                        --days <n>            finestra storica in giorni (default: tutto lo storico)
+                       --baseline sold|listed
+                                             popolazione su cui si calcolano le mediane
+                                             storiche. 'sold' (default) usa le sole
+                                             inserzioni sparite da uno snapshot completo
+                                             successivo a un prezzo compatibile con una
+                                             vendita; 'listed' usa tutte le inserzioni
+                                             osservate, cioè i prezzi richiesti
+                       --sale-margin <pct>   tolleranza dell'euristica di vendita: una
+                                             inserzione sparita conta come venduta se non
+                                             chiedeva più di questa percentuale sopra la
+                                             mediana del proprio bucket; sopra è
+                                             considerata un ritiro (default: 20, solo con
+                                             --baseline sold)
                        --from-snapshot       confronta l'ultimo snapshot invece del mercato live
                        --max-per-type <n>    limite prodotti per tipo (solo live)
                        --top <n>             default: 30
@@ -735,10 +844,17 @@ void PrintHelp()
                        --days <n>            giorni di storico da conservare, default: 365
                        --dry-run             mostra cosa verrebbe rimosso senza modificare nulla
 
-        Opzioni comuni:
-          --planet odin|heimdall   default: heimdall
-          --db <percorso>          database SQLite (default: %LOCALAPPDATA%\NCMarket\ncmarket.db)
+        Opzioni comuni (accettate dai comandi a cui si applicano):
+          --planet odin|heimdall   default: heimdall (non si applica a prune)
+          --db <percorso>          database SQLite, per i comandi che lo usano
+                                   (default: %LOCALAPPDATA%\NCMarket\ncmarket.db)
           --no-names               non risolvere i nomi di item e skill
+
+        Ogni comando accetta soltanto le proprie opzioni: un'opzione sconosciuta, ripetuta
+        o priva di valore fa terminare la CLI con codice 2 senza eseguire nulla.
+
+        snapshot e prune si serializzano fra loro tramite un lock su <database>.lock: se
+        due job schedulati si sovrappongono, il secondo attende invece di fallire.
 
         Esempi:
           ncmarket fetch --type weapon --order price --limit 10
@@ -748,6 +864,8 @@ void PrintHelp()
           ncmarket stats --type ring --top 20
           ncmarket deals --discount 30
           ncmarket deals --grade legendary,mythic
+          ncmarket deals --baseline listed --discount 40
+          ncmarket deals --sale-margin 10 --min-samples 3
           ncmarket deals --type ring --from-snapshot --min-samples 3
           ncmarket export --type weapon --sep ;
           ncmarket export --snapshot 2 --out listino.csv
