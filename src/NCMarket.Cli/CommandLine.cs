@@ -26,7 +26,7 @@ internal sealed class CommandLine
         ["deals"] = new[]
         {
             "planet", "db", "type", "grade", "discount", "min-samples", "days",
-            "from-snapshot", "max-per-type", "top", "no-names",
+            "baseline", "sale-margin", "from-snapshot", "max-per-type", "top", "no-names",
         },
         ["export"] = new[] { "planet", "db", "snapshot", "type", "out", "sep", "no-names" },
         ["prune"] = new[] { "db", "days", "dry-run" },

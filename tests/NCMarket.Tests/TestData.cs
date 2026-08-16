@@ -73,14 +73,31 @@ internal static class TestData
             RegisteredBlockIndex = 1,
         };
 
-    /// <summary>Creates a snapshot, fills it and marks it complete.</summary>
+    /// <summary>
+    /// Creates a snapshot, fills it and marks it complete. Defaults to a full capture of
+    /// the ring listing, the type <see cref="Product"/> produces.
+    /// </summary>
     public static long AddCompleteSnapshot(
         MarketDb db, DateTime takenAtUtc, IEnumerable<ItemProduct> products,
-        string planet = "heimdall")
+        string planet = "heimdall",
+        IEnumerable<EquipmentType>? types = null,
+        int? maxPerType = null)
     {
-        var id = db.CreateSnapshot(planet, new[] { EquipmentType.Ring }, takenAtUtc);
-        db.AddProducts(id, products);
+        var id = AddSnapshot(db, takenAtUtc, products, planet, types, maxPerType);
         db.FinalizeSnapshot(id);
+        return id;
+    }
+
+    /// <summary>Creates a snapshot and fills it, leaving it partial (never finalized).</summary>
+    public static long AddSnapshot(
+        MarketDb db, DateTime takenAtUtc, IEnumerable<ItemProduct> products,
+        string planet = "heimdall",
+        IEnumerable<EquipmentType>? types = null,
+        int? maxPerType = null)
+    {
+        var id = db.CreateSnapshot(
+            planet, types ?? new[] { EquipmentType.Ring }, takenAtUtc, maxPerType);
+        db.AddProducts(id, products);
         return id;
     }
 }

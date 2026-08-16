@@ -1,4 +1,5 @@
 using System.Globalization;
+using NCMarket.Core;
 
 namespace NCMarket.Tests;
 
@@ -29,7 +30,28 @@ public sealed class MarketDbMigrationTests
         using var conn = temp.Connect();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = "PRAGMA user_version;";
-        Assert.Equal(3L, (long)cmd.ExecuteScalar()!);
+        Assert.Equal(4L, (long)cmd.ExecuteScalar()!);
+    }
+
+    [Fact]
+    public void A_v2_database_gains_the_capture_limit_column_on_open()
+    {
+        using var temp = new TempDatabase();
+        WriteV2Database(temp);
+
+        using var db = temp.Open();
+
+        // Gli snapshot preesistenti valgono come catture integrali: è ciò che fa il
+        // comando 'snapshot' quando --max-per-type non viene passato, e assumere il
+        // contrario azzererebbe lo storico utile alla rilevazione delle vendite.
+        Assert.All(db.GetSnapshots(), s => Assert.False(s.IsTruncated));
+
+        // La colonna serve alla rilevazione delle vendite: senza, la query fallirebbe.
+        // L'unica inserzione è stata vista nell'ultimo snapshot completo, quindi risulta
+        // ancora in vendita.
+        var sold = db.GetPriceBaselines("heimdall", population: BaselinePopulation.Sold);
+        Assert.Empty(sold.Baselines);
+        Assert.Equal(1, sold.Outcomes.Open);
     }
 
     [Fact]

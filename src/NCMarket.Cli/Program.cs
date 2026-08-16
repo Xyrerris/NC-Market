@@ -126,9 +126,10 @@ async Task<int> SnapshotAsync()
     using var client = new MarketClient(planet);
 
     var takenAt = DateTime.UtcNow;
-    var snapshotId = db.CreateSnapshot(planet.Name, types, takenAt);
+    var snapshotId = db.CreateSnapshot(planet.Name, types, takenAt, maxPerType);
     Console.WriteLine(
-        $"Snapshot #{snapshotId} — pianeta {planet.Name}, {takenAt.ToString("u", culture)}");
+        $"Snapshot #{snapshotId} — pianeta {planet.Name}, {takenAt.ToString("u", culture)}" +
+        (maxPerType is int limit ? $", limite {limit} inserzioni per tipo" : ""));
 
     var grandTotal = 0;
     try
@@ -185,7 +186,9 @@ int ListSnapshots()
             s.TakenAtUtc.ToString("yyyy-MM-dd HH:mm:ss", culture),
             s.ItemSubTypes,
             s.ProductCount.ToString("N0", culture),
-            s.IsComplete ? "completo" : "PARZIALE",
+            s.IsComplete
+                ? "completo" + (s.IsTruncated ? $" (limite {s.MaxPerType})" : "")
+                : "PARZIALE",
         }).ToList());
 
     if (snapshots.Any(s => !s.IsComplete))
@@ -194,6 +197,15 @@ int ListSnapshots()
         Console.WriteLine(
             "Gli snapshot parziali sono catture interrotte a metà: restano consultabili " +
             "per id, ma stats, deals ed export non li scelgono come ultimo snapshot.");
+    }
+
+    if (snapshots.Any(s => s.IsTruncated))
+    {
+        Console.WriteLine();
+        Console.WriteLine(
+            "Gli snapshot con un limite (--max-per-type) non coprono l'intero listino: " +
+            "la rilevazione delle vendite non li usa come prova che un'inserzione sia " +
+            "sparita dal mercato.");
     }
 
     return 0;
@@ -299,6 +311,27 @@ async Task<int> DealsAsync()
     var top = options.GetInt("top", 30, min: 1);
     var maxPerType = GetMaxPerType();
 
+    var population = options.GetValueOrDefault("baseline", "sold").ToLowerInvariant() switch
+    {
+        "sold" => BaselinePopulation.Sold,
+        "listed" => BaselinePopulation.Listed,
+        var value => throw new ArgumentException(
+            $"Popolazione di confronto non valida: '{value}'. Valori ammessi: sold " +
+            "(inserzioni concluse) e listed (tutte le inserzioni osservate)."),
+    };
+
+    // Un'opzione che non ha effetto è un errore, non un default silenzioso.
+    if (options.ContainsKey("sale-margin") && population != BaselinePopulation.Sold)
+    {
+        Console.Error.WriteLine(
+            "L'opzione '--sale-margin' regola l'euristica di vendita e si applica " +
+            "soltanto a '--baseline sold'.");
+        return 2;
+    }
+
+    var saleMargin = options.GetInt(
+        "sale-margin", MarketDb.DefaultSaleMarginPercent, min: 0, max: 500);
+
     HashSet<int>? grades = null;
     if (options.TryGetValue("grade", out var gradesRaw))
     {
@@ -318,10 +351,25 @@ async Task<int> DealsAsync()
     }
 
     using var db = OpenDb();
-    var baselines = db.GetPriceBaselines(planet.Name, type, sinceUtc);
-    if (baselines.Count == 0)
+    var baselineSet = db.GetPriceBaselines(planet.Name, type, sinceUtc, population, saleMargin);
+    var baselines = baselineSet.Baselines;
+    var outcomes = baselineSet.Outcomes;
+    if (outcomes.Total == 0)
     {
         Console.WriteLine($"Nessuno storico prezzi per {planet.Name}. Esegui prima 'snapshot'.");
+        return 0;
+    }
+
+    if (baselines.Count == 0)
+    {
+        // Storico c'è, ma nessuna inserzione risulta ancora conclusa: perché una
+        // sparizione sia osservabile serve uno snapshot completo successivo.
+        Console.WriteLine(
+            $"Nessuna vendita rilevata fra le {outcomes.Total.ToString("N0", culture)} " +
+            $"inserzioni storicizzate per {planet.Name}: perché la sparizione di " +
+            "un'inserzione sia osservabile serve un secondo snapshot completo e integrale " +
+            "(senza --max-per-type) dello stesso tipo. Usa '--baseline listed' per " +
+            "confrontare intanto con i prezzi richiesti.");
         return 0;
     }
 
@@ -376,6 +424,7 @@ async Task<int> DealsAsync()
     var gradeScope = grades is null
         ? ""
         : ", rarità " + string.Join(",", grades.OrderBy(g => g).Select(g => (Grade)g));
+    Console.WriteLine(PopulationSummary(baselineSet, saleMargin));
     Console.WriteLine(
         $"Occasioni su {planet.Name} — sconto ≥ {discount}% sulla mediana storica del " +
         $"rapporto prezzo/CP per item+livello+opzioni (campioni ≥ {minSamples}{window}" +
@@ -522,6 +571,23 @@ int Prune()
 }
 
 // ---------------------------------------------------------------- helper
+
+/// Dichiara su quale popolazione sono state calcolate le mediane: la differenza fra
+/// misurare quanto chiedono i venditori e quanto il mercato paga davvero.
+string PopulationSummary(BaselineSet set, int saleMargin)
+{
+    var o = set.Outcomes;
+    string N(int value) => value.ToString("N0", culture);
+
+    return set.Population == BaselinePopulation.Sold
+        ? $"Riferimento: {N(o.LikelySold)} inserzioni concluse a un prezzo compatibile " +
+          $"con una vendita, su {N(o.Total)} osservate ({N(o.Open)} ancora in vendita, " +
+          $"{N(o.LikelyWithdrawn)} sparite oltre il +{saleMargin}% sulla mediana del " +
+          "proprio bucket e quindi considerate ritiri)."
+        : $"Riferimento: tutte le {N(o.Total)} inserzioni osservate — sono prezzi " +
+          $"richiesti, non di vendita ({N(o.LikelySold)} risultano concluse a un prezzo " +
+          "compatibile con una vendita: '--baseline sold' usa soltanto quelle).";
+}
 
 string DbPath() => options.GetValueOrDefault("db") ?? AppPaths.DefaultDbPath;
 
@@ -738,7 +804,7 @@ void PrintHelp()
                        --top <n>             default: 30
 
           deals      Occasioni: inserzioni correnti sotto la mediana storica del
-                     database (metrica primaria: NCG per punto CP, per item+livello)
+                     database (metrica primaria: NCG per punto CP, per item+livello+opzioni)
                        --type <tipo>         filtro opzionale (default: tutti i tipi)
                        --grade <g[,g...]>    filtro rarità: 1-8 o normal, rare, epic,
                                              unique, legendary, divinity, mythic,
@@ -746,6 +812,19 @@ void PrintHelp()
                        --discount <pct>      sconto minimo percentuale (0-100), default: 25
                        --min-samples <n>     inserzioni storiche minime per confronto, default: 5
                        --days <n>            finestra storica in giorni (default: tutto lo storico)
+                       --baseline sold|listed
+                                             popolazione su cui si calcolano le mediane
+                                             storiche. 'sold' (default) usa le sole
+                                             inserzioni sparite da uno snapshot completo
+                                             successivo a un prezzo compatibile con una
+                                             vendita; 'listed' usa tutte le inserzioni
+                                             osservate, cioè i prezzi richiesti
+                       --sale-margin <pct>   tolleranza dell'euristica di vendita: una
+                                             inserzione sparita conta come venduta se non
+                                             chiedeva più di questa percentuale sopra la
+                                             mediana del proprio bucket; sopra è
+                                             considerata un ritiro (default: 20, solo con
+                                             --baseline sold)
                        --from-snapshot       confronta l'ultimo snapshot invece del mercato live
                        --max-per-type <n>    limite prodotti per tipo (solo live)
                        --top <n>             default: 30
@@ -785,6 +864,8 @@ void PrintHelp()
           ncmarket stats --type ring --top 20
           ncmarket deals --discount 30
           ncmarket deals --grade legendary,mythic
+          ncmarket deals --baseline listed --discount 40
+          ncmarket deals --sale-margin 10 --min-samples 3
           ncmarket deals --type ring --from-snapshot --min-samples 3
           ncmarket export --type weapon --sep ;
           ncmarket export --snapshot 2 --out listino.csv

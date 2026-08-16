@@ -11,6 +11,10 @@ di P2.6.
 **Aggiornato il 2026-08-14**: chiuso P1.2 (bucket dei comparabili). Restano aperti P1.1,
 P2.4, P2.5 e l'ultimo punto di P2.6.
 
+**Aggiornato il 2026-08-16**: chiuso P1.1 (rilevazione vendite), l'ultimo P1. Restano
+aperti P2.4, P2.5 e l'ultimo punto di P2.6: nessuno dei tre tocca la correttezza del
+motore di valutazione.
+
 Legenda priorità:
 
 - **P0** — bug che corrompono i dati o li nascondono; da fare prima di aggiungere feature.
@@ -26,7 +30,7 @@ Legenda priorità:
 | Branch di lavoro | `feature/docker-deploy`, **10 commit avanti** su `origin/main` | invariato: il merge su `main` resta da fare |
 | `origin/main` | fermo ai commit iniziali | invariato |
 | Build locale | **fallisce**: SDK 8.0.204 contro target `net9.0` | ✅ verde (SDK 9.0.317, versione fissata da `global.json`) |
-| Test | nessuno | ✅ 35 test xUnit in `tests/NCMarket.Tests` |
+| Test | nessuno | ✅ 46 test xUnit in `tests/NCMarket.Tests` (al 2026-08-16) |
 | CI | nessuna | ✅ `.github/workflows/ci.yml`: build + test + build dell'immagine Docker |
 | File spuri tracciati | `p0.txt`, `p1.txt` | ✅ rimossi dal tracciamento, `.gitignore` esteso |
 
@@ -142,37 +146,65 @@ sistema operativo anche se il processo viene ucciso.
 
 ## P1 — Il limite concettuale del motore `deals`
 
-### P1.1 — I baseline usano prezzi richiesti, non prezzi di vendita (aperto)
+### P1.1 — I baseline usano prezzi richiesti, non prezzi di vendita ✅ FATTO
 
-**Dove**: [src/NCMarket.Core/MarketDb.cs](src/NCMarket.Core/MarketDb.cs) (`GetPriceBaselines`)
+**Dove**: [src/NCMarket.Core/MarketDb.cs](src/NCMarket.Core/MarketDb.cs) (`GetPriceBaselines`),
+[src/NCMarket.Cli/Program.cs](src/NCMarket.Cli/Program.cs) (`DealsAsync`)
 
-È il problema più importante dell'intero progetto. Le mediane sono calcolate su tutte le
-inserzioni osservate, incluse quelle che **nessuno ha mai comprato**. Un'inserzione
-sovrapprezzata resta nel campione fino al `prune` (365 giorni di default) e alza il
-riferimento: `deals` finisce per segnalare come occasione ciò che è soltanto meno assurdo
-del resto del listino. Sui mercati illiquidi (gradi 7-8, pochi scambi) l'effetto domina il
-risultato.
+Era il problema più importante dell'intero progetto. Le mediane erano calcolate su tutte
+le inserzioni osservate, incluse quelle che **nessuno ha mai comprato**. Un'inserzione
+sovrapprezzata restava nel campione fino al `prune` (365 giorni di default) e alzava il
+riferimento: `deals` finiva per segnalare come occasione ciò che era soltanto meno assurdo
+del resto del listino. Sui mercati illiquidi (gradi 7-8, pochi scambi) l'effetto dominava
+il risultato.
 
-**Intervento** — è la voce *Rilevazione vendite* della roadmap, ed è la feature a maggior
-valore rimasto. I dati necessari sono già nel database (`first_seen_snapshot_id`,
-`last_seen_snapshot_id`, `sightings`): un'inserzione sparita fra lo snapshot N e l'N+1 è
-stata venduta oppure ritirata. Passi:
+**Fatto**: `GetPriceBaselines` prende ora una `BaselinePopulation` e restituisce un
+`BaselineSet` (baseline + `ListingOutcomes`, cioè come si è divisa la popolazione).
+Con `Sold` — il default di `deals` — le mediane si calcolano in due passi:
 
-1. calcolo delle sparizioni per confronto fra snapshot consecutivi dello stesso pianeta e
-   sottotipo — **il prerequisito P0.1 è ora chiuso**: basta confrontare i soli snapshot
-   `complete`, quindi l'assenza di un'inserzione non può più essere l'artefatto di una
-   cattura interrotta;
-2. euristica di classificazione: sparita a prezzo ≤ mediana del bucket → probabile vendita;
-   sparita molto sopra la mediana → probabile ritiro;
-3. calcolo dei baseline sulle sole inserzioni verosimilmente concluse;
-4. (opzionale, successivo) incrocio con le transazioni `BuyProduct` on-chain via 9cscan o
-   mimir per sostituire l'euristica con il dato reale.
+1. **sparizione**: un'inserzione ha lasciato il mercato quando esiste uno snapshot
+   successivo che avrebbe potuto vederla e non l'ha vista. "Avrebbe potuto" significa
+   stesso pianeta, stesso `item_sub_type`, `complete` (prerequisito P0.1) e non troncato.
+   L'ultimo snapshot che soddisfa queste condizioni è la *frontiera di copertura* del
+   tipo: `last_seen_snapshot_id < frontiera` è la condizione di sparizione;
+2. **vendita o ritiro**: fra le sparite, chi chiedeva al più `--sale-margin` percento
+   (default 20) sopra la mediana richiesta del proprio bucket conta come vendita; sopra
+   quella soglia è quasi sempre un ritiro o una scadenza, e viene scartata.
 
-È il salto da "listino" a "mercato": senza questo, `deals` misura le richieste dei
-venditori, non i prezzi.
+I `--max-per-type` hanno reso necessario lo **schema v4**: una cattura troncata è un
+campione, non il listino, quindi l'assenza di un'inserzione da uno di questi snapshot non
+prova nulla. La colonna `snapshots.max_per_type` (NULL = cattura integrale) la rende
+riconoscibile e la esclude dalla frontiera; senza, un solo `snapshot --max-per-type`
+avrebbe classificato come vendute tutte le inserzioni che non era arrivato a scaricare.
+La migrazione è in place e considera integrali gli snapshot preesistenti, che è ciò che
+`snapshot` fa quando l'opzione non viene passata.
 
-**Fatto quando**: i baseline sono calcolabili sulle sole inserzioni concluse e `deals`
-espone su quale popolazione sta confrontando.
+`deals` dichiara in testa alla tabella la popolazione di confronto e la sua composizione
+(concluse / ancora in vendita / ritiri stimati), così la tolleranza si giudica sui numeri;
+`--baseline listed` torna al comportamento precedente e `--sale-margin` senza
+`--baseline sold` è un errore, non un'opzione che non si applica. Su un database senza
+un secondo snapshot completo, `deals` spiega perché non ci sono vendite invece di
+restituire una tabella vuota.
+
+**Onestà dello stimatore**: l'euristica è asimmetrica per costruzione — scarta le sparite
+care, non le sparite a poco — quindi una mediana `sold` sta sotto la corrispondente
+`listed` anche quando tutte le sparizioni fossero vendite reali. È il motivo per cui la
+composizione della popolazione viene stampata invece che nascosta.
+
+**Verificato da**: `MarketDbTests.A_listing_gone_from_a_later_snapshot_is_measured_as_a_sale`,
+`A_listing_still_on_sale_is_not_a_sale`,
+`The_sale_margin_decides_where_a_disappearance_stops_being_a_sale`,
+`An_interrupted_snapshot_is_not_proof_that_a_listing_is_gone`,
+`A_snapshot_of_another_type_is_not_proof_that_a_listing_is_gone`,
+`A_truncated_snapshot_is_not_proof_that_a_listing_is_gone`,
+`A_snapshot_of_another_planet_is_not_proof_that_a_listing_is_gone`,
+`MarketDbMigrationTests.A_v2_database_gains_the_capture_limit_column_on_open`.
+
+**Resta aperto, in prospettiva** (non necessario a chiudere questa voce): incrocio con le
+transazioni `BuyProduct` on-chain via 9cscan o mimir, che sostituirebbe l'euristica con il
+dato reale. Un secondo affinamento a costo minore: usare `seller_agent` per riconoscere il
+*re-listing* (sparizione seguita dalla ricomparsa dello stesso venditore nello stesso
+bucket) e classificarlo come ritiro anche quando il prezzo era basso.
 
 ### P1.2 — Bucket dei comparabili troppo grossolano ✅ FATTO
 
@@ -201,9 +233,9 @@ segnala accanto all'esempio del comando.
 
 **Resta aperto, in prospettiva** (non necessario a chiudere questa voce): sostituire il
 bucketing con un modello di prezzo normalizzato per CP e statistiche robuste (mediana +
-MAD invece della sola mediana). Ha senso affrontarlo dopo P1.1, quando i baseline saranno
-calcolati sulle inserzioni concluse: cambiare stimatore su una popolazione ancora
-sbagliata non migliora il risultato.
+MAD invece della sola mediana). Aveva senso affrontarlo dopo P1.1, perché cambiare
+stimatore su una popolazione sbagliata non migliora il risultato; ora che i baseline si
+calcolano sulle inserzioni concluse, il prerequisito è soddisfatto.
 
 **Verificato da**: `DealFinderTests.A_listing_is_not_compared_with_a_different_option_count`,
 `Each_option_count_is_measured_against_its_own_baseline`,
@@ -215,14 +247,17 @@ sbagliata non migliora il risultato.
 
 ### P2.1 — Nessun test ✅ FATTO
 
-Progetto `tests/NCMarket.Tests` (xUnit), 38 test, nessuna dipendenza di rete:
+Progetto `tests/NCMarket.Tests` (xUnit), 46 test, nessuna dipendenza di rete:
 
 - `MarketDbTests` — stato degli snapshot, `GetLatestSnapshotId`, deduplicazione di
   `AddProducts`, mediane, partizionamento dei bucket e finestra `--days` di
-  `GetPriceBaselines`, `Prune` con e senza `--dry-run`, uso effettivo dell'indice via
-  `EXPLAIN QUERY PLAN`;
-- `MarketDbMigrationTests` — un database v2 costruito a mano viene migrato a v3
-  conservando i dati e classificando correttamente snapshot completi e parziali;
+  `GetPriceBaselines`, rilevazione delle vendite (sparizione, soglia di
+  classificazione, e i quattro casi in cui uno snapshot non fa prova: parziale,
+  troncato, di un altro tipo, di un altro pianeta), `Prune` con e senza `--dry-run`,
+  uso effettivo dell'indice via `EXPLAIN QUERY PLAN`;
+- `MarketDbMigrationTests` — un database v2 costruito a mano viene migrato a v4
+  conservando i dati, classificando correttamente snapshot completi e parziali e
+  acquisendo la colonna `max_per_type`;
 - `DealFinderTests` — soglie, campioni minimi, metrica CP contro metrica prezzo,
   comparabilità per numero di opzioni, ordinamento;
 - `DbLockTests` — il secondo detentore attende e poi rinuncia; il rilascio libera il lock;
@@ -286,10 +321,12 @@ MIT è la scelta usuale; Apache-2.0 aggiunge una concessione esplicita di brevet
 |---|---|---|---|
 | 1 | Merge del branch su `main` | minimo | Allinea il repository e attiva la CI sul ramo principale |
 | 2 | Scelta del LICENSE (P2.5) | minimo | Serve una decisione, non del lavoro |
-| 3 | **P1.1** (rilevazione vendite) | medio-alto | Rende `deals` effettivamente affidabile; i prerequisiti sono chiusi, P1.2 compreso |
+| 3 | Taratura di `--sale-margin` su dati reali | basso | La soglia di default (20%) è una scelta ragionata, non una misura: con qualche giorno di snapshot si può verificare come si sposta la composizione della popolazione |
 | 4 | Completare la copertura dei test (P2.1, parte residua) | basso | Export CSV e parsing nomi sono ancora senza asserzioni |
 | 5 | Notifica occasioni (webhook Telegram/Discord) dal job | basso | È il payoff del deploy su server: non si leggono CSV, si viene avvisati |
 | 6 | Filtri avanzati API (`stat`, `itemIds[]`, `isCustom`) + output `--json` | basso | Già in roadmap; il JSON abilita la dashboard |
 | 7 | P2.4 (estrarre l'orchestrazione in Core) | medio | Prima di dashboard o servizio schedulato, non dopo |
+| 8 | Mediana + MAD, o vendite on-chain via 9cscan/mimir | medio-alto | I due modi di migliorare ancora la stima, ora che la popolazione è quella giusta |
 
-Il punto 3 è quello che cambia il valore dello strumento.
+Con P1.1 chiuso non restano interventi che cambiano la correttezza del motore: i punti 1
+e 2 sono decisioni, il 3 è una misura da fare sui dati veri, gli altri sono estensioni.
