@@ -18,6 +18,11 @@ motore di valutazione.
 **Aggiornato il 2026-08-16 (2)**: chiuso P2.4 (orchestrazione estratta in `NCMarket.Core`).
 Restano aperti P2.5 — che è una decisione, non del lavoro — e l'ultimo punto di P2.6.
 
+**Aggiornato il 2026-08-18**: chiuso l'ultimo punto di P2.6 (le baseline si calcolano a
+flusso, un bucket per volta). La misura che il punto aspettava ha però mostrato che
+l'indice `ix_listings_last_seen` non viene mai usato dalla finestra `--days`: è la nuova
+voce P2.7. Resta aperto P2.5, che è una decisione, non del lavoro.
+
 Legenda priorità:
 
 - **P0** — bug che corrompono i dati o li nascondono; da fare prima di aggiungere feature.
@@ -33,7 +38,7 @@ Legenda priorità:
 | Branch di lavoro | `feature/docker-deploy`, **10 commit avanti** su `origin/main` | invariato: il merge su `main` resta da fare |
 | `origin/main` | fermo ai commit iniziali | invariato |
 | Build locale | **fallisce**: SDK 8.0.204 contro target `net9.0` | ✅ verde (SDK 9.0.317, versione fissata da `global.json`) |
-| Test | nessuno | ✅ 59 test xUnit in `tests/NCMarket.Tests` (al 2026-08-16) |
+| Test | nessuno | ✅ 60 test xUnit in `tests/NCMarket.Tests` (al 2026-08-18) |
 | CI | nessuna | ✅ `.github/workflows/ci.yml`: build + test + build dell'immagine Docker |
 | File spuri tracciati | `p0.txt`, `p1.txt` | ✅ rimossi dal tracciamento, `.gitignore` esteso |
 
@@ -124,6 +129,14 @@ quindi anche sui database già esistenti, senza migrazione dedicata.
 **Verificato da**: `MarketDbTests.Prune_filters_listings_through_the_last_seen_index`
 (asserisce su `EXPLAIN QUERY PLAN`) e
 `MarketDbMigrationTests.A_v2_database_keeps_its_data_and_gains_the_missing_index`.
+
+**Corretto il 2026-08-18**: metà della motivazione qui sopra era sbagliata. L'indice
+serve `Prune`, ed è quello che il test verifica; la finestra `--days` di
+`GetPriceBaselines` invece non lo usa e non lo ha mai usato, perché il predicato è scritto
+come disgiunzione (`$since IS NULL OR last_seen_at_utc >= $since`) e il planner non può
+risolverla con un indice. `EXPLAIN QUERY PLAN` su quella query dice
+`SEARCH listings USING INDEX ix_listings_planet_subtype (planet=?)` con qualunque valore
+di `$since`. Il seguito è in P2.7.
 
 ### P0.6 — Conflitto tra job schedulati ✅ FATTO
 
@@ -250,14 +263,15 @@ calcolano sulle inserzioni concluse, il prerequisito è soddisfatto.
 
 ### P2.1 — Nessun test ✅ FATTO
 
-Progetto `tests/NCMarket.Tests` (xUnit), 59 test, nessuna dipendenza di rete:
+Progetto `tests/NCMarket.Tests` (xUnit), 60 test, nessuna dipendenza di rete:
 
 - `MarketDbTests` — stato degli snapshot, `GetLatestSnapshotId`, deduplicazione di
   `AddProducts`, mediane, partizionamento dei bucket e finestra `--days` di
   `GetPriceBaselines`, rilevazione delle vendite (sparizione, soglia di
   classificazione, e i quattro casi in cui uno snapshot non fa prova: parziale,
-  troncato, di un altro tipo, di un altro pianeta), `Prune` con e senza `--dry-run`,
-  uso effettivo dell'indice via `EXPLAIN QUERY PLAN`;
+  troncato, di un altro tipo, di un altro pianeta), raggruppamento di un bucket sparso
+  nel listino, `Prune` con e senza `--dry-run`, uso effettivo dell'indice via
+  `EXPLAIN QUERY PLAN`;
 - `MarketDbMigrationTests` — un database v2 costruito a mano viene migrato a v4
   conservando i dati, classificando correttamente snapshot completi e parziali e
   acquisendo la colonna `max_per_type`;
@@ -348,12 +362,97 @@ MIT è la scelta usuale; Apache-2.0 aggiunge una concessione esplicita di brevet
   e filtrare in memoria.
 - ✅ `MarketClient` imposta uno `User-Agent` che identifica il progetto e attende 250 ms
   fra una pagina e la successiva.
-- ⬜ `GetPriceBaselines` carica ancora tutte le righe in memoria per fare il bucketing in
-  C#. Accettabile oggi; da rivedere quando lo storico crescerà. Non è stato fatto insieme
-  a P1.2 come previsto: l'alternativa è aggregare in SQL, ma SQLite non ha una funzione
-  mediana e la versione con funzioni finestra è nettamente meno leggibile di quella in
-  C#, a fronte di un problema di prestazioni che oggi non si manifesta. Da riprendere
-  quando ci sarà una misura che lo giustifichi, o insieme al passaggio a mediana + MAD.
+- ✅ `GetPriceBaselines` non tiene più in memoria l'intero storico: le baseline si
+  calcolano a flusso, un bucket per volta.
+
+**La misura che il punto aspettava**. Il punto era rimasto aperto in attesa di un numero,
+e il numero dice due cose diverse da quelle che ci si aspettava. Su database sintetici
+(cattura ogni 6 ore per un anno, cinque tipi, ~22.000 bucket a 2 milioni di inserzioni),
+popolazione `listed`, prima dell'intervento:
+
+| Inserzioni | Tempo | Heap vivo al picco | Allocato |
+|---|---|---|---|
+| 100.000 | 354 ms | 19 MB | 23 MB |
+| 500.000 | 1.424 ms | 73 MB | 108 MB |
+| 2.000.000 | 4.589 ms | 293 MB | 411 MB |
+
+1. **il tempo non era il problema, e non era ottimizzabile in C#**: leggere le sole righe
+   da SQLite, senza costruire niente, costa 4.611 ms su 2 milioni di inserzioni, cioè
+   l'intero tempo della chiamata. Il bucketing in C# è gratis in confronto: qualunque
+   riscrittura dell'aggregazione avrebbe lasciato il tempo dov'era;
+2. **la memoria invece cresceva senza limite**, ed è la parte che il punto denunciava. Il
+   picco non è nemmeno il dato utile: `List<T>` raddoppia, quindi nell'istante del
+   ridimensionamento convivono il vettore vecchio e quello nuovo, ed è quello a fare i
+   293 MB. A storico doppio sarebbero stati il doppio.
+
+**Fatto**: la query è ordinata per chiave del bucket e l'aggregazione consuma il lettore a
+gruppi, un bucket alla volta (`ReadBuckets`), riusando un solo buffer per le mediane
+(`Summarise`). In memoria sta un bucket — una manciata di pezzi comparabili — invece di un
+anno di catture. Il raggruppamento resta a SQLite, che sa versare su disco; la mediana
+resta in C#, quindi nessuna funzione finestra e nessuna perdita di leggibilità: era
+l'obiezione che aveva bloccato il punto la prima volta.
+
+| Inserzioni | Tempo | Heap vivo al picco | Allocato |
+|---|---|---|---|
+| 100.000 | 359 ms | 2 MB | 2 MB |
+| 500.000 | 1.363 ms | 4 MB | 4 MB |
+| 2.000.000 | 6.192 ms | 4 MB | 4 MB |
+
+La memoria è **piatta**: non dipende più dallo storico, solo dal bucket più grande. Il
+prezzo è l'ordinamento, e si paga tutto sul caso più grande: fino a 500.000 inserzioni il
+tempo è invariato (dentro il rumore), a 2 milioni la popolazione `listed` passa da 4.589 a
+6.192 ms (+35%). La popolazione `sold` — quella di default — ci perde molto meno (5.868 →
+6.159 ms, +5%) perché in cambio sparisce la seconda aggregazione completa che serviva a
+ricalcolare le mediane sul sottoinsieme concluso, e sotto le 500.000 inserzioni migliora
+(390 → 304 ms su 100.000).
+
+Un indice dedicato per evitare l'ordinamento è stato provato e **scartato sulla misura**:
+`(planet, item_id, level, option_count)` rende la stessa lettura 3,5 volte più lenta
+(16.120 ms contro 4.611), perché scandire una tabella nell'ordine di un indice significa
+risalire alla riga una alla volta.
+
+**Verificato da**: `MarketDbTests.GetPriceBaselines_gathers_a_bucket_scattered_through_the_listing`,
+che alterna di proposito inserzioni di bucket diversi — i test esistenti le inserivano già
+raggruppate, quindi passavano anche senza l'ordinamento; questo, tolto l'`ORDER BY`,
+fallisce con `Samples = 1` invece di 3. In più, fuori dalla suite: confronto con
+un'implementazione di riferimento indipendente scritta in LINQ su 9 combinazioni
+(entrambe le popolazioni, margini 0/20/200, filtro tipo, finestre `--days`) a 500.000 e a
+2 milioni di inserzioni, tutte identiche; e output della CLI byte per byte identico fra
+build vecchia e nuova su 6 combinazioni di opzioni di `deals`.
+
+**Resta aperto, in prospettiva** (non necessario a chiudere questa voce): il passaggio a
+mediana + MAD, che era l'altra occasione in cui riprendere questo punto. L'aggregazione a
+flusso non lo ostacola — la MAD di un bucket si calcola con lo stesso buffer, in una
+seconda passata sui valori già in mano.
+
+### P2.7 — La finestra `--days` non passa dall'indice (aperto)
+
+**Dove**: [src/NCMarket.Core/MarketDb.cs](src/NCMarket.Core/MarketDb.cs) (`ReadBuckets`)
+
+Trovato misurando P2.6, non cercandolo. Il filtro della finestra storica è scritto
+`($since IS NULL OR last_seen_at_utc >= $since)`, un'unica stringa SQL che vale sia con la
+finestra sia senza. È comoda, ma è una disgiunzione: il planner non può risolverla con un
+indice, e infatti `EXPLAIN QUERY PLAN` risponde
+`SEARCH listings USING INDEX ix_listings_planet_subtype (planet=?)` qualunque sia `$since`.
+`ix_listings_last_seen`, creato in P0.5 anche per questa query, non è mai entrato in gioco.
+
+Il costo, su 2 milioni di inserzioni: `--days 7` restituisce 39.483 righe leggendone 2
+milioni, in 1.949 ms.
+
+Non basta però rendere il predicato indicizzabile. Misurato, riscriverlo senza la
+disgiunzione non cambia nulla (1.988 ms contro 2.116): senza statistiche il planner non ha
+motivo di preferire un indice all'altro. E forzarlo non è la risposta, perché l'indice
+giusto dipende dall'ampiezza della finestra: con `INDEXED BY ix_listings_last_seen` sette
+giorni scendono a 511 ms (4 volte più veloce), ma novanta giorni salgono a 3.378 ms contro
+2.525 (peggio, perché a quel punto le risalite alla riga sono mezzo milione).
+
+Servono quindi due mosse, in quest'ordine: costruire la clausola `WHERE` in C# invece
+dell'idioma `IS NULL OR`, e dare al planner delle statistiche (`ANALYZE`, da rinfrescare
+in `prune`) perché scelga finestra per finestra. Sono entrambe poco costose; quello che
+manca è il motivo. Oggi `deals` ha `--days 0` come default, cioè tutto lo storico, dove
+l'indice non servirebbe comunque. Diventa un intervento sensato quando la finestra sarà
+l'uso normale — per esempio con il job di notifica delle occasioni, che guarda solo il
+mercato recente.
 
 ---
 
@@ -366,8 +465,10 @@ MIT è la scelta usuale; Apache-2.0 aggiunge una concessione esplicita di brevet
 | 3 | Taratura di `--sale-margin` su dati reali | basso | La soglia di default (20%) è una scelta ragionata, non una misura: con qualche giorno di snapshot si può verificare come si sposta la composizione della popolazione |
 | 4 | Completare la copertura dei test (P2.1, parte residua) | basso | Export CSV e parsing nomi sono ancora senza asserzioni |
 | 5 | Notifica occasioni (webhook Telegram/Discord) dal job | basso | È il payoff del deploy su server: non si leggono CSV, si viene avvisati. `DealService` è già richiamabile senza CLI |
-| 6 | Filtri avanzati API (`stat`, `itemIds[]`, `isCustom`) + output `--json` | basso | Già in roadmap; il JSON abilita la dashboard |
-| 7 | Mediana + MAD, o vendite on-chain via 9cscan/mimir | medio-alto | I due modi di migliorare ancora la stima, ora che la popolazione è quella giusta |
+| 6 | Indicizzare la finestra `--days` (P2.7) | basso | Ha senso subito dopo il punto 5, che è ciò che rende la finestra l'uso normale |
+| 7 | Filtri avanzati API (`stat`, `itemIds[]`, `isCustom`) + output `--json` | basso | Già in roadmap; il JSON abilita la dashboard |
+| 8 | Mediana + MAD, o vendite on-chain via 9cscan/mimir | medio-alto | I due modi di migliorare ancora la stima, ora che la popolazione è quella giusta |
 
 Con P1.1 chiuso non restano interventi che cambiano la correttezza del motore: i punti 1
-e 2 sono decisioni, il 3 è una misura da fare sui dati veri, gli altri sono estensioni.
+e 2 sono decisioni, il 3 è una misura da fare sui dati veri, gli altri sono estensioni o
+prestazioni.

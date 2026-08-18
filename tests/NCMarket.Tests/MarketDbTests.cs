@@ -146,6 +146,36 @@ public sealed class MarketDbTests
     }
 
     [Fact]
+    public void GetPriceBaselines_gathers_a_bucket_scattered_through_the_listing()
+    {
+        using var temp = new TempDatabase();
+        using var db = temp.Open();
+
+        // Il listino arriva nell'ordine del market service, quindi i pezzi comparabili
+        // fra loro sono sparsi: qui vengono alternati di proposito. Il bucketing lascia
+        // il raggruppamento alla query, che le ordina per chiave; senza quell'ordine
+        // ogni bucket si spezzerebbe in frammenti e nel risultato resterebbe solo
+        // l'ultimo, con una mediana calcolata su un campione al posto di tre.
+        TestData.AddCompleteSnapshot(db, Now, new[]
+        {
+            TestData.Product(price: 100m, combatPoint: 1000),
+            TestData.Product(level: 5, price: 900m, combatPoint: 1000),
+            TestData.Product(price: 200m, combatPoint: 1000),
+            TestData.Product(level: 5, price: 700m, combatPoint: 1000),
+            TestData.Product(price: 300m, combatPoint: 1000),
+            TestData.Product(level: 5, price: 800m, combatPoint: 1000),
+        });
+
+        var baselines = db.GetPriceBaselines("heimdall").Baselines;
+
+        Assert.Equal(2, baselines.Count);
+        Assert.Equal(3, baselines[Bucket()].Samples);
+        Assert.Equal(200d, baselines[Bucket()].MedianPrice);
+        Assert.Equal(3, baselines[Bucket(level: 5)].Samples);
+        Assert.Equal(800d, baselines[Bucket(level: 5)].MedianPrice);
+    }
+
+    [Fact]
     public void GetPriceBaselines_leaves_the_price_per_cp_null_without_cp_samples()
     {
         using var temp = new TempDatabase();

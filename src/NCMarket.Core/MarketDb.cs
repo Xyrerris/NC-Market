@@ -250,7 +250,12 @@ public sealed class MarketDb : IDisposable
             CREATE INDEX IF NOT EXISTS ix_listings_planet_subtype ON listings(planet, item_sub_type);
             CREATE INDEX IF NOT EXISTS ix_listings_item ON listings(item_id);
             CREATE INDEX IF NOT EXISTS ix_sightings_listing ON sightings(listing_id);
-            -- Filter column of both Prune and the --days window of GetPriceBaselines.
+            -- Filter column of Prune, which is the one query the planner actually
+            -- resolves through it. The --days window of GetPriceBaselines is written as
+            -- a disjunction ($since IS NULL OR ...) and cannot use an index; measured on
+            -- two million listings, forcing this one is four times faster over a week
+            -- and slower over ninety days, so the choice belongs to the planner and the
+            -- predicate has to be made sargable first (see P2.7 in BACKLOG.md).
             CREATE INDEX IF NOT EXISTS ix_listings_last_seen ON listings(last_seen_at_utc);
             """);
     }
@@ -766,46 +771,78 @@ public sealed class MarketDb : IDisposable
         BaselinePopulation population = BaselinePopulation.Listed,
         double saleMarginPercent = DefaultSaleMarginPercent)
     {
-        var rows = ReadBaselineRows(planet, type, sinceUtc);
-        var listed = Aggregate(rows);
         var frontier = GetCoverageFrontier(planet);
         var tolerated = 1 + saleMarginPercent / 100;
+        var wantSold = population == BaselinePopulation.Sold;
 
-        var sold = new List<BaselineRow>();
-        var open = 0;
-        var withdrawn = 0;
-        foreach (var row in rows)
+        var baselines = new Dictionary<BaselineKey, PriceBaseline>();
+        var concluded = new List<BaselineRow>();
+        var scratch = new List<double>();
+        int total = 0, open = 0, likelySold = 0, likelyWithdrawn = 0;
+
+        foreach (var bucket in ReadBuckets(planet, type, sinceUtc))
         {
-            if (!frontier.TryGetValue(row.SubType, out var lastProof)
-                || lastProof <= row.LastSeenSnapshotId)
+            // The ask median classifies the listings of this bucket, so it is computed
+            // whichever population was asked for.
+            var listed = Summarise(bucket[0].Key, bucket, scratch);
+            total += bucket.Count;
+
+            concluded.Clear();
+            foreach (var row in bucket)
             {
-                open++;
-                continue;
+                if (!frontier.TryGetValue(row.SubType, out var lastProof)
+                    || lastProof <= row.LastSeenSnapshotId)
+                {
+                    open++;
+                    continue;
+                }
+
+                // No usable median means nothing to compare the asking price against:
+                // keep the listing rather than invent a reason to discard it.
+                if (listed.MedianPrice > 0 && row.Price > listed.MedianPrice * tolerated)
+                {
+                    likelyWithdrawn++;
+                    continue;
+                }
+
+                concluded.Add(row);
             }
 
-            // No usable median means nothing to compare the asking price against: keep
-            // the listing rather than invent a reason to discard it.
-            var medianAsk = listed[row.Key].MedianPrice;
-            if (medianAsk > 0 && row.Price > medianAsk * tolerated)
-            {
-                withdrawn++;
-                continue;
-            }
+            likelySold += concluded.Count;
 
-            sold.Add(row);
+            if (!wantSold)
+            {
+                baselines[listed.Key] = listed;
+            }
+            else if (concluded.Count > 0)
+            {
+                baselines[listed.Key] = Summarise(listed.Key, concluded, scratch);
+            }
         }
 
         return new BaselineSet(
             population,
-            new ListingOutcomes(rows.Count, open, sold.Count, withdrawn),
-            population == BaselinePopulation.Sold ? Aggregate(sold) : listed);
+            new ListingOutcomes(total, open, likelySold, likelyWithdrawn),
+            baselines);
     }
 
     /// <summary>One listing, reduced to what a baseline is made of.</summary>
     private readonly record struct BaselineRow(
         BaselineKey Key, int SubType, long LastSeenSnapshotId, double Price, int CombatPoint);
 
-    private List<BaselineRow> ReadBaselineRows(
+    /// <summary>
+    /// The listings of a planet, one <see cref="BaselineKey"/> bucket at a time. Ordering
+    /// the query by the bucket key leaves the grouping to SQLite, so what is held in
+    /// memory is a bucket — a handful of comparable pieces — instead of the whole
+    /// history, which a year of captures makes millions of rows. The price is the sort,
+    /// which SQLite spills to disk when it needs to; that is the trade, because the
+    /// managed heap has nowhere to spill.
+    /// <para>
+    /// The list is reused from one bucket to the next: read a bucket before asking for
+    /// the following one, and do not hold on to it.
+    /// </para>
+    /// </summary>
+    private IEnumerable<List<BaselineRow>> ReadBuckets(
         string planet, EquipmentType? type, DateTime? sinceUtc)
     {
         using var cmd = _conn.CreateCommand();
@@ -815,7 +852,8 @@ public sealed class MarketDb : IDisposable
             FROM listings
             WHERE planet = $planet
               AND ($subType IS NULL OR item_sub_type = $subType)
-              AND ($since IS NULL OR last_seen_at_utc >= $since);
+              AND ($since IS NULL OR last_seen_at_utc >= $since)
+            ORDER BY item_id, level, option_count;
             """;
         cmd.Parameters.AddWithValue("$planet", planet);
         cmd.Parameters.AddWithValue("$subType", type is null ? DBNull.Value : (int)type.Value);
@@ -825,51 +863,61 @@ public sealed class MarketDb : IDisposable
                 ? DBNull.Value
                 : sinceUtc.Value.ToString("O", CultureInfo.InvariantCulture));
 
-        var rows = new List<BaselineRow>();
+        var bucket = new List<BaselineRow>();
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
         {
-            rows.Add(new BaselineRow(
+            var row = new BaselineRow(
                 new BaselineKey(reader.GetInt32(0), reader.GetInt32(1), reader.GetInt32(2)),
                 reader.GetInt32(5),
                 reader.GetInt64(6),
                 reader.GetDouble(3),
-                reader.GetInt32(4)));
+                reader.GetInt32(4));
+
+            if (bucket.Count > 0 && !row.Key.Equals(bucket[0].Key))
+            {
+                yield return bucket;
+                bucket.Clear();
+            }
+
+            bucket.Add(row);
         }
 
-        return rows;
+        if (bucket.Count > 0)
+        {
+            yield return bucket;
+        }
     }
 
-    private static Dictionary<BaselineKey, PriceBaseline> Aggregate(List<BaselineRow> rows)
+    /// <summary>
+    /// The baseline of a single bucket: median price over every listing given, median
+    /// price-per-CP over those that carry a combat point. <paramref name="scratch"/> is
+    /// the buffer the values are sorted in, passed in so that a whole history costs one
+    /// of them instead of two per bucket.
+    /// </summary>
+    private static PriceBaseline Summarise(
+        BaselineKey key, List<BaselineRow> rows, List<double> scratch)
     {
-        var buckets = new Dictionary<BaselineKey, (List<double> Prices, List<double> PricesPerCp)>();
+        scratch.Clear();
         foreach (var row in rows)
         {
-            if (!buckets.TryGetValue(row.Key, out var bucket))
-            {
-                bucket = (new List<double>(), new List<double>());
-                buckets[row.Key] = bucket;
-            }
+            scratch.Add(row.Price);
+        }
 
-            bucket.Prices.Add(row.Price);
+        var medianPrice = Median(scratch);
+
+        scratch.Clear();
+        foreach (var row in rows)
+        {
             if (row.CombatPoint > 0)
             {
-                bucket.PricesPerCp.Add(row.Price / row.CombatPoint);
+                scratch.Add(row.Price / row.CombatPoint);
             }
         }
 
-        var result = new Dictionary<BaselineKey, PriceBaseline>(buckets.Count);
-        foreach (var (key, (prices, pricesPerCp)) in buckets)
-        {
-            result[key] = new PriceBaseline(
-                key,
-                prices.Count,
-                Median(prices),
-                pricesPerCp.Count,
-                pricesPerCp.Count > 0 ? Median(pricesPerCp) : null);
-        }
-
-        return result;
+        return new PriceBaseline(
+            key, rows.Count, medianPrice,
+            scratch.Count, scratch.Count > 0 ? Median(scratch) : null);
     }
 
     /// <summary>
