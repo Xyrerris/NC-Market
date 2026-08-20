@@ -8,7 +8,7 @@ namespace NCMarket.Core;
 /// HTTP client for the official Nine Chronicles market service
 /// (https://github.com/planetarium/market-service).
 /// </summary>
-public sealed class MarketClient : IDisposable
+public sealed class MarketClient : IMarketListingSource, IDisposable
 {
     /// <summary>Sort orders accepted by the market service.</summary>
     public static readonly string[] ValidOrders =
@@ -179,6 +179,16 @@ public sealed class MarketClient : IDisposable
 
         return results;
     }
+
+    /// <summary>
+    /// The <see cref="IMarketListingSource"/> view of the method above: the abstraction
+    /// exposes what a caller storing or judging a listing needs, leaving page size and
+    /// sort order — which exist to work around the service's unstable ordering — to
+    /// whoever constructs the client.
+    /// </summary>
+    Task<IReadOnlyList<ItemProduct>> IMarketListingSource.GetAllProductsAsync(
+        EquipmentType type, int? maxItems, Action<int, int>? progress, CancellationToken ct) =>
+        GetAllProductsAsync(type, maxItems: maxItems, progress: progress, ct: ct);
 
     private static bool IsTransient(HttpStatusCode status) =>
         (int)status >= 500 || status == HttpStatusCode.RequestTimeout ||

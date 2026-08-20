@@ -75,6 +75,10 @@ NC-Market/
 │   │   ├── EquipmentType.cs    Enum equipaggiamenti + parsing
 │   │   ├── Models/             DTO della risposta del market service
 │   │   ├── MarketClient.cs     Client HTTP con paginazione automatica
+│   │   ├── IMarketListingSource.cs  Astrazione del listino corrente (la implementa MarketClient)
+│   │   ├── ICaptureProgress.cs Avanzamento di una cattura, riportato mentre avviene
+│   │   ├── SnapshotService.cs  Orchestrazione di 'snapshot': cattura, salva, finalizza
+│   │   ├── DealService.cs      Orchestrazione di 'deals': baseline, listino da confrontare, esito
 │   │   ├── NameProvider.cs     Risoluzione id -> nome per item e skill (cache locale)
 │   │   ├── ProductFormat.cs    Formattazione statistiche e skill delle inserzioni
 │   │   ├── SnapshotCsvExporter.cs  Export CSV flat di uno snapshot
@@ -83,17 +87,24 @@ NC-Market/
 │   │   └── MarketDb.cs         Storicizzazione su SQLite, rilevazione vendite, query analitiche
 │   └── NCMarket.Cli/           Applicazione console
 │       ├── CommandLine.cs      Opzioni ammesse per verbo e loro validazione
+│       ├── ConsoleReport.cs    Tabelle e messaggi a schermo
+│       ├── ConsoleProgress.cs  Avanzamento di una cattura sulla console
+│       ├── HelpText.cs         Testo del comando 'help'
 │       └── Program.cs          Comandi: fetch, snapshot, snapshots, history, stats, deals, export, prune
 └── tests/
-    └── NCMarket.Tests/         xUnit: schema e migrazioni, baseline, vendite, prune, deals, CLI
+    └── NCMarket.Tests/         xUnit: schema e migrazioni, baseline, vendite, prune, deals, servizi, CLI
 ```
 
 Scelte progettuali:
 
 - **.NET 9 / C#**: coerente con l'ecosistema Nine Chronicles (lib9c, Libplanet) e con gli
   SDK già presenti sulla macchina.
-- **Core separato dalla CLI**: la libreria `NCMarket.Core` è riusabile in step successivi
-  (servizio schedulato, dashboard, motore di valutazione) senza toccare la CLI.
+- **Core separato dalla CLI**: `NCMarket.Core` contiene anche l'orchestrazione dei due
+  comandi che fanno lavoro vero — `SnapshotService` (cattura del listino) e `DealService`
+  (ricerca delle occasioni) — e non scrive nulla a schermo: riporta l'avanzamento tramite
+  `ICaptureProgress` e restituisce un risultato. Un servizio schedulato o una dashboard li
+  guidano come li guida la CLI; in `NCMarket.Cli` restano la lettura delle opzioni e la
+  presentazione (`ConsoleReport`).
 - **SQLite** (`Microsoft.Data.Sqlite`): zero amministrazione, file unico, adatto a
   storicizzazione e query aggregate. Percorso di default:
   `%LOCALAPPDATA%\NCMarket\ncmarket.db`, personalizzabile con `--db`.
@@ -382,3 +393,7 @@ di fallire sul `VACUUM`.
 ```powershell
 dotnet build NC-Market/NCMarket.sln
 ```
+
+## Licenza
+
+[MIT](LICENSE).
