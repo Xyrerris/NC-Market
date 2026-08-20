@@ -393,3 +393,7 @@ di fallire sul `VACUUM`.
 ```powershell
 dotnet build NC-Market/NCMarket.sln
 ```
+
+## Licenza
+
+[MIT](LICENSE).

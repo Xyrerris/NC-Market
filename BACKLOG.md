@@ -23,6 +23,11 @@ flusso, un bucket per volta). La misura che il punto aspettava ha però mostrato
 l'indice `ix_listings_last_seen` non viene mai usato dalla finestra `--days`: è la nuova
 voce P2.7. Resta aperto P2.5, che è una decisione, non del lavoro.
 
+**Aggiornato il 2026-08-20**: chiuso P2.5 (licenza MIT) e allineato il repository —
+P2.4 e P2.6 sono ora su `main`. Resta aperto il solo P2.7, che è parcheggiato in attesa
+di un motivo: la finestra `--days` diventa l'uso normale con il job di notifica, ed è
+allora che indicizzarla ha senso.
+
 Legenda priorità:
 
 - **P0** — bug che corrompono i dati o li nascondono; da fare prima di aggiungere feature.
@@ -33,14 +38,15 @@ Legenda priorità:
 
 ## Stato del repository
 
-| Voce | Stato al 2026-08-12 | Stato al 2026-08-13 |
+| Voce | Stato al 2026-08-12 | Stato al 2026-08-20 |
 |---|---|---|
-| Branch di lavoro | `feature/docker-deploy`, **10 commit avanti** su `origin/main` | invariato: il merge su `main` resta da fare |
-| `origin/main` | fermo ai commit iniziali | invariato |
+| Branch di lavoro | `feature/docker-deploy`, **10 commit avanti** su `origin/main` | ✅ nessuno in sospeso: `perf/baseline-streaming` (P2.4 + P2.6) è stato unito a `main` |
+| `origin/main` | fermo ai commit iniziali | ✅ allineato: contiene tutto il lavoro fino a P2.6 |
 | Build locale | **fallisce**: SDK 8.0.204 contro target `net9.0` | ✅ verde (SDK 9.0.317, versione fissata da `global.json`) |
-| Test | nessuno | ✅ 60 test xUnit in `tests/NCMarket.Tests` (al 2026-08-18) |
+| Test | nessuno | ✅ 60 test xUnit in `tests/NCMarket.Tests`, tutti verdi |
 | CI | nessuna | ✅ `.github/workflows/ci.yml`: build + test + build dell'immagine Docker |
 | File spuri tracciati | `p0.txt`, `p1.txt` | ✅ rimossi dal tracciamento, `.gitignore` esteso |
+| Licenza | assente | ✅ MIT ([LICENSE](LICENSE)) |
 
 ---
 
@@ -348,12 +354,15 @@ rifiuta comunque una cattura senza tipi.
 limite per tipo, nessun tipo) e `DealServiceTests` (9 casi: i quattro `DealStatus`,
 percorso snapshot e percorso live, filtro rarità, sorgente mancante, pianeta sbagliato).
 
-### P2.5 — Manca il LICENSE (aperto, richiede una decisione)
+### P2.5 — Manca il LICENSE ✅ FATTO
 
-Repository pubblico senza file di licenza. La scelta è del proprietario del repository e,
-una volta pubblicata, la concessione non è di fatto revocabile per le versioni già
-rilasciate: per questo non è stata fatta d'ufficio. Per un progetto personale su GitHub
-MIT è la scelta usuale; Apache-2.0 aggiunge una concessione esplicita di brevetto.
+Repository pubblico senza file di licenza. La scelta era del proprietario del repository
+e, una volta pubblicata, la concessione non è di fatto revocabile per le versioni già
+rilasciate: per questo non è stata fatta d'ufficio.
+
+**Fatto**: [LICENSE](LICENSE) con il testo MIT, la scelta usuale per un progetto personale
+su GitHub. Apache-2.0 sarebbe stata l'alternativa, per la concessione esplicita di
+brevetto che aggiunge; qui non c'è nulla di brevettabile da concedere.
 
 ### P2.6 — Dettagli minori
 
@@ -460,15 +469,13 @@ mercato recente.
 
 | # | Intervento | Costo | Perché in questa posizione |
 |---|---|---|---|
-| 1 | Merge del branch su `main` | minimo | Allinea il repository e attiva la CI sul ramo principale |
-| 2 | Scelta del LICENSE (P2.5) | minimo | Serve una decisione, non del lavoro |
-| 3 | Taratura di `--sale-margin` su dati reali | basso | La soglia di default (20%) è una scelta ragionata, non una misura: con qualche giorno di snapshot si può verificare come si sposta la composizione della popolazione |
+| 1 | Notifica occasioni (webhook Telegram/Discord) dal job | basso | È il payoff del deploy su server: non si leggono CSV, si viene avvisati. `DealService` è già richiamabile senza CLI, perché P2.4 l'ha estratto in Core |
+| 2 | Taratura di `--sale-margin` su dati reali | basso | La soglia di default (20%) è una scelta ragionata, non una misura: con qualche giorno di snapshot si può verificare come si sposta la composizione della popolazione. Si accumula da sé mentre il job del punto 1 gira |
+| 3 | Indicizzare la finestra `--days` (P2.7) | basso | Ha senso subito dopo il punto 1, che è ciò che rende la finestra l'uso normale |
 | 4 | Completare la copertura dei test (P2.1, parte residua) | basso | Export CSV e parsing nomi sono ancora senza asserzioni |
-| 5 | Notifica occasioni (webhook Telegram/Discord) dal job | basso | È il payoff del deploy su server: non si leggono CSV, si viene avvisati. `DealService` è già richiamabile senza CLI |
-| 6 | Indicizzare la finestra `--days` (P2.7) | basso | Ha senso subito dopo il punto 5, che è ciò che rende la finestra l'uso normale |
-| 7 | Filtri avanzati API (`stat`, `itemIds[]`, `isCustom`) + output `--json` | basso | Già in roadmap; il JSON abilita la dashboard |
-| 8 | Mediana + MAD, o vendite on-chain via 9cscan/mimir | medio-alto | I due modi di migliorare ancora la stima, ora che la popolazione è quella giusta |
+| 5 | Filtri avanzati API (`stat`, `itemIds[]`, `isCustom`) + output `--json` | basso | Già in roadmap; il JSON abilita la dashboard |
+| 6 | Mediana + MAD, o vendite on-chain via 9cscan/mimir | medio-alto | I due modi di migliorare ancora la stima, ora che la popolazione è quella giusta |
 
-Con P1.1 chiuso non restano interventi che cambiano la correttezza del motore: i punti 1
-e 2 sono decisioni, il 3 è una misura da fare sui dati veri, gli altri sono estensioni o
-prestazioni.
+Con P1.1 chiuso non restano interventi che cambiano la correttezza del motore, e con il
+merge e la licenza fatti non restano decisioni in sospeso: il punto 2 è una misura da fare
+sui dati veri, gli altri sono estensioni o prestazioni.
