@@ -294,6 +294,21 @@ internal static class ConsoleReport
     }
 
     /// <summary>
+    /// What the alert did. A run that found deals but announced none is not the same as
+    /// one that found nothing, and on a scheduled job this line is the only place the
+    /// difference shows: silence alone would read as a broken notifier.
+    /// </summary>
+    public static void Alert(AlertReport alert, string channel)
+    {
+        Console.WriteLine();
+        Console.WriteLine(alert.Sent
+            ? $"Notifica {channel} inviata: {alert.New.Count.ToString("N0", Culture)} " +
+              $"occasioni nuove su {alert.Found.ToString("N0", Culture)}."
+            : $"Nessuna notifica {channel}: le {alert.Found.ToString("N0", Culture)} " +
+              "occasioni trovate erano già state segnalate.");
+    }
+
+    /// <summary>
     /// States which population the medians were measured on: the difference between
     /// measuring what sellers ask and what the market pays.
     /// </summary>
@@ -327,6 +342,7 @@ internal static class ConsoleReport
         Console.WriteLine($"  Inserzioni {invariant ?? "rimosse"}: {result.ListingsRemoved.ToString("N0", Culture)}");
         Console.WriteLine($"  Avvistamenti {invariant ?? "rimossi"}: {result.SightingsRemoved.ToString("N0", Culture)}");
         Console.WriteLine($"  Snapshot {invariant ?? "rimossi"}: {result.SnapshotsRemoved.ToString("N0", Culture)}");
+        Console.WriteLine($"  Segnalazioni {invariant ?? "rimosse"}: {result.NotificationsRemoved.ToString("N0", Culture)}");
         if (!dryRun)
         {
             Console.WriteLine(

@@ -14,8 +14,9 @@ FROM mcr.microsoft.com/dotnet/runtime:9.0
 WORKDIR /data
 
 COPY --from=build /app /app
-COPY docker/ncmarket docker/snapshot-job docker/entrypoint /usr/local/bin/
-RUN chmod +x /usr/local/bin/ncmarket /usr/local/bin/snapshot-job /usr/local/bin/entrypoint
+COPY docker/ncmarket docker/snapshot-job docker/deals-job docker/entrypoint /usr/local/bin/
+RUN chmod +x /usr/local/bin/ncmarket /usr/local/bin/snapshot-job \
+             /usr/local/bin/deals-job /usr/local/bin/entrypoint
 
 # Su Linux .NET risolve LocalApplicationData come $XDG_DATA_HOME: database e cache
 # dei nomi item/skill finiscono quindi in /data/NCMarket (vedi AppPaths.cs).

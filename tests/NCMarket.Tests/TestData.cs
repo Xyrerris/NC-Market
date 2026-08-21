@@ -1,3 +1,4 @@
+using System.Net;
 using Microsoft.Data.Sqlite;
 using NCMarket.Core;
 using NCMarket.Core.Models;
@@ -153,6 +154,74 @@ internal sealed class FakeMarket : IMarketListingSource
         var products = _listings.GetValueOrDefault(type, Array.Empty<ItemProduct>());
         progress?.Invoke(products.Count, products.Count);
         return Task.FromResult(products);
+    }
+}
+
+/// <summary>
+/// A destination that keeps the messages instead of delivering them: what an alert run
+/// does is decide whether to speak and what to say, which is what this records.
+/// </summary>
+internal sealed class FakeChannel : INotificationChannel
+{
+    private bool _fails;
+
+    public string Name => "Fake";
+
+    /// <summary>The messages delivered, in order.</summary>
+    public List<string> Sent { get; } = new();
+
+    /// <summary>Makes every send fail, the way a wrong token or a dead network would.</summary>
+    public FakeChannel Failing()
+    {
+        _fails = true;
+        return this;
+    }
+
+    public Task SendAsync(string message, CancellationToken ct = default)
+    {
+        if (_fails)
+        {
+            throw new InvalidOperationException(
+                "Telegram ha risposto 401 (Unauthorized): Unauthorized.");
+        }
+
+        Sent.Add(message);
+        return Task.CompletedTask;
+    }
+}
+
+/// <summary>
+/// An HTTP endpoint that answers from a script instead of from the network, and keeps
+/// what it was sent.
+/// </summary>
+internal sealed class FakeHttpHandler : HttpMessageHandler
+{
+    private readonly Queue<(HttpStatusCode Status, string Body)> _answers = new();
+
+    /// <summary>Full URLs requested, in order — token included, which is the point.</summary>
+    public List<string> Urls { get; } = new();
+
+    /// <summary>Request bodies, as sent on the wire.</summary>
+    public List<string> Bodies { get; } = new();
+
+    /// <summary>Queues one answer. Requests past the last one get a plain success.</summary>
+    public FakeHttpHandler Answering(HttpStatusCode status, string body = """{"ok":true}""")
+    {
+        _answers.Enqueue((status, body));
+        return this;
+    }
+
+    protected override async Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request, CancellationToken ct)
+    {
+        Urls.Add(request.RequestUri!.ToString());
+        Bodies.Add(request.Content is null ? "" : await request.Content.ReadAsStringAsync(ct));
+
+        var (status, body) = _answers.Count > 0
+            ? _answers.Dequeue()
+            : (HttpStatusCode.OK, """{"ok":true}""");
+
+        return new HttpResponseMessage(status) { Content = new StringContent(body) };
     }
 }
 

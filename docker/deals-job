@@ -1,0 +1,31 @@
+#!/bin/sh
+# Job periodico: cerca le occasioni e notifica quelle mai segnalate prima.
+#
+# Va schedulato dopo snapshot-job: per default confronta l'ultimo snapshot
+# (--from-snapshot), che e' quello appena catturato, cosi' non riscarica il
+# listino una seconda volta. Ogni inserzione viene notificata una volta sola,
+# quindi la frequenza si sceglie per quanto in fretta si vogliono sapere le
+# cose, non per evitare di ricevere sempre gli stessi messaggi.
+#
+# Variabili d'ambiente:
+#   NCMARKET_PLANET             pianeta da interrogare (default: heimdall)
+#   NCMARKET_TELEGRAM_TOKEN     token del bot Telegram (obbligatoria)
+#   NCMARKET_TELEGRAM_CHAT_ID   chat di destinazione (obbligatoria)
+#   NCMARKET_DEALS_ARGS         opzioni di 'deals' (default: --from-snapshot)
+#
+# Con `set -e` un errore fa uscire il job con codice != 0: Coolify segna lo
+# Scheduled Task come fallito e invia la notifica configurata. Un token mancante
+# o una chat sbagliata sono quindi un fallimento visibile, non un silenzio -
+# che e' esattamente cio' che un job di notifica non deve produrre.
+set -eu
+
+PLANET="${NCMARKET_PLANET:-heimdall}"
+
+echo "[$(date -u +%FT%TZ)] deals $PLANET - inizio"
+
+# Volutamente non quotata: e' l'unico modo di passare piu' opzioni da una sola
+# variabile d'ambiente.
+# shellcheck disable=SC2086
+ncmarket deals --planet "$PLANET" --notify ${NCMARKET_DEALS_ARGS:---from-snapshot}
+
+echo "[$(date -u +%FT%TZ)] deals $PLANET - fine"

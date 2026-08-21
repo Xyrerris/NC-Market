@@ -32,6 +32,7 @@ try
         "deals" => await DealsAsync(),
         "export" => await ExportAsync(),
         "prune" => Prune(),
+        "notify-test" => await NotifyTestAsync(),
         _ => throw new InvalidOperationException(
             $"Comando '{verb}' dichiarato in CommandLine ma non implementato."),
     };
@@ -199,6 +200,17 @@ async Task<int> DealsAsync()
         return 2;
     }
 
+    // Il canale di notifica si valida qui, prima della ricerca: scaricare il mercato
+    // live sono minuti, e scoprire solo alla fine che manca il token significa averli
+    // spesi per niente.
+    var notify = options.ContainsKey("notify");
+    TelegramOptions? telegram = null;
+    if (notify && !TelegramOptions.TryFromEnvironment(out telegram, out var notifyError))
+    {
+        Console.Error.WriteLine(notifyError);
+        return 2;
+    }
+
     var query = new DealQuery
     {
         Planet = planet,
@@ -240,7 +252,38 @@ async Task<int> DealsAsync()
         return 0;
     }
 
-    ConsoleReport.Deals(report, query, days, top, await LoadItemNamesAsync());
+    var names = await LoadItemNamesAsync();
+    ConsoleReport.Deals(report, query, days, top, names);
+
+    if (notify)
+    {
+        using var notifier = new TelegramNotifier(telegram!);
+        var alert = await new DealAlertService(db, notifier)
+            .AnnounceAsync(report, query, names, top);
+
+        ConsoleReport.Alert(alert, notifier.Name);
+    }
+
+    return 0;
+}
+
+/// Verifica la configurazione del canale di notifica prima che serva davvero: senza
+/// questo comando l'unico modo di sapere se token e chat sono giusti è aspettare la
+/// prima occasione, e un silenzio non distingue "nessuna occasione" da "non arriva".
+async Task<int> NotifyTestAsync()
+{
+    if (!TelegramOptions.TryFromEnvironment(out var telegram, out var error))
+    {
+        Console.Error.WriteLine(error);
+        return 2;
+    }
+
+    using var notifier = new TelegramNotifier(telegram!);
+    await notifier.SendAsync(
+        "NC-Market — messaggio di prova.\n" +
+        "Se lo stai leggendo, le notifiche delle occasioni arriveranno in questa chat.");
+
+    Console.WriteLine($"Messaggio di prova inviato su {notifier.Name}.");
     return 0;
 }
 

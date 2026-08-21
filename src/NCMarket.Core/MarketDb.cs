@@ -114,7 +114,7 @@ public sealed record BaselineSet(
 /// </summary>
 public sealed record PruneResult(
     int ListingsRemoved, int SightingsRemoved, int SnapshotsRemoved,
-    long BytesBefore, long BytesAfter);
+    int NotificationsRemoved, long BytesBefore, long BytesAfter);
 
 /// <summary>
 /// SQLite storage for market snapshots. Snapshots are logically immutable copies of
@@ -246,6 +246,18 @@ public sealed class MarketDb : IDisposable
                 snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
                 listing_id INTEGER NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
                 PRIMARY KEY(snapshot_id, listing_id)
+            ) WITHOUT ROWID;
+
+            -- Listings already announced by 'deals --notify'. Keyed by product_id, the
+            -- market's own identity of an offer, and not by a foreign key to listings:
+            -- an alert on the live market names offers no snapshot has stored yet. The
+            -- table is created here rather than by a migration because it is new, not
+            -- changed, so any existing database acquires it on open (as in P0.5); it
+            -- stays small — a deal is rare — and needs no index of its own, the only
+            -- query on it being the retention sweep.
+            CREATE TABLE IF NOT EXISTS notified_deals(
+                product_id TEXT PRIMARY KEY,
+                notified_at_utc TEXT NOT NULL
             ) WITHOUT ROWID;
 
             CREATE INDEX IF NOT EXISTS ix_listings_planet_subtype ON listings(planet, item_sub_type);
@@ -1003,12 +1015,85 @@ public sealed class MarketDb : IDisposable
     }
 
     /// <summary>
+    /// Which of <paramref name="productIds"/> have already been the subject of an alert
+    /// (see <see cref="DealAlertService"/>). Asking about the listings at hand, rather
+    /// than reading the whole table, keeps the cost proportional to the deals found and
+    /// not to how long the job has been running.
+    /// </summary>
+    public IReadOnlySet<Guid> GetAnnouncedProducts(IEnumerable<Guid> productIds)
+    {
+        var wanted = productIds.Distinct().ToList();
+        var announced = new HashSet<Guid>();
+
+        // SQLite caps the parameters of a single statement: a list of deals is short, but
+        // that is the caller's business rather than a limit to inherit.
+        const int batchSize = 500;
+        for (var start = 0; start < wanted.Count; start += batchSize)
+        {
+            var batch = wanted.GetRange(start, Math.Min(batchSize, wanted.Count - start));
+            using var cmd = _conn.CreateCommand();
+            var placeholders = new string[batch.Count];
+            for (var i = 0; i < batch.Count; i++)
+            {
+                placeholders[i] = "$p" + i.ToString(CultureInfo.InvariantCulture);
+                cmd.Parameters.AddWithValue(placeholders[i], batch[i].ToString("D"));
+            }
+
+            cmd.CommandText =
+                "SELECT product_id FROM notified_deals WHERE product_id IN (" +
+                string.Join(", ", placeholders) + ");";
+
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                announced.Add(Guid.Parse(reader.GetString(0)));
+            }
+        }
+
+        return announced;
+    }
+
+    /// <summary>
+    /// Records listings as announced, and returns how many were not recorded already.
+    /// Re-recording one keeps its first date: the row answers "has this been announced",
+    /// and the answer does not change with the second alert that would have repeated it.
+    /// </summary>
+    public int RecordAnnounced(IEnumerable<Guid> productIds, DateTime atUtc)
+    {
+        using var tx = _conn.BeginTransaction();
+        using var cmd = _conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = """
+            INSERT OR IGNORE INTO notified_deals(product_id, notified_at_utc)
+            VALUES($productId, $at);
+            """;
+        cmd.Parameters.AddWithValue("$at", atUtc.ToString("O", CultureInfo.InvariantCulture));
+        var productId = cmd.Parameters.Add("$productId", SqliteType.Text);
+
+        var recorded = 0;
+        foreach (var id in productIds)
+        {
+            productId.Value = id.ToString("D");
+            recorded += cmd.ExecuteNonQuery();
+        }
+
+        tx.Commit();
+        return recorded;
+    }
+
+    /// <summary>
     /// Retention pass: removes listings whose last sighting is older than
     /// <paramref name="cutoffUtc"/> (their sightings cascade away) and snapshots taken
     /// before the cutoff that are left with no sightings, then compacts the file with
     /// VACUUM. With <paramref name="dryRun"/> nothing is modified and the result
     /// reports what would be removed. The product_count of surviving snapshots is not
     /// rewritten: it documents the size of the listing at capture time.
+    /// <para>
+    /// An alert is forgotten only when its listing is: old enough, and no longer in the
+    /// history that survives the pass. Forgetting it while the offer still stands would
+    /// announce it a second time, which is the one thing
+    /// <see cref="DealAlertService"/> exists to prevent.
+    /// </para>
     /// </summary>
     public PruneResult Prune(DateTime cutoffUtc, bool dryRun = false)
     {
@@ -1037,9 +1122,16 @@ public sealed class MarketDb : IDisposable
                   WHERE g.snapshot_id = s.id AND l.last_seen_at_utc >= $cutoff);
             """, cutoff);
 
+        // Same predicate as the DELETE below, on purpose: written as "no listing of this
+        // product survives the cutoff" rather than "no listing at all", it gives the same
+        // answer before and after the listings are removed, so the dry run counts what
+        // the real pass removes instead of an optimistic subset of it.
+        var notifications = ScalarCount(NotifiedDealsCutoff("SELECT COUNT(*)"), cutoff);
+
         if (dryRun)
         {
-            return new PruneResult(listings, sightings, snapshots, bytesBefore, bytesBefore);
+            return new PruneResult(
+                listings, sightings, snapshots, notifications, bytesBefore, bytesBefore);
         }
 
         Execute("BEGIN IMMEDIATE;");
@@ -1052,6 +1144,7 @@ public sealed class MarketDb : IDisposable
                   AND NOT EXISTS (
                       SELECT 1 FROM sightings WHERE sightings.snapshot_id = snapshots.id);
                 """, cutoff);
+            ExecuteWithCutoff(NotifiedDealsCutoff("DELETE"), cutoff);
             Execute("COMMIT;");
         }
         catch
@@ -1063,8 +1156,23 @@ public sealed class MarketDb : IDisposable
         Execute("VACUUM;");
         Execute("PRAGMA wal_checkpoint(TRUNCATE);");
         var bytesAfter = new FileInfo(DbPath).Length;
-        return new PruneResult(listings, sightings, snapshots, bytesBefore, bytesAfter);
+        return new PruneResult(
+            listings, sightings, snapshots, notifications, bytesBefore, bytesAfter);
     }
+
+    /// <summary>
+    /// The retention rule for announced deals, as a <c>SELECT COUNT(*)</c> or a
+    /// <c>DELETE</c>. One text for both so the dry run cannot promise something different
+    /// from what the pass does.
+    /// </summary>
+    private static string NotifiedDealsCutoff(string head) => $"""
+        {head} FROM notified_deals
+        WHERE notified_at_utc < $cutoff
+          AND NOT EXISTS (
+              SELECT 1 FROM listings
+              WHERE listings.product_id = notified_deals.product_id
+                AND listings.last_seen_at_utc >= $cutoff);
+        """;
 
     private (string Planet, string TakenAtUtc) GetSnapshotKey(long snapshotId)
     {

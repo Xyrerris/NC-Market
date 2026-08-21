@@ -386,6 +386,42 @@ public sealed class MarketDbTests
     }
 
     [Fact]
+    public void Prune_forgets_an_announcement_only_when_it_forgets_the_listing()
+    {
+        using var temp = new TempDatabase();
+        using var db = temp.Open();
+
+        var gone = TestData.Product();
+        var standing = TestData.Product(itemId: 10100001);
+        TestData.AddCompleteSnapshot(db, Now.AddDays(-400), new[] { gone });
+        TestData.AddCompleteSnapshot(db, Now.AddDays(-1), new[] { standing });
+        db.RecordAnnounced(new[] { gone.ProductId, standing.ProductId }, Now.AddDays(-400));
+
+        // Entrambe le segnalazioni sono vecchie: a decidere è il destino della loro
+        // inserzione, perché dimenticarne una ancora in vendita la rimanderebbe in chat.
+        var preview = db.Prune(Now.AddDays(-365), dryRun: true);
+        var result = db.Prune(Now.AddDays(-365));
+
+        Assert.Equal(1, preview.NotificationsRemoved);
+        Assert.Equal(1, result.NotificationsRemoved);
+        Assert.Equal(
+            standing.ProductId,
+            Assert.Single(db.GetAnnouncedProducts(new[] { gone.ProductId, standing.ProductId })));
+    }
+
+    [Fact]
+    public void An_announcement_recorded_twice_is_recorded_once()
+    {
+        using var temp = new TempDatabase();
+        using var db = temp.Open();
+        var product = TestData.Product();
+
+        Assert.Equal(1, db.RecordAnnounced(new[] { product.ProductId }, Now));
+        Assert.Equal(0, db.RecordAnnounced(new[] { product.ProductId }, Now.AddHours(6)));
+        Assert.Single(db.GetAnnouncedProducts(new[] { product.ProductId }));
+    }
+
+    [Fact]
     public void Prune_filters_listings_through_the_last_seen_index()
     {
         using var temp = new TempDatabase();

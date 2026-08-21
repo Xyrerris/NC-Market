@@ -67,7 +67,16 @@ internal static class HelpText
                                              --baseline sold)
                        --from-snapshot       confronta l'ultimo snapshot invece del mercato live
                        --max-per-type <n>    limite prodotti per tipo (solo live)
-                       --top <n>             default: 30
+                       --top <n>             default: 30 (vale anche per le occasioni
+                                             elencate nella notifica)
+                       --notify              invia su Telegram le occasioni mai segnalate
+                                             prima. Ogni inserzione si notifica una volta
+                                             sola: un job schedulato non ripete la stessa
+                                             offerta a ogni esecuzione
+
+          notify-test
+                     Invia un messaggio di prova sul canale di notifica: verifica token e
+                     chat senza aspettare la prima occasione
 
           export     Esporta uno snapshot in CSV flat: una riga per inserzione,
                      statistiche in colonne <stat>_base/<stat>_bonus e skill in
@@ -90,6 +99,12 @@ internal static class HelpText
                                    (default: %LOCALAPPDATA%\NCMarket\ncmarket.db)
           --no-names               non risolvere i nomi di item e skill
 
+        Notifiche (deals --notify, notify-test) — configurate da variabili d'ambiente e
+        non da opzioni, perché un token di bot è una credenziale e le opzioni finiscono
+        nella cronologia della shell e nell'elenco dei processi:
+          NCMARKET_TELEGRAM_TOKEN     token del bot, da @BotFather
+          NCMARKET_TELEGRAM_CHAT_ID   chat di destinazione (negativo per gruppi e canali)
+
         Ogni comando accetta soltanto le proprie opzioni: un'opzione sconosciuta, ripetuta
         o priva di valore fa terminare la CLI con codice 2 senza eseguire nulla.
 
@@ -107,6 +122,8 @@ internal static class HelpText
           ncmarket deals --baseline listed --discount 40
           ncmarket deals --sale-margin 10 --min-samples 3
           ncmarket deals --type ring --from-snapshot --min-samples 3
+          ncmarket notify-test
+          ncmarket deals --from-snapshot --discount 30 --notify
           ncmarket export --type weapon --sep ;
           ncmarket export --snapshot 2 --out listino.csv
           ncmarket prune --dry-run

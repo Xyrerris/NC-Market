@@ -34,11 +34,16 @@ la libreria non ha `SQLITE_ENABLE_STAT4` — e sostituito da un indice di copert
 migliora anche il default e toglie alla voce la dipendenza dal job di notifica. Il
 backlog non ha più punti aperti.
 
+**Aggiornato il 2026-08-21 (2)**: fatto il punto 1 dei prossimi passi — la notifica delle
+occasioni su Telegram — che è la prima voce non di debito del backlog e apre la nuova
+sezione P3. Il resto dei prossimi passi è invariato.
+
 Legenda priorità:
 
 - **P0** — bug che corrompono i dati o li nascondono; da fare prima di aggiungere feature.
 - **P1** — limiti concettuali del motore di valutazione; è qui che sta il valore.
 - **P2** — infrastruttura e debito tecnico; abilitano il lavoro successivo.
+- **P3** — quello che il motore, una volta corretto, permette di fare.
 
 ---
 
@@ -523,16 +528,96 @@ che inserisce qualche migliaio di righe e non due milioni — me lo aspetto tras
 
 ---
 
+## P3 — Dal dato all'avviso
+
+### P3.1 — Le occasioni non arrivavano a nessuno ✅ FATTO
+
+**Dove**: [src/NCMarket.Core/DealAlertService.cs](src/NCMarket.Core/DealAlertService.cs) (nuovo),
+[src/NCMarket.Core/DealMessage.cs](src/NCMarket.Core/DealMessage.cs) (nuovo),
+[src/NCMarket.Core/INotificationChannel.cs](src/NCMarket.Core/INotificationChannel.cs) (nuovo),
+[src/NCMarket.Core/TelegramNotifier.cs](src/NCMarket.Core/TelegramNotifier.cs) (nuovo),
+[docker/deals-job](docker/deals-job) (nuovo),
+[src/NCMarket.Core/MarketDb.cs](src/NCMarket.Core/MarketDb.cs),
+[src/NCMarket.Cli/Program.cs](src/NCMarket.Cli/Program.cs)
+
+Il deploy su server raccoglieva dati che nessuno guardava: `deals` sa dire cosa conviene
+comprare, ma lo scrive su una console che sul server non esiste. Era il punto 1 dei
+prossimi passi, ed era a costo basso perché P2.4 aveva già tirato fuori `DealService`
+dalla CLI.
+
+**Fatto**: `deals --notify` manda in chat le occasioni nuove, `docker/deals-job` ne è la
+forma schedulata, `notify-test` verifica il canale. Le decisioni che contano sono tre.
+
+**Una volta sola per inserzione.** È il punto su cui la voce sta o cade. Una ricerca
+schedulata non è una persona che guarda: rigira ogni poche ore e ritrova la stessa
+occasione finché qualcuno non la compra, quindi otto notifiche al giorno per la stessa
+offerta sono notifiche che dopo due giorni non si aprono più. La nuova tabella
+`notified_deals` tiene le inserzioni già segnalate; la chiave è `product_id` per lo stesso
+motivo per cui lo è in `listings` — non cambia finché l'offerta resta in piedi, e una
+rimessa in vendita a un prezzo diverso è un prodotto nuovo, cioè un'offerta nuova, che va
+segnalata di nuovo. Non è una foreign key verso `listings`: si notifica anche il mercato
+live, che contiene inserzioni mai storicizzate. Anche le occasioni oltre `--top` sono
+registrate come segnalate, e il messaggio dichiara quante sono: lasciarle indietro le
+farebbe ripresentare a ogni esecuzione senza mai elencarle.
+
+**Le credenziali stanno nell'ambiente** (`NCMARKET_TELEGRAM_TOKEN`,
+`NCMARKET_TELEGRAM_CHAT_ID`), non fra le opzioni. Un token di bot è una credenziale al
+portatore e un'opzione finisce nella cronologia della shell, nell'elenco dei processi e
+nella definizione dello Scheduled Task. Per la stessa ragione il token compare nel
+percorso dell'URL ma **mai** in un messaggio d'errore, che è la cosa che si incolla in
+chat quando qualcosa non va: gli errori nominano `bot<token>/sendMessage`. Se una delle
+due variabili manca, `--notify` fallisce con codice 2 **prima** della ricerca, invece di
+scoprirlo dopo i minuti del download.
+
+**Prima si manda, poi si registra.** L'ordine inverso sarebbe più comodo e sbaglia dalla
+parte peggiore: un'inserzione marcata come annunciata da un invio poi fallito non verrebbe
+segnalata mai più, e un silenzio non è osservabile. Così invece un invio fallito non
+registra niente, il comando esce diverso da zero — il job risulta fallito sullo scheduler —
+e la prossima esecuzione riprova; il rischio speculare è una notifica doppia.
+
+**Sul nome.** Quello che Telegram chiama *webhook* è la direzione opposta: un indirizzo
+che Telegram contatta per consegnare a un bot i messaggi che gli scrivono. Qui non c'è
+niente da ricevere, la segnalazione esce, quindi è una `POST` a `sendMessage` — ed è anche
+il motivo per cui la macchina che esegue il job non ha bisogno di indirizzo pubblico,
+porta in ingresso o certificato. Il canale sta dietro `INotificationChannel`: aggiungere
+Discord significa implementarla, senza toccare ciò che decide se e cosa c'è da dire. Il
+messaggio è testo semplice senza markup, così non c'è niente da sfuggire e il nome di un
+item resta quello che il gioco gli ha dato.
+
+**Il prezzo**: `deals` diventa un comando che scrive, cosa che prima non era. La scrittura
+è una `INSERT` per occasione e non prende il lock del database — prenderlo vorrebbe dire
+serializzare contro il job di snapshot anche i minuti del download, che avvengono prima —
+quindi resta una finestra stretta in cui un `prune` in `VACUUM` può farla fallire dopo che
+il messaggio è partito. Costa una notifica doppia, cioè esattamente il modo in cui questo
+codice ha già deciso di sbagliare.
+
+**Verificato da**: `DealAlertServiceTests` (5 casi: annuncio unico e silenzio alla seconda
+esecuzione, ritentativo dopo un invio fallito, occasioni oltre l'elenco comunque
+registrate, ricerca senza risposta, ricerca senza occasioni), `TelegramNotifierTests` (6
+casi: destinazione e corpo della richiesta, rifiuto definitivo non ritentato e senza token
+nel messaggio, taglio del messaggio sopra i 4096 caratteri e invio di tutte le parti,
+lettura delle credenziali), `DealMessageTests` (4 casi: contenuto, ripiego sul prezzo
+senza CP confrontabile, occasioni contate e non elencate, filtri dichiarati) e due casi in
+`MarketDbTests` per la retention delle segnalazioni e l'idempotenza della registrazione.
+
+**Resta aperto, in prospettiva** (non necessario a chiudere questa voce): non c'è un tetto
+al numero di messaggi di una singola esecuzione — l'elenco è limitato da `--top`, ma la
+prima esecuzione su uno storico già ricco manda comunque un messaggio lungo, tagliato in
+più parti. E la soglia di "interessante" resta quella di `deals` (`--discount`,
+`--min-samples`): finché il punto 1 dei prossimi passi non è misurato, è una scelta
+ragionata e non una taratura.
+
+---
+
 ## Prossimi passi
 
 | # | Intervento | Costo | Perché in questa posizione |
 |---|---|---|---|
-| 1 | Notifica occasioni (webhook Telegram/Discord) dal job | basso | È il payoff del deploy su server: non si leggono CSV, si viene avvisati. `DealService` è già richiamabile senza CLI, perché P2.4 l'ha estratto in Core |
-| 2 | Taratura di `--sale-margin` su dati reali | basso | La soglia di default (20%) è una scelta ragionata, non una misura: con qualche giorno di snapshot si può verificare come si sposta la composizione della popolazione. Si accumula da sé mentre il job del punto 1 gira |
-| 3 | Completare la copertura dei test (P2.1, parte residua) | basso | Export CSV e parsing nomi sono ancora senza asserzioni |
-| 4 | Filtri avanzati API (`stat`, `itemIds[]`, `isCustom`) + output `--json` | basso | Già in roadmap; il JSON abilita la dashboard |
-| 5 | Mediana + MAD, o vendite on-chain via 9cscan/mimir | medio-alto | I due modi di migliorare ancora la stima, ora che la popolazione è quella giusta |
+| 1 | Taratura di `--sale-margin` su dati reali | basso | La soglia di default (20%) è una scelta ragionata, non una misura: con qualche giorno di snapshot si può verificare come si sposta la composizione della popolazione. Si accumula da sé mentre il job di notifica di P3.1 gira |
+| 2 | Completare la copertura dei test (P2.1, parte residua) | basso | Export CSV e parsing nomi sono ancora senza asserzioni |
+| 3 | Filtri avanzati API (`stat`, `itemIds[]`, `isCustom`) + output `--json` | basso | Già in roadmap; il JSON abilita la dashboard |
+| 4 | Mediana + MAD, o vendite on-chain via 9cscan/mimir | medio-alto | I due modi di migliorare ancora la stima, ora che la popolazione è quella giusta |
 
-Con P1.1 chiuso non restano interventi che cambiano la correttezza del motore, e con P2.7
-il backlog non ha più punti aperti: il punto 2 è una misura da fare sui dati veri, gli
-altri sono estensioni.
+Con P1.1 chiuso non restano interventi che cambiano la correttezza del motore, con P2.7 il
+debito è chiuso e con P3.1 il risultato arriva a destinazione: il punto 1 è una misura da
+fare sui dati veri — e adesso i dati si accumulano da soli — gli altri sono estensioni.
