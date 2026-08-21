@@ -75,6 +75,14 @@ NC-Market/
 │   │   ├── EquipmentType.cs    Enum equipaggiamenti + parsing
 │   │   ├── Models/             DTO della risposta del market service
 │   │   ├── MarketClient.cs     Client HTTP con paginazione automatica
+│   │   ├── IMarketListingSource.cs  Astrazione del listino corrente (la implementa MarketClient)
+│   │   ├── ICaptureProgress.cs Avanzamento di una cattura, riportato mentre avviene
+│   │   ├── SnapshotService.cs  Orchestrazione di 'snapshot': cattura, salva, finalizza
+│   │   ├── DealService.cs      Orchestrazione di 'deals': baseline, listino da confrontare, esito
+│   │   ├── DealAlertService.cs Segnalazione delle occasioni nuove, una volta sola ciascuna
+│   │   ├── DealMessage.cs      Testo di una segnalazione (senza markup, indipendente dal canale)
+│   │   ├── INotificationChannel.cs  Astrazione del canale di notifica
+│   │   ├── TelegramNotifier.cs Invio su Telegram (Bot API) e lettura delle credenziali
 │   │   ├── NameProvider.cs     Risoluzione id -> nome per item e skill (cache locale)
 │   │   ├── ProductFormat.cs    Formattazione statistiche e skill delle inserzioni
 │   │   ├── SnapshotCsvExporter.cs  Export CSV flat di uno snapshot
@@ -83,17 +91,26 @@ NC-Market/
 │   │   └── MarketDb.cs         Storicizzazione su SQLite, rilevazione vendite, query analitiche
 │   └── NCMarket.Cli/           Applicazione console
 │       ├── CommandLine.cs      Opzioni ammesse per verbo e loro validazione
-│       └── Program.cs          Comandi: fetch, snapshot, snapshots, history, stats, deals, export, prune
+│       ├── ConsoleReport.cs    Tabelle e messaggi a schermo
+│       ├── ConsoleProgress.cs  Avanzamento di una cattura sulla console
+│       ├── HelpText.cs         Testo del comando 'help'
+│       └── Program.cs          Comandi: fetch, snapshot, snapshots, history, stats, deals,
+│                               export, prune, notify-test
 └── tests/
-    └── NCMarket.Tests/         xUnit: schema e migrazioni, baseline, vendite, prune, deals, CLI
+    └── NCMarket.Tests/         xUnit: schema e migrazioni, baseline, vendite, prune, deals,
+                                notifiche, servizi, CLI
 ```
 
 Scelte progettuali:
 
 - **.NET 9 / C#**: coerente con l'ecosistema Nine Chronicles (lib9c, Libplanet) e con gli
   SDK già presenti sulla macchina.
-- **Core separato dalla CLI**: la libreria `NCMarket.Core` è riusabile in step successivi
-  (servizio schedulato, dashboard, motore di valutazione) senza toccare la CLI.
+- **Core separato dalla CLI**: `NCMarket.Core` contiene anche l'orchestrazione dei due
+  comandi che fanno lavoro vero — `SnapshotService` (cattura del listino) e `DealService`
+  (ricerca delle occasioni) — e non scrive nulla a schermo: riporta l'avanzamento tramite
+  `ICaptureProgress` e restituisce un risultato. Un servizio schedulato o una dashboard li
+  guidano come li guida la CLI; in `NCMarket.Cli` restano la lettura delle opzioni e la
+  presentazione (`ConsoleReport`).
 - **SQLite** (`Microsoft.Data.Sqlite`): zero amministrazione, file unico, adatto a
   storicizzazione e query aggregate. Percorso di default:
   `%LOCALAPPDATA%\NCMarket\ncmarket.db`, personalizzabile con `--db`.
@@ -140,6 +157,12 @@ sightings(                    -- appartenenza inserzione <-> snapshot: due inter
     listing_id INTEGER FK -> listings.id    ON DELETE CASCADE,
     PRIMARY KEY(snapshot_id, listing_id)
 )
+
+notified_deals(               -- occasioni già segnalate da 'deals --notify'
+    product_id TEXT PK,       -- GUID dell'inserzione, non FK: si notifica anche il
+                              -- mercato live, che contiene inserzioni mai storicizzate
+    notified_at_utc TEXT      -- ISO 8601
+)
 ```
 
 `product_id` è stabile e immutabile per tutta la vita di un'inserzione (un cambio di
@@ -160,6 +183,14 @@ non coprono l'intero listino, quindi l'assenza di un'inserzione da uno di questi
 snapshot non prova che sia uscita dal mercato. Anche loro sono esclusi dalla rilevazione
 delle vendite.
 
+`notified_deals` è ciò che rende una notifica un avviso e non un promemoria: un job
+schedulato ritrova la stessa occasione a ogni esecuzione finché qualcuno non la compra,
+quindi `deals --notify` invia soltanto le inserzioni mai segnalate prima. La chiave è
+`product_id` per lo stesso motivo per cui lo è in `listings`: non cambia finché l'offerta
+resta in piedi, e una rimessa in vendita a un prezzo diverso è un prodotto nuovo, cioè
+un'offerta nuova, che va segnalata di nuovo. `prune` dimentica una segnalazione solo
+quando dimentica anche la sua inserzione: farlo prima significherebbe rimandarla in chat.
+
 I database creati con lo schema v1 (una copia completa di ogni inserzione per
 snapshot) vengono **migrati automaticamente** alla prima apertura: viene lasciata una
 copia di sicurezza `<db>.v1.bak` accanto al file originale (preceduta da un checkpoint
@@ -167,7 +198,9 @@ WAL, così la copia contiene anche le ultime scritture) e il database viene comp
 con `VACUUM`. I database v2 e v3 acquisiscono le colonne `status` e `max_per_type` in
 place, senza backup: quelle migrazioni non sono distruttive. Gli snapshot già presenti
 valgono come catture integrali, che è ciò che `snapshot` fa quando `--max-per-type` non
-viene passato. Il database usa il journal WAL, quindi accanto al file
+viene passato. Le tabelle e gli indici *nuovi* — `notified_deals` è l'ultimo — non hanno
+migrazione né numero di versione: sono creati `IF NOT EXISTS` a ogni apertura, quindi un
+database esistente li acquisisce da sé. Il database usa il journal WAL, quindi accanto al file
 possono comparire i file di servizio `-wal` e `-shm`, più un file `.lock` vuoto usato
 per serializzare `snapshot` e `prune`.
 
@@ -224,6 +257,14 @@ dotnet run --project src/NCMarket.Cli -- deals --type ring --from-snapshot --min
 # legendary, divinity, mythic, transcendent)
 dotnet run --project src/NCMarket.Cli -- deals --grade legendary,mythic
 
+# Segnalazione su Telegram delle sole occasioni mai notificate prima: è la forma che
+# 'deals' prende su un server, dove nessuno legge l'output. Token e chat si passano
+# dall'ambiente, non dalla riga di comando (vedi "Notifiche su Telegram")
+dotnet run --project src/NCMarket.Cli -- deals --from-snapshot --discount 30 --notify
+
+# Messaggio di prova, per verificare token e chat senza aspettare la prima occasione
+dotnet run --project src/NCMarket.Cli -- notify-test
+
 # Export CSV "flat" di uno snapshot: una riga per inserzione, statistiche in colonne
 # <stat>_base/<stat>_bonus (hp, atk, def, cri, hit, spd, drv, drr, cdmg, armorpen,
 # thorn) e skill in colonne skill1_*/skill2_* (id, nome, categoria, elemento,
@@ -275,6 +316,64 @@ osservabile: su un database appena creato `deals` lo dice invece di restituire u
 vuota. Il passo successivo in accuratezza è sostituire l'euristica con le transazioni
 `BuyProduct` on-chain (9cscan/mimir), che sono il dato reale.
 
+### Notifiche su Telegram
+
+`deals --notify` manda in chat le occasioni trovate. È la forma che il comando prende su
+un server, dove nessuno guarda l'output: un job che gira ogni poche ore non produce una
+tabella da leggere, produce un messaggio quando c'è qualcosa da sapere.
+
+**Configurazione** — due variabili d'ambiente, mai opzioni della riga di comando: un token
+di bot è una credenziale al portatore, e le opzioni finiscono nella cronologia della shell,
+nell'elenco dei processi della macchina e nella definizione dello Scheduled Task.
+
+| Variabile | Come si ottiene |
+|---|---|
+| `NCMARKET_TELEGRAM_TOKEN` | `@BotFather`, comando `/newbot`: il token è nella risposta |
+| `NCMARKET_TELEGRAM_CHAT_ID` | scrivere una volta al bot, poi leggere `https://api.telegram.org/bot<token>/getUpdates` e prendere `message.chat.id` (per gruppi e canali è negativo) |
+
+Se manca una delle due, `--notify` fallisce **prima** della ricerca con codice 2, invece
+di scoprirlo dopo i minuti del download. `notify-test` invia un messaggio di prova e serve
+a distinguere "non ci sono occasioni" da "le notifiche non arrivano", che altrimenti sono
+lo stesso silenzio.
+
+Sul nome: Telegram chiama *webhook* la direzione opposta — un indirizzo che Telegram
+contatta per consegnare a un bot i messaggi che gli vengono scritti. Qui non c'è niente da
+ricevere: una segnalazione esce, quindi è una `POST` a `sendMessage`, e la macchina che
+esegue il job non ha bisogno di indirizzo pubblico, porta in ingresso o certificato.
+
+**Una volta sola per inserzione.** Una ricerca schedulata non è una persona che guarda:
+ritrova la stessa occasione a ogni esecuzione finché qualcuno non la compra, e otto
+notifiche al giorno per la stessa offerta sono notifiche che non si leggono più. Vengono
+quindi segnalate solo le inserzioni mai segnalate prima, tenute in `notified_deals` (vedi
+[Schema del database](#schema-del-database-v4)). Anche le occasioni oltre il limite di
+`--top` contano come segnalate: il messaggio dichiara quante sono e dove vederle, mentre
+lasciarle indietro le farebbe ripresentare a ogni esecuzione senza mai elencarle.
+
+Il messaggio è testo semplice, senza markup — non c'è niente da sfuggire, e il nome di un
+item è quello che il gioco ha deciso di chiamarlo. Ogni inserzione occupa tre righe: cosa
+è, quanto costa, perché è a buon mercato.
+
+```
+NC-Market — 2 nuove occasioni su heimdall (Ring)
+Sconto ≥ 25% sulla mediana delle inserzioni concluse per item+livello+opzioni (campioni ≥ 5).
+
+1) Guardian Ring +7 — Ring grado 5, 4 opzioni, CP 12.450
+   142.50 NCG — sconto 41.2% su NCG/CP (38.0% sul prezzo)
+   87 CP/NCG contro una mediana di 148 su 12 inserzioni
+```
+
+**Se l'invio fallisce** non viene registrato niente e il comando esce con codice diverso da
+zero: la stessa occasione viene ritentata alla prossima esecuzione. È il verso giusto in
+cui sbagliare — segnare come annunciata un'inserzione il cui messaggio non è partito la
+renderebbe invisibile per sempre, mentre il caso opposto costa una notifica doppia. Un
+token sbagliato o una chat inesistente non vengono ritentati sul momento (nessun numero di
+tentativi li sistema) e l'errore riporta la spiegazione di Telegram **senza** il token, che
+altrimenti finirebbe nei log.
+
+Il canale è dietro un'interfaccia (`INotificationChannel`), quindi aggiungerne un secondo —
+Discord, un webhook proprio — significa implementarla, senza toccare ciò che decide se e
+cosa c'è da dire.
+
 Test:
 
 ```bash
@@ -300,6 +399,11 @@ Punti chiave:
 - lo script `docker/snapshot-job` è il job da schedulare: esegue `snapshot` e, se
   `NCMARKET_EXPORT=1`, anche l'`export` CSV in `/data/NCMarket/exports`. Esce con codice
   diverso da zero in caso di errore, così lo scheduler può notificare il fallimento;
+- lo script `docker/deals-job` è il secondo job: esegue `deals --notify` e manda in chat
+  le occasioni nuove (vedi [Notifiche su Telegram](#notifiche-su-telegram)). Va schedulato
+  dopo il primo, perché per default confronta l'ultimo snapshot — quello appena catturato —
+  e non riscarica il listino; `NCMARKET_DEALS_ARGS` sostituisce le opzioni di default
+  (`--from-snapshot`), ad esempio con `--from-snapshot --discount 30 --grade legendary,mythic`;
 - il container gira come utente non privilegiato (`app`, l'utente standard delle immagini
   .NET): `/data` gli appartiene, e un volume Docker vuoto montato lì ne eredita i permessi.
   Un volume che contiene già dati scritti da una versione precedente dell'immagine, quando
@@ -316,7 +420,12 @@ docker run --rm -v ncmarket-data:/data ncmarket snapshots
 Configurazione su Coolify: risorsa *Application* con build pack `Dockerfile`, nessun FQDN,
 health check disabilitato (non è un servizio web), storage persistente montato su `/data`,
 variabili `NCMARKET_PLANET` e `NCMARKET_EXPORT`, e uno *Scheduled Task* con comando
-`snapshot-job` alla frequenza desiderata (es. `0 */6 * * *`).
+`snapshot-job` alla frequenza desiderata (es. `0 */6 * * *`). Per le notifiche si
+aggiungono `NCMARKET_TELEGRAM_TOKEN` e `NCMARKET_TELEGRAM_CHAT_ID` (da marcare come
+segrete) e un secondo *Scheduled Task* con comando `deals-job`, sfasato di qualche minuto
+dal primo (es. `10 */6 * * *`) perché confronta lo snapshot che quello ha appena
+catturato. Prima di aspettare la prima occasione conviene verificare il canale con
+`docker exec <container> ncmarket notify-test`.
 
 Grazie all'archiviazione deduplicata (schema v2) uno snapshot scrive per intero solo le
 inserzioni mai viste prima; quelle già note costano ~20 byte l'una. La crescita del
@@ -367,7 +476,10 @@ di fallire sul `VACUUM`.
 - **Segnalazione occasioni** ✅ — comando `deals`: confronto tra le offerte correnti
   (mercato live o ultimo snapshot) e le mediane storiche di prezzo e NCG/CP per
   terna (item, livello, numero di opzioni), calcolate sulle inserzioni stimate vendute,
-  con soglie di sconto e campioni minimi configurabili.
+  con soglie di sconto e campioni minimi configurabili. Con `--notify` le occasioni nuove
+  arrivano su Telegram invece di restare in una tabella che nessuno guarda, una volta sola
+  per inserzione (vedi [Notifiche su Telegram](#notifiche-su-telegram)); il job
+  `docker/deals-job` è la forma schedulata dello stesso comando.
 - **Reportistica**: dashboard e grafici andamento prezzi (l'export CSV è già disponibile
   con il comando `export`).
 
@@ -382,3 +494,7 @@ di fallire sul `VACUUM`.
 ```powershell
 dotnet build NC-Market/NCMarket.sln
 ```
+
+## Licenza
+
+[MIT](LICENSE).

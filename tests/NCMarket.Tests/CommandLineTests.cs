@@ -102,4 +102,24 @@ public sealed class CommandLineTests
         var options = Parse("deals", "--discount", "300");
         Assert.Throws<ArgumentException>(() => options.GetInt("discount", 25, min: 0, max: 100));
     }
+
+    [Fact]
+    public void Notify_is_a_flag_and_does_not_swallow_the_option_after_it()
+    {
+        var options = Parse("deals", "--notify", "--discount", "30");
+
+        Assert.True(options.ContainsKey("notify"));
+        Assert.Equal(30, options.GetInt("discount", 25, min: 0, max: 100));
+    }
+
+    [Fact]
+    public void Notify_test_takes_no_options_at_all()
+    {
+        Parse("notify-test");
+
+        // Le credenziali sono variabili d'ambiente: non c'è niente da passare, e
+        // passarlo è un errore come ovunque nella CLI.
+        Assert.Contains(
+            "--planet", Reject("notify-test", "--planet", "odin"), StringComparison.Ordinal);
+    }
 }

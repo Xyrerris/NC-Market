@@ -1,3 +1,4 @@
+using System.Net;
 using Microsoft.Data.Sqlite;
 using NCMarket.Core;
 using NCMarket.Core.Models;
@@ -100,4 +101,151 @@ internal static class TestData
         db.AddProducts(id, products);
         return id;
     }
+}
+
+/// <summary>
+/// A market that answers from a fixed listing instead of the network, and remembers what
+/// it was asked for: what the orchestration services do is make requests, in an order and
+/// with limits that matter, which is what this records.
+/// </summary>
+internal sealed class FakeMarket : IMarketListingSource
+{
+    private readonly Dictionary<EquipmentType, IReadOnlyList<ItemProduct>> _listings = new();
+    private EquipmentType? _failOn;
+
+    public FakeMarket(Planet? planet = null) => Planet = planet ?? Planet.Heimdall;
+
+    public Planet Planet { get; }
+
+    /// <summary>Types asked for, in the order they were asked for.</summary>
+    public List<EquipmentType> Requested { get; } = new();
+
+    /// <summary>The per-type limit of the last request.</summary>
+    public int? LastMaxItems { get; private set; }
+
+    /// <summary>Puts a type on sale, so a market is set up in a single expression.</summary>
+    public FakeMarket With(EquipmentType type, params ItemProduct[] products)
+    {
+        _listings[type] = products;
+        return this;
+    }
+
+    /// <summary>Makes one type fail to download, the way a network error would.</summary>
+    public FakeMarket FailingOn(EquipmentType type)
+    {
+        _failOn = type;
+        return this;
+    }
+
+    public Task<IReadOnlyList<ItemProduct>> GetAllProductsAsync(
+        EquipmentType type,
+        int? maxItems = null,
+        Action<int, int>? progress = null,
+        CancellationToken ct = default)
+    {
+        Requested.Add(type);
+        LastMaxItems = maxItems;
+        if (type == _failOn)
+        {
+            throw new InvalidOperationException(
+                $"Il market service ha risposto 503 per {type}.");
+        }
+
+        var products = _listings.GetValueOrDefault(type, Array.Empty<ItemProduct>());
+        progress?.Invoke(products.Count, products.Count);
+        return Task.FromResult(products);
+    }
+}
+
+/// <summary>
+/// A destination that keeps the messages instead of delivering them: what an alert run
+/// does is decide whether to speak and what to say, which is what this records.
+/// </summary>
+internal sealed class FakeChannel : INotificationChannel
+{
+    private bool _fails;
+
+    public string Name => "Fake";
+
+    /// <summary>The messages delivered, in order.</summary>
+    public List<string> Sent { get; } = new();
+
+    /// <summary>Makes every send fail, the way a wrong token or a dead network would.</summary>
+    public FakeChannel Failing()
+    {
+        _fails = true;
+        return this;
+    }
+
+    public Task SendAsync(string message, CancellationToken ct = default)
+    {
+        if (_fails)
+        {
+            throw new InvalidOperationException(
+                "Telegram ha risposto 401 (Unauthorized): Unauthorized.");
+        }
+
+        Sent.Add(message);
+        return Task.CompletedTask;
+    }
+}
+
+/// <summary>
+/// An HTTP endpoint that answers from a script instead of from the network, and keeps
+/// what it was sent.
+/// </summary>
+internal sealed class FakeHttpHandler : HttpMessageHandler
+{
+    private readonly Queue<(HttpStatusCode Status, string Body)> _answers = new();
+
+    /// <summary>Full URLs requested, in order — token included, which is the point.</summary>
+    public List<string> Urls { get; } = new();
+
+    /// <summary>Request bodies, as sent on the wire.</summary>
+    public List<string> Bodies { get; } = new();
+
+    /// <summary>Queues one answer. Requests past the last one get a plain success.</summary>
+    public FakeHttpHandler Answering(HttpStatusCode status, string body = """{"ok":true}""")
+    {
+        _answers.Enqueue((status, body));
+        return this;
+    }
+
+    protected override async Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request, CancellationToken ct)
+    {
+        Urls.Add(request.RequestUri!.ToString());
+        Bodies.Add(request.Content is null ? "" : await request.Content.ReadAsStringAsync(ct));
+
+        var (status, body) = _answers.Count > 0
+            ? _answers.Dequeue()
+            : (HttpStatusCode.OK, """{"ok":true}""");
+
+        return new HttpResponseMessage(status) { Content = new StringContent(body) };
+    }
+}
+
+/// <summary>Collects the progress callbacks instead of printing them.</summary>
+internal sealed class RecordingProgress : ISnapshotProgress
+{
+    public long? Created { get; private set; }
+
+    public long? Interrupted { get; private set; }
+
+    public List<EquipmentType> Started { get; } = new();
+
+    public List<(EquipmentType Type, int Listings)> Completed { get; } = new();
+
+    public void SnapshotCreated(long snapshotId, DateTime takenAtUtc) => Created = snapshotId;
+
+    public void SnapshotInterrupted(long snapshotId) => Interrupted = snapshotId;
+
+    public void TypeStarted(EquipmentType type) => Started.Add(type);
+
+    public void TypeProgress(EquipmentType type, int fetched, int total)
+    {
+    }
+
+    public void TypeCompleted(EquipmentType type, int listings) =>
+        Completed.Add((type, listings));
 }

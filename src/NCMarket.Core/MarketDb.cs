@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
 using NCMarket.Core.Models;
@@ -113,7 +114,7 @@ public sealed record BaselineSet(
 /// </summary>
 public sealed record PruneResult(
     int ListingsRemoved, int SightingsRemoved, int SnapshotsRemoved,
-    long BytesBefore, long BytesAfter);
+    int NotificationsRemoved, long BytesBefore, long BytesAfter);
 
 /// <summary>
 /// SQLite storage for market snapshots. Snapshots are logically immutable copies of
@@ -247,11 +248,38 @@ public sealed class MarketDb : IDisposable
                 PRIMARY KEY(snapshot_id, listing_id)
             ) WITHOUT ROWID;
 
+            -- Listings already announced by 'deals --notify'. Keyed by product_id, the
+            -- market's own identity of an offer, and not by a foreign key to listings:
+            -- an alert on the live market names offers no snapshot has stored yet. The
+            -- table is created here rather than by a migration because it is new, not
+            -- changed, so any existing database acquires it on open (as in P0.5); it
+            -- stays small — a deal is rare — and needs no index of its own, the only
+            -- query on it being the retention sweep.
+            CREATE TABLE IF NOT EXISTS notified_deals(
+                product_id TEXT PRIMARY KEY,
+                notified_at_utc TEXT NOT NULL
+            ) WITHOUT ROWID;
+
             CREATE INDEX IF NOT EXISTS ix_listings_planet_subtype ON listings(planet, item_sub_type);
             CREATE INDEX IF NOT EXISTS ix_listings_item ON listings(item_id);
             CREATE INDEX IF NOT EXISTS ix_sightings_listing ON sightings(listing_id);
-            -- Filter column of both Prune and the --days window of GetPriceBaselines.
+            -- Filter column of Prune, which sweeps the whole table by age with no
+            -- planet to narrow it down first.
             CREATE INDEX IF NOT EXISTS ix_listings_last_seen ON listings(last_seen_at_utc);
+
+            -- Covers the baseline query of GetPriceBaselines: planet and the --days
+            -- window are its filters, the remaining columns are the ones it selects,
+            -- so SQLite answers from the index and never reaches the table. Measured
+            -- on two million listings: --days 7 drops from 1,203 to 45 ms and
+            -- --days 90 from 1,633 to 573 ms. The whole-history default gets cheaper
+            -- too (3,549 to 2,629 ms), because an index row carries nine columns
+            -- while a table row drags stats_json and skills_json along with it. The
+            -- price is about half the size of the database again, and six seconds on
+            -- the first open of an existing two-million-listing one, while the index
+            -- is built (P2.7).
+            CREATE INDEX IF NOT EXISTS ix_listings_baseline ON listings(
+                planet, last_seen_at_utc, item_id, level, option_count,
+                price, combat_point, item_sub_type, last_seen_snapshot_id);
             """);
     }
 
@@ -766,110 +794,184 @@ public sealed class MarketDb : IDisposable
         BaselinePopulation population = BaselinePopulation.Listed,
         double saleMarginPercent = DefaultSaleMarginPercent)
     {
-        var rows = ReadBaselineRows(planet, type, sinceUtc);
-        var listed = Aggregate(rows);
         var frontier = GetCoverageFrontier(planet);
         var tolerated = 1 + saleMarginPercent / 100;
+        var wantSold = population == BaselinePopulation.Sold;
 
-        var sold = new List<BaselineRow>();
-        var open = 0;
-        var withdrawn = 0;
-        foreach (var row in rows)
+        var baselines = new Dictionary<BaselineKey, PriceBaseline>();
+        var concluded = new List<BaselineRow>();
+        var scratch = new List<double>();
+        int total = 0, open = 0, likelySold = 0, likelyWithdrawn = 0;
+
+        foreach (var bucket in ReadBuckets(planet, type, sinceUtc))
         {
-            if (!frontier.TryGetValue(row.SubType, out var lastProof)
-                || lastProof <= row.LastSeenSnapshotId)
+            // The ask median classifies the listings of this bucket, so it is computed
+            // whichever population was asked for.
+            var listed = Summarise(bucket[0].Key, bucket, scratch);
+            total += bucket.Count;
+
+            concluded.Clear();
+            foreach (var row in bucket)
             {
-                open++;
-                continue;
+                if (!frontier.TryGetValue(row.SubType, out var lastProof)
+                    || lastProof <= row.LastSeenSnapshotId)
+                {
+                    open++;
+                    continue;
+                }
+
+                // No usable median means nothing to compare the asking price against:
+                // keep the listing rather than invent a reason to discard it.
+                if (listed.MedianPrice > 0 && row.Price > listed.MedianPrice * tolerated)
+                {
+                    likelyWithdrawn++;
+                    continue;
+                }
+
+                concluded.Add(row);
             }
 
-            // No usable median means nothing to compare the asking price against: keep
-            // the listing rather than invent a reason to discard it.
-            var medianAsk = listed[row.Key].MedianPrice;
-            if (medianAsk > 0 && row.Price > medianAsk * tolerated)
-            {
-                withdrawn++;
-                continue;
-            }
+            likelySold += concluded.Count;
 
-            sold.Add(row);
+            if (!wantSold)
+            {
+                baselines[listed.Key] = listed;
+            }
+            else if (concluded.Count > 0)
+            {
+                baselines[listed.Key] = Summarise(listed.Key, concluded, scratch);
+            }
         }
 
         return new BaselineSet(
             population,
-            new ListingOutcomes(rows.Count, open, sold.Count, withdrawn),
-            population == BaselinePopulation.Sold ? Aggregate(sold) : listed);
+            new ListingOutcomes(total, open, likelySold, likelyWithdrawn),
+            baselines);
     }
 
     /// <summary>One listing, reduced to what a baseline is made of.</summary>
     private readonly record struct BaselineRow(
         BaselineKey Key, int SubType, long LastSeenSnapshotId, double Price, int CombatPoint);
 
-    private List<BaselineRow> ReadBaselineRows(
-        string planet, EquipmentType? type, DateTime? sinceUtc)
+    /// <summary>
+    /// The baseline query carrying only the filters that were actually asked for.
+    /// Writing the optional ones as <c>$p IS NULL OR column = $p</c> keeps the SQL
+    /// constant and costs the index: a disjunction is not sargable, so the planner
+    /// resolves it by scanning whatever the window. That idiom is what kept
+    /// <c>ix_listings_last_seen</c> out of this query for as long as it existed (P2.7).
+    /// <para>
+    /// The selected columns are, in order, the trailing columns of
+    /// <c>ix_listings_baseline</c>. That is what makes the index cover the query;
+    /// selecting one more silently uncovers it and the cost comes back without
+    /// anything breaking, which is why a test asserts on the query plan.
+    /// </para>
+    /// </summary>
+    internal static string BaselineQuery(EquipmentType? type, DateTime? sinceUtc)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
+        var sql = new StringBuilder("""
             SELECT item_id, level, option_count, price, combat_point,
                    item_sub_type, last_seen_snapshot_id
             FROM listings
             WHERE planet = $planet
-              AND ($subType IS NULL OR item_sub_type = $subType)
-              AND ($since IS NULL OR last_seen_at_utc >= $since);
-            """;
-        cmd.Parameters.AddWithValue("$planet", planet);
-        cmd.Parameters.AddWithValue("$subType", type is null ? DBNull.Value : (int)type.Value);
-        cmd.Parameters.AddWithValue(
-            "$since",
-            sinceUtc is null
-                ? DBNull.Value
-                : sinceUtc.Value.ToString("O", CultureInfo.InvariantCulture));
+            """);
 
-        var rows = new List<BaselineRow>();
+        if (type is not null)
+        {
+            sql.Append("\n  AND item_sub_type = $subType");
+        }
+
+        if (sinceUtc is not null)
+        {
+            sql.Append("\n  AND last_seen_at_utc >= $since");
+        }
+
+        return sql.Append("\nORDER BY item_id, level, option_count;").ToString();
+    }
+
+    /// <summary>
+    /// The listings of a planet, one <see cref="BaselineKey"/> bucket at a time. Ordering
+    /// the query by the bucket key leaves the grouping to SQLite, so what is held in
+    /// memory is a bucket — a handful of comparable pieces — instead of the whole
+    /// history, which a year of captures makes millions of rows. The price is the sort,
+    /// which SQLite spills to disk when it needs to; that is the trade, because the
+    /// managed heap has nowhere to spill.
+    /// <para>
+    /// The list is reused from one bucket to the next: read a bucket before asking for
+    /// the following one, and do not hold on to it.
+    /// </para>
+    /// </summary>
+    private IEnumerable<List<BaselineRow>> ReadBuckets(
+        string planet, EquipmentType? type, DateTime? sinceUtc)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = BaselineQuery(type, sinceUtc);
+        cmd.Parameters.AddWithValue("$planet", planet);
+        if (type is not null)
+        {
+            cmd.Parameters.AddWithValue("$subType", (int)type.Value);
+        }
+
+        if (sinceUtc is not null)
+        {
+            cmd.Parameters.AddWithValue(
+                "$since", sinceUtc.Value.ToString("O", CultureInfo.InvariantCulture));
+        }
+
+        var bucket = new List<BaselineRow>();
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
         {
-            rows.Add(new BaselineRow(
+            var row = new BaselineRow(
                 new BaselineKey(reader.GetInt32(0), reader.GetInt32(1), reader.GetInt32(2)),
                 reader.GetInt32(5),
                 reader.GetInt64(6),
                 reader.GetDouble(3),
-                reader.GetInt32(4)));
+                reader.GetInt32(4));
+
+            if (bucket.Count > 0 && !row.Key.Equals(bucket[0].Key))
+            {
+                yield return bucket;
+                bucket.Clear();
+            }
+
+            bucket.Add(row);
         }
 
-        return rows;
+        if (bucket.Count > 0)
+        {
+            yield return bucket;
+        }
     }
 
-    private static Dictionary<BaselineKey, PriceBaseline> Aggregate(List<BaselineRow> rows)
+    /// <summary>
+    /// The baseline of a single bucket: median price over every listing given, median
+    /// price-per-CP over those that carry a combat point. <paramref name="scratch"/> is
+    /// the buffer the values are sorted in, passed in so that a whole history costs one
+    /// of them instead of two per bucket.
+    /// </summary>
+    private static PriceBaseline Summarise(
+        BaselineKey key, List<BaselineRow> rows, List<double> scratch)
     {
-        var buckets = new Dictionary<BaselineKey, (List<double> Prices, List<double> PricesPerCp)>();
+        scratch.Clear();
         foreach (var row in rows)
         {
-            if (!buckets.TryGetValue(row.Key, out var bucket))
-            {
-                bucket = (new List<double>(), new List<double>());
-                buckets[row.Key] = bucket;
-            }
+            scratch.Add(row.Price);
+        }
 
-            bucket.Prices.Add(row.Price);
+        var medianPrice = Median(scratch);
+
+        scratch.Clear();
+        foreach (var row in rows)
+        {
             if (row.CombatPoint > 0)
             {
-                bucket.PricesPerCp.Add(row.Price / row.CombatPoint);
+                scratch.Add(row.Price / row.CombatPoint);
             }
         }
 
-        var result = new Dictionary<BaselineKey, PriceBaseline>(buckets.Count);
-        foreach (var (key, (prices, pricesPerCp)) in buckets)
-        {
-            result[key] = new PriceBaseline(
-                key,
-                prices.Count,
-                Median(prices),
-                pricesPerCp.Count,
-                pricesPerCp.Count > 0 ? Median(pricesPerCp) : null);
-        }
-
-        return result;
+        return new PriceBaseline(
+            key, rows.Count, medianPrice,
+            scratch.Count, scratch.Count > 0 ? Median(scratch) : null);
     }
 
     /// <summary>
@@ -913,12 +1015,85 @@ public sealed class MarketDb : IDisposable
     }
 
     /// <summary>
+    /// Which of <paramref name="productIds"/> have already been the subject of an alert
+    /// (see <see cref="DealAlertService"/>). Asking about the listings at hand, rather
+    /// than reading the whole table, keeps the cost proportional to the deals found and
+    /// not to how long the job has been running.
+    /// </summary>
+    public IReadOnlySet<Guid> GetAnnouncedProducts(IEnumerable<Guid> productIds)
+    {
+        var wanted = productIds.Distinct().ToList();
+        var announced = new HashSet<Guid>();
+
+        // SQLite caps the parameters of a single statement: a list of deals is short, but
+        // that is the caller's business rather than a limit to inherit.
+        const int batchSize = 500;
+        for (var start = 0; start < wanted.Count; start += batchSize)
+        {
+            var batch = wanted.GetRange(start, Math.Min(batchSize, wanted.Count - start));
+            using var cmd = _conn.CreateCommand();
+            var placeholders = new string[batch.Count];
+            for (var i = 0; i < batch.Count; i++)
+            {
+                placeholders[i] = "$p" + i.ToString(CultureInfo.InvariantCulture);
+                cmd.Parameters.AddWithValue(placeholders[i], batch[i].ToString("D"));
+            }
+
+            cmd.CommandText =
+                "SELECT product_id FROM notified_deals WHERE product_id IN (" +
+                string.Join(", ", placeholders) + ");";
+
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                announced.Add(Guid.Parse(reader.GetString(0)));
+            }
+        }
+
+        return announced;
+    }
+
+    /// <summary>
+    /// Records listings as announced, and returns how many were not recorded already.
+    /// Re-recording one keeps its first date: the row answers "has this been announced",
+    /// and the answer does not change with the second alert that would have repeated it.
+    /// </summary>
+    public int RecordAnnounced(IEnumerable<Guid> productIds, DateTime atUtc)
+    {
+        using var tx = _conn.BeginTransaction();
+        using var cmd = _conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = """
+            INSERT OR IGNORE INTO notified_deals(product_id, notified_at_utc)
+            VALUES($productId, $at);
+            """;
+        cmd.Parameters.AddWithValue("$at", atUtc.ToString("O", CultureInfo.InvariantCulture));
+        var productId = cmd.Parameters.Add("$productId", SqliteType.Text);
+
+        var recorded = 0;
+        foreach (var id in productIds)
+        {
+            productId.Value = id.ToString("D");
+            recorded += cmd.ExecuteNonQuery();
+        }
+
+        tx.Commit();
+        return recorded;
+    }
+
+    /// <summary>
     /// Retention pass: removes listings whose last sighting is older than
     /// <paramref name="cutoffUtc"/> (their sightings cascade away) and snapshots taken
     /// before the cutoff that are left with no sightings, then compacts the file with
     /// VACUUM. With <paramref name="dryRun"/> nothing is modified and the result
     /// reports what would be removed. The product_count of surviving snapshots is not
     /// rewritten: it documents the size of the listing at capture time.
+    /// <para>
+    /// An alert is forgotten only when its listing is: old enough, and no longer in the
+    /// history that survives the pass. Forgetting it while the offer still stands would
+    /// announce it a second time, which is the one thing
+    /// <see cref="DealAlertService"/> exists to prevent.
+    /// </para>
     /// </summary>
     public PruneResult Prune(DateTime cutoffUtc, bool dryRun = false)
     {
@@ -947,9 +1122,16 @@ public sealed class MarketDb : IDisposable
                   WHERE g.snapshot_id = s.id AND l.last_seen_at_utc >= $cutoff);
             """, cutoff);
 
+        // Same predicate as the DELETE below, on purpose: written as "no listing of this
+        // product survives the cutoff" rather than "no listing at all", it gives the same
+        // answer before and after the listings are removed, so the dry run counts what
+        // the real pass removes instead of an optimistic subset of it.
+        var notifications = ScalarCount(NotifiedDealsCutoff("SELECT COUNT(*)"), cutoff);
+
         if (dryRun)
         {
-            return new PruneResult(listings, sightings, snapshots, bytesBefore, bytesBefore);
+            return new PruneResult(
+                listings, sightings, snapshots, notifications, bytesBefore, bytesBefore);
         }
 
         Execute("BEGIN IMMEDIATE;");
@@ -962,6 +1144,7 @@ public sealed class MarketDb : IDisposable
                   AND NOT EXISTS (
                       SELECT 1 FROM sightings WHERE sightings.snapshot_id = snapshots.id);
                 """, cutoff);
+            ExecuteWithCutoff(NotifiedDealsCutoff("DELETE"), cutoff);
             Execute("COMMIT;");
         }
         catch
@@ -973,8 +1156,23 @@ public sealed class MarketDb : IDisposable
         Execute("VACUUM;");
         Execute("PRAGMA wal_checkpoint(TRUNCATE);");
         var bytesAfter = new FileInfo(DbPath).Length;
-        return new PruneResult(listings, sightings, snapshots, bytesBefore, bytesAfter);
+        return new PruneResult(
+            listings, sightings, snapshots, notifications, bytesBefore, bytesAfter);
     }
+
+    /// <summary>
+    /// The retention rule for announced deals, as a <c>SELECT COUNT(*)</c> or a
+    /// <c>DELETE</c>. One text for both so the dry run cannot promise something different
+    /// from what the pass does.
+    /// </summary>
+    private static string NotifiedDealsCutoff(string head) => $"""
+        {head} FROM notified_deals
+        WHERE notified_at_utc < $cutoff
+          AND NOT EXISTS (
+              SELECT 1 FROM listings
+              WHERE listings.product_id = notified_deals.product_id
+                AND listings.last_seen_at_utc >= $cutoff);
+        """;
 
     private (string Planet, string TakenAtUtc) GetSnapshotKey(long snapshotId)
     {

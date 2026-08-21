@@ -146,6 +146,36 @@ public sealed class MarketDbTests
     }
 
     [Fact]
+    public void GetPriceBaselines_gathers_a_bucket_scattered_through_the_listing()
+    {
+        using var temp = new TempDatabase();
+        using var db = temp.Open();
+
+        // Il listino arriva nell'ordine del market service, quindi i pezzi comparabili
+        // fra loro sono sparsi: qui vengono alternati di proposito. Il bucketing lascia
+        // il raggruppamento alla query, che le ordina per chiave; senza quell'ordine
+        // ogni bucket si spezzerebbe in frammenti e nel risultato resterebbe solo
+        // l'ultimo, con una mediana calcolata su un campione al posto di tre.
+        TestData.AddCompleteSnapshot(db, Now, new[]
+        {
+            TestData.Product(price: 100m, combatPoint: 1000),
+            TestData.Product(level: 5, price: 900m, combatPoint: 1000),
+            TestData.Product(price: 200m, combatPoint: 1000),
+            TestData.Product(level: 5, price: 700m, combatPoint: 1000),
+            TestData.Product(price: 300m, combatPoint: 1000),
+            TestData.Product(level: 5, price: 800m, combatPoint: 1000),
+        });
+
+        var baselines = db.GetPriceBaselines("heimdall").Baselines;
+
+        Assert.Equal(2, baselines.Count);
+        Assert.Equal(3, baselines[Bucket()].Samples);
+        Assert.Equal(200d, baselines[Bucket()].MedianPrice);
+        Assert.Equal(3, baselines[Bucket(level: 5)].Samples);
+        Assert.Equal(800d, baselines[Bucket(level: 5)].MedianPrice);
+    }
+
+    [Fact]
     public void GetPriceBaselines_leaves_the_price_per_cp_null_without_cp_samples()
     {
         using var temp = new TempDatabase();
@@ -356,6 +386,42 @@ public sealed class MarketDbTests
     }
 
     [Fact]
+    public void Prune_forgets_an_announcement_only_when_it_forgets_the_listing()
+    {
+        using var temp = new TempDatabase();
+        using var db = temp.Open();
+
+        var gone = TestData.Product();
+        var standing = TestData.Product(itemId: 10100001);
+        TestData.AddCompleteSnapshot(db, Now.AddDays(-400), new[] { gone });
+        TestData.AddCompleteSnapshot(db, Now.AddDays(-1), new[] { standing });
+        db.RecordAnnounced(new[] { gone.ProductId, standing.ProductId }, Now.AddDays(-400));
+
+        // Entrambe le segnalazioni sono vecchie: a decidere è il destino della loro
+        // inserzione, perché dimenticarne una ancora in vendita la rimanderebbe in chat.
+        var preview = db.Prune(Now.AddDays(-365), dryRun: true);
+        var result = db.Prune(Now.AddDays(-365));
+
+        Assert.Equal(1, preview.NotificationsRemoved);
+        Assert.Equal(1, result.NotificationsRemoved);
+        Assert.Equal(
+            standing.ProductId,
+            Assert.Single(db.GetAnnouncedProducts(new[] { gone.ProductId, standing.ProductId })));
+    }
+
+    [Fact]
+    public void An_announcement_recorded_twice_is_recorded_once()
+    {
+        using var temp = new TempDatabase();
+        using var db = temp.Open();
+        var product = TestData.Product();
+
+        Assert.Equal(1, db.RecordAnnounced(new[] { product.ProductId }, Now));
+        Assert.Equal(0, db.RecordAnnounced(new[] { product.ProductId }, Now.AddHours(6)));
+        Assert.Single(db.GetAnnouncedProducts(new[] { product.ProductId }));
+    }
+
+    [Fact]
     public void Prune_filters_listings_through_the_last_seen_index()
     {
         using var temp = new TempDatabase();
@@ -376,6 +442,33 @@ public sealed class MarketDbTests
 
         Assert.Contains(
             plan, line => line.Contains("ix_listings_last_seen", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void The_baseline_window_is_answered_from_the_covering_index()
+    {
+        using var temp = new TempDatabase();
+        using var db = temp.Open();
+        TestData.AddCompleteSnapshot(db, Now, new[] { TestData.Product() });
+
+        using var conn = temp.Connect();
+        using var cmd = conn.CreateCommand();
+        // The query the production code runs, not a copy of it: a column added to the
+        // SELECT list uncovers the index, and that is the regression this test catches.
+        cmd.CommandText =
+            "EXPLAIN QUERY PLAN " + MarketDb.BaselineQuery(null, Now.AddDays(-7));
+
+        var plan = new List<string>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            plan.Add(reader.GetString(reader.GetOrdinal("detail")));
+        }
+
+        Assert.Contains(
+            plan,
+            line => line.Contains(
+                "COVERING INDEX ix_listings_baseline", StringComparison.Ordinal));
     }
 
     private static long Scalar(SqliteConnection conn, string sql)

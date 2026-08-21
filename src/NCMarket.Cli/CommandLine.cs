@@ -13,7 +13,7 @@ internal sealed class CommandLine
     /// <summary>Options that carry no value; every other option consumes the next token.</summary>
     private static readonly HashSet<string> Flags = new(StringComparer.OrdinalIgnoreCase)
     {
-        "details", "no-names", "from-snapshot", "dry-run",
+        "details", "no-names", "from-snapshot", "dry-run", "notify",
     };
 
     private static readonly Dictionary<string, string[]> ByVerb = new(StringComparer.Ordinal)
@@ -27,9 +27,14 @@ internal sealed class CommandLine
         {
             "planet", "db", "type", "grade", "discount", "min-samples", "days",
             "baseline", "sale-margin", "from-snapshot", "max-per-type", "top", "no-names",
+            "notify",
         },
         ["export"] = new[] { "planet", "db", "snapshot", "type", "out", "sep", "no-names" },
         ["prune"] = new[] { "db", "days", "dry-run" },
+
+        // The credentials of the notification channel are environment variables, not
+        // options (see TelegramOptions), so there is nothing left for this verb to take.
+        ["notify-test"] = Array.Empty<string>(),
     };
 
     private readonly Dictionary<string, string> _values;
@@ -168,5 +173,7 @@ internal sealed class CommandLine
     }
 
     private static string Describe(string[] allowed) =>
-        string.Join(", ", allowed.Order(StringComparer.Ordinal).Select(a => "--" + a));
+        allowed.Length == 0
+            ? "nessuna"
+            : string.Join(", ", allowed.Order(StringComparer.Ordinal).Select(a => "--" + a));
 }
