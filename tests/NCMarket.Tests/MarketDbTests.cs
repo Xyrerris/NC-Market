@@ -408,6 +408,33 @@ public sealed class MarketDbTests
             plan, line => line.Contains("ix_listings_last_seen", StringComparison.Ordinal));
     }
 
+    [Fact]
+    public void The_baseline_window_is_answered_from_the_covering_index()
+    {
+        using var temp = new TempDatabase();
+        using var db = temp.Open();
+        TestData.AddCompleteSnapshot(db, Now, new[] { TestData.Product() });
+
+        using var conn = temp.Connect();
+        using var cmd = conn.CreateCommand();
+        // The query the production code runs, not a copy of it: a column added to the
+        // SELECT list uncovers the index, and that is the regression this test catches.
+        cmd.CommandText =
+            "EXPLAIN QUERY PLAN " + MarketDb.BaselineQuery(null, Now.AddDays(-7));
+
+        var plan = new List<string>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            plan.Add(reader.GetString(reader.GetOrdinal("detail")));
+        }
+
+        Assert.Contains(
+            plan,
+            line => line.Contains(
+                "COVERING INDEX ix_listings_baseline", StringComparison.Ordinal));
+    }
+
     private static long Scalar(SqliteConnection conn, string sql)
     {
         using var cmd = conn.CreateCommand();

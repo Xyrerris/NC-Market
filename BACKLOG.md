@@ -28,6 +28,12 @@ P2.4 e P2.6 sono ora su `main`. Resta aperto il solo P2.7, che è parcheggiato i
 di un motivo: la finestra `--days` diventa l'uso normale con il job di notifica, ed è
 allora che indicizzarla ha senso.
 
+**Aggiornato il 2026-08-21**: chiuso P2.7, l'ultimo punto aperto. Il piano che la voce
+conteneva è stato scartato sulla misura — `ANALYZE` non discrimina la finestra, perché
+la libreria non ha `SQLITE_ENABLE_STAT4` — e sostituito da un indice di copertura, che
+migliora anche il default e toglie alla voce la dipendenza dal job di notifica. Il
+backlog non ha più punti aperti.
+
 Legenda priorità:
 
 - **P0** — bug che corrompono i dati o li nascondono; da fare prima di aggiungere feature.
@@ -43,7 +49,7 @@ Legenda priorità:
 | Branch di lavoro | `feature/docker-deploy`, **10 commit avanti** su `origin/main` | ✅ nessuno in sospeso: `perf/baseline-streaming` (P2.4 + P2.6) è stato unito a `main` |
 | `origin/main` | fermo ai commit iniziali | ✅ allineato: contiene tutto il lavoro fino a P2.6 |
 | Build locale | **fallisce**: SDK 8.0.204 contro target `net9.0` | ✅ verde (SDK 9.0.317, versione fissata da `global.json`) |
-| Test | nessuno | ✅ 60 test xUnit in `tests/NCMarket.Tests`, tutti verdi |
+| Test | nessuno | ✅ 61 test xUnit in `tests/NCMarket.Tests`, tutti verdi |
 | CI | nessuna | ✅ `.github/workflows/ci.yml`: build + test + build dell'immagine Docker |
 | File spuri tracciati | `p0.txt`, `p1.txt` | ✅ rimossi dal tracciamento, `.gitignore` esteso |
 | Licenza | assente | ✅ MIT ([LICENSE](LICENSE)) |
@@ -269,7 +275,7 @@ calcolano sulle inserzioni concluse, il prerequisito è soddisfatto.
 
 ### P2.1 — Nessun test ✅ FATTO
 
-Progetto `tests/NCMarket.Tests` (xUnit), 60 test, nessuna dipendenza di rete:
+Progetto `tests/NCMarket.Tests` (xUnit), 61 test, nessuna dipendenza di rete:
 
 - `MarketDbTests` — stato degli snapshot, `GetLatestSnapshotId`, deduplicazione di
   `AddProducts`, mediane, partizionamento dei bucket e finestra `--days` di
@@ -434,34 +440,86 @@ mediana + MAD, che era l'altra occasione in cui riprendere questo punto. L'aggre
 flusso non lo ostacola — la MAD di un bucket si calcola con lo stesso buffer, in una
 seconda passata sui valori già in mano.
 
-### P2.7 — La finestra `--days` non passa dall'indice (aperto)
+### P2.7 — La finestra `--days` non passa dall'indice ✅ FATTO
 
-**Dove**: [src/NCMarket.Core/MarketDb.cs](src/NCMarket.Core/MarketDb.cs) (`ReadBuckets`)
+**Dove**: [src/NCMarket.Core/MarketDb.cs](src/NCMarket.Core/MarketDb.cs)
+(`BaselineQuery`, `CreateSchema`)
 
-Trovato misurando P2.6, non cercandolo. Il filtro della finestra storica è scritto
-`($since IS NULL OR last_seen_at_utc >= $since)`, un'unica stringa SQL che vale sia con la
-finestra sia senza. È comoda, ma è una disgiunzione: il planner non può risolverla con un
-indice, e infatti `EXPLAIN QUERY PLAN` risponde
-`SEARCH listings USING INDEX ix_listings_planet_subtype (planet=?)` qualunque sia `$since`.
-`ix_listings_last_seen`, creato in P0.5 anche per questa query, non è mai entrato in gioco.
+Trovato misurando P2.6, non cercandolo. Il filtro della finestra storica era scritto
+`($since IS NULL OR last_seen_at_utc >= $since)`, un'unica stringa SQL che valeva sia con
+la finestra sia senza. Comoda, ma è una disgiunzione: il planner non può risolverla con un
+indice, e `EXPLAIN QUERY PLAN` rispondeva
+`SEARCH listings USING INDEX ix_listings_planet_subtype (planet=?)` qualunque fosse
+`$since`. `ix_listings_last_seen`, creato in P0.5 anche per questa query, non è mai
+entrato in gioco.
 
-Il costo, su 2 milioni di inserzioni: `--days 7` restituisce 39.483 righe leggendone 2
-milioni, in 1.949 ms.
+**Il piano che questa voce conteneva era sbagliato per metà.** Prevedeva due mosse: rendere
+il predicato indicizzabile, e dare al planner delle statistiche (`ANALYZE`) perché
+scegliesse l'indice finestra per finestra. La seconda non era mai stata provata, e non
+funziona: con `ANALYZE` il planner sceglie `ix_listings_last_seen` a sette giorni **e** a
+novanta, cioè anche nel caso che questa stessa voce aveva misurato come peggiore. Il
+motivo è strutturale: la libreria che il progetto usa davvero (SQLite 3.49.1 via
+Microsoft.Data.Sqlite 10.0.10) non è compilata con `SQLITE_ENABLE_STAT4` — `PRAGMA
+compile_options` non riporta alcuna voce `STAT` — quindi `ANALYZE` produce la sola
+`sqlite_stat1`, che contiene la media di righe per chiave uguale. Dice quanto è selettiva
+un'uguaglianza; non dice nulla su quante righe soddisfino un `>=`, che è esattamente la
+domanda da cui dipende la scelta.
 
-Non basta però rendere il predicato indicizzabile. Misurato, riscriverlo senza la
-disgiunzione non cambia nulla (1.988 ms contro 2.116): senza statistiche il planner non ha
-motivo di preferire un indice all'altro. E forzarlo non è la risposta, perché l'indice
-giusto dipende dall'ampiezza della finestra: con `INDEXED BY ix_listings_last_seen` sette
-giorni scendono a 511 ms (4 volte più veloce), ma novanta giorni salgono a 3.378 ms contro
-2.525 (peggio, perché a quel punto le risalite alla riga sono mezzo milione).
+Scartato sulla misura anche l'indice composito `(planet, last_seen_at_utc)`: senza
+statistiche il planner lo usa pure quando non c'è finestra, e il default passa da 3.549 a
+**12.940 ms**, 3,6 volte peggio di prima. È lo stesso effetto per cui P2.6 aveva scartato
+`(planet, item_id, level, option_count)` — un indice non coprente costringe a risalire
+alla riga una alla volta.
 
-Servono quindi due mosse, in quest'ordine: costruire la clausola `WHERE` in C# invece
-dell'idioma `IS NULL OR`, e dare al planner delle statistiche (`ANALYZE`, da rinfrescare
-in `prune`) perché scelga finestra per finestra. Sono entrambe poco costose; quello che
-manca è il motivo. Oggi `deals` ha `--days 0` come default, cioè tutto lo storico, dove
-l'indice non servirebbe comunque. Diventa un intervento sensato quando la finestra sarà
-l'uso normale — per esempio con il job di notifica delle occasioni, che guarda solo il
-mercato recente.
+**Fatto**: la clausola `WHERE` si costruisce in C# (`BaselineQuery`) con i soli filtri
+davvero richiesti, invece dell'idioma `IS NULL OR`; e un indice **di copertura**
+`ix_listings_baseline(planet, last_seen_at_utc, item_id, level, option_count, price,
+combat_point, item_sub_type, last_seen_snapshot_id)` porta tutte e sole le colonne che la
+query seleziona, così SQLite risponde dall'indice e non tocca mai la tabella. È creato in
+`CreateSchema`, quindi acquisito da qualunque database all'apertura senza migrazione
+dedicata, come in P0.5.
+
+Banco: 2 milioni di inserzioni sintetiche, un anno di storico, 95% sul pianeta di lavoro;
+tempi di lettura completa delle righe, la stessa misura di P2.6. La serie è interna a
+questo banco e non va confrontata riga per riga con quella di P2.6, che girava su un
+database sintetico diverso.
+
+| Caso | Prima | Il piano di questa voce (`ANALYZE`) | Fatto (indice di copertura) |
+|---|---|---|---|
+| `--days 7` — 36.493 righe | 1.203 ms | 242 ms | **45 ms** |
+| `--days 90` — 468.212 righe | 1.633 ms | 3.251 ms | **573 ms** |
+| `--days 0`, il default — 1,9 M righe | 3.549 ms | 3.371 ms | **2.629 ms** |
+
+Migliora anche il percorso `--type`, dove la disgiunzione era la stessa e viene tolta
+insieme all'altra: 279 → 15 ms su sette giorni, 719 → 693 ms su tutto lo storico.
+
+**Perché non aspetta più il job di notifica**. La voce era parcheggiata perché il piano di
+allora aiutava la sola finestra stretta e peggiorava il resto, quindi conveniva aspettare
+che la finestra stretta diventasse l'uso normale. Con l'indice di copertura migliorano
+tutti e tre i casi, **default compreso**: una riga d'indice porta nove colonne, una riga di
+tabella si trascina dietro anche `stats_json` e `skills_json`. Non c'è più niente da
+barattare, e l'ipotesi su cui poggiava l'attesa non serve più che sia vera — il che è un
+bene, perché era dubbia: `--days` restringe la popolazione delle **baseline**, non le
+inserzioni da giudicare, e un job di notifica vuole offerte fresche ma baseline sul
+massimo storico possibile.
+
+**Il prezzo**: il database passa da 257 a 383 MB (+49%), e la prima apertura di un
+database esistente si ferma il tempo di costruire l'indice — 6 secondi su 2 milioni di
+inserzioni.
+
+**Verificato da**: `MarketDbTests.The_baseline_window_is_answered_from_the_covering_index`,
+che esegue `EXPLAIN QUERY PLAN` sulla stringa prodotta da `BaselineQuery` — non su una
+copia scritta nel test — e pretende `COVERING INDEX`. Il test è stato controllato per
+mutazione: aggiungendo `first_seen_snapshot_id` al `SELECT` il piano scende da
+`COVERING INDEX` a `INDEX` e il test fallisce, che è il guasto silenzioso contro cui
+esiste. Aggiungere invece `id` non lo fa fallire, ed è corretto così: `id` è il rowid,
+presente in ogni voce d'indice, quindi la copertura regge davvero.
+
+**Resta aperto, in prospettiva** (non necessario a chiudere questa voce): due misure non
+fatte. Se `ix_listings_planet_subtype` sia ancora ripagato, ora che il nuovo indice serve
+la stessa query; e quanto costi in scrittura l'indice a nove colonne su uno `snapshot`,
+che inserisce qualche migliaio di righe e non due milioni — me lo aspetto trascurabile, ma
+è un'aspettativa, non un dato.
 
 ---
 
@@ -471,11 +529,10 @@ mercato recente.
 |---|---|---|---|
 | 1 | Notifica occasioni (webhook Telegram/Discord) dal job | basso | È il payoff del deploy su server: non si leggono CSV, si viene avvisati. `DealService` è già richiamabile senza CLI, perché P2.4 l'ha estratto in Core |
 | 2 | Taratura di `--sale-margin` su dati reali | basso | La soglia di default (20%) è una scelta ragionata, non una misura: con qualche giorno di snapshot si può verificare come si sposta la composizione della popolazione. Si accumula da sé mentre il job del punto 1 gira |
-| 3 | Indicizzare la finestra `--days` (P2.7) | basso | Ha senso subito dopo il punto 1, che è ciò che rende la finestra l'uso normale |
-| 4 | Completare la copertura dei test (P2.1, parte residua) | basso | Export CSV e parsing nomi sono ancora senza asserzioni |
-| 5 | Filtri avanzati API (`stat`, `itemIds[]`, `isCustom`) + output `--json` | basso | Già in roadmap; il JSON abilita la dashboard |
-| 6 | Mediana + MAD, o vendite on-chain via 9cscan/mimir | medio-alto | I due modi di migliorare ancora la stima, ora che la popolazione è quella giusta |
+| 3 | Completare la copertura dei test (P2.1, parte residua) | basso | Export CSV e parsing nomi sono ancora senza asserzioni |
+| 4 | Filtri avanzati API (`stat`, `itemIds[]`, `isCustom`) + output `--json` | basso | Già in roadmap; il JSON abilita la dashboard |
+| 5 | Mediana + MAD, o vendite on-chain via 9cscan/mimir | medio-alto | I due modi di migliorare ancora la stima, ora che la popolazione è quella giusta |
 
-Con P1.1 chiuso non restano interventi che cambiano la correttezza del motore, e con il
-merge e la licenza fatti non restano decisioni in sospeso: il punto 2 è una misura da fare
-sui dati veri, gli altri sono estensioni o prestazioni.
+Con P1.1 chiuso non restano interventi che cambiano la correttezza del motore, e con P2.7
+il backlog non ha più punti aperti: il punto 2 è una misura da fare sui dati veri, gli
+altri sono estensioni.

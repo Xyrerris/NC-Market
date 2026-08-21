@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
 using NCMarket.Core.Models;
@@ -250,13 +251,23 @@ public sealed class MarketDb : IDisposable
             CREATE INDEX IF NOT EXISTS ix_listings_planet_subtype ON listings(planet, item_sub_type);
             CREATE INDEX IF NOT EXISTS ix_listings_item ON listings(item_id);
             CREATE INDEX IF NOT EXISTS ix_sightings_listing ON sightings(listing_id);
-            -- Filter column of Prune, which is the one query the planner actually
-            -- resolves through it. The --days window of GetPriceBaselines is written as
-            -- a disjunction ($since IS NULL OR ...) and cannot use an index; measured on
-            -- two million listings, forcing this one is four times faster over a week
-            -- and slower over ninety days, so the choice belongs to the planner and the
-            -- predicate has to be made sargable first (see P2.7 in BACKLOG.md).
+            -- Filter column of Prune, which sweeps the whole table by age with no
+            -- planet to narrow it down first.
             CREATE INDEX IF NOT EXISTS ix_listings_last_seen ON listings(last_seen_at_utc);
+
+            -- Covers the baseline query of GetPriceBaselines: planet and the --days
+            -- window are its filters, the remaining columns are the ones it selects,
+            -- so SQLite answers from the index and never reaches the table. Measured
+            -- on two million listings: --days 7 drops from 1,203 to 45 ms and
+            -- --days 90 from 1,633 to 573 ms. The whole-history default gets cheaper
+            -- too (3,549 to 2,629 ms), because an index row carries nine columns
+            -- while a table row drags stats_json and skills_json along with it. The
+            -- price is about half the size of the database again, and six seconds on
+            -- the first open of an existing two-million-listing one, while the index
+            -- is built (P2.7).
+            CREATE INDEX IF NOT EXISTS ix_listings_baseline ON listings(
+                planet, last_seen_at_utc, item_id, level, option_count,
+                price, combat_point, item_sub_type, last_seen_snapshot_id);
             """);
     }
 
@@ -831,6 +842,41 @@ public sealed class MarketDb : IDisposable
         BaselineKey Key, int SubType, long LastSeenSnapshotId, double Price, int CombatPoint);
 
     /// <summary>
+    /// The baseline query carrying only the filters that were actually asked for.
+    /// Writing the optional ones as <c>$p IS NULL OR column = $p</c> keeps the SQL
+    /// constant and costs the index: a disjunction is not sargable, so the planner
+    /// resolves it by scanning whatever the window. That idiom is what kept
+    /// <c>ix_listings_last_seen</c> out of this query for as long as it existed (P2.7).
+    /// <para>
+    /// The selected columns are, in order, the trailing columns of
+    /// <c>ix_listings_baseline</c>. That is what makes the index cover the query;
+    /// selecting one more silently uncovers it and the cost comes back without
+    /// anything breaking, which is why a test asserts on the query plan.
+    /// </para>
+    /// </summary>
+    internal static string BaselineQuery(EquipmentType? type, DateTime? sinceUtc)
+    {
+        var sql = new StringBuilder("""
+            SELECT item_id, level, option_count, price, combat_point,
+                   item_sub_type, last_seen_snapshot_id
+            FROM listings
+            WHERE planet = $planet
+            """);
+
+        if (type is not null)
+        {
+            sql.Append("\n  AND item_sub_type = $subType");
+        }
+
+        if (sinceUtc is not null)
+        {
+            sql.Append("\n  AND last_seen_at_utc >= $since");
+        }
+
+        return sql.Append("\nORDER BY item_id, level, option_count;").ToString();
+    }
+
+    /// <summary>
     /// The listings of a planet, one <see cref="BaselineKey"/> bucket at a time. Ordering
     /// the query by the bucket key leaves the grouping to SQLite, so what is held in
     /// memory is a bucket — a handful of comparable pieces — instead of the whole
@@ -846,22 +892,18 @@ public sealed class MarketDb : IDisposable
         string planet, EquipmentType? type, DateTime? sinceUtc)
     {
         using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
-            SELECT item_id, level, option_count, price, combat_point,
-                   item_sub_type, last_seen_snapshot_id
-            FROM listings
-            WHERE planet = $planet
-              AND ($subType IS NULL OR item_sub_type = $subType)
-              AND ($since IS NULL OR last_seen_at_utc >= $since)
-            ORDER BY item_id, level, option_count;
-            """;
+        cmd.CommandText = BaselineQuery(type, sinceUtc);
         cmd.Parameters.AddWithValue("$planet", planet);
-        cmd.Parameters.AddWithValue("$subType", type is null ? DBNull.Value : (int)type.Value);
-        cmd.Parameters.AddWithValue(
-            "$since",
-            sinceUtc is null
-                ? DBNull.Value
-                : sinceUtc.Value.ToString("O", CultureInfo.InvariantCulture));
+        if (type is not null)
+        {
+            cmd.Parameters.AddWithValue("$subType", (int)type.Value);
+        }
+
+        if (sinceUtc is not null)
+        {
+            cmd.Parameters.AddWithValue(
+                "$since", sinceUtc.Value.ToString("O", CultureInfo.InvariantCulture));
+        }
 
         var bucket = new List<BaselineRow>();
         using var reader = cmd.ExecuteReader();
