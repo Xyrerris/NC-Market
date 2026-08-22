@@ -51,7 +51,7 @@ public sealed class NameProvider
     /// <summary>
     /// Loads a name map from the local cache, refreshing it from GitHub when missing or
     /// older than <paramref name="maxAge"/> (default 7 days). Falls back to a stale cache,
-    /// then to an empty provider, when the download fails.
+    /// then to an empty provider, when the refresh fails.
     /// </summary>
     public static async Task<NameProvider> LoadAsync(
         string csvUrl,
@@ -76,9 +76,12 @@ public sealed class NameProvider
                 Directory.CreateDirectory(Path.GetDirectoryName(cachePath)!);
                 await File.WriteAllTextAsync(cachePath, csv, Encoding.UTF8, ct);
             }
-            catch (Exception e) when (e is HttpRequestException or TaskCanceledException or IOException)
+            catch (Exception e) when (e is HttpRequestException or TaskCanceledException
+                                        or IOException or UnauthorizedAccessException)
             {
-                // Offline or GitHub unreachable: fall back to a stale cache if present.
+                // Refresh failed: offline, GitHub unreachable, or a cache we are not allowed
+                // to rewrite (a data directory owned by another user). Fall back to the copy
+                // on disk: stale item names beat no item names.
             }
             finally
             {
