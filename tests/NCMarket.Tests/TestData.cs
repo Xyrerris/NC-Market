@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http.Headers;
 using Microsoft.Data.Sqlite;
 using NCMarket.Core;
 using NCMarket.Core.Models;
@@ -204,6 +205,9 @@ internal sealed class FakeHttpHandler : HttpMessageHandler
     /// <summary>Request bodies, as sent on the wire.</summary>
     public List<string> Bodies { get; } = new();
 
+    /// <summary>Request headers, in the same order — how a caller identifies itself.</summary>
+    public List<HttpRequestHeaders> Headers { get; } = new();
+
     /// <summary>Queues one answer. Requests past the last one get a plain success.</summary>
     public FakeHttpHandler Answering(HttpStatusCode status, string body = """{"ok":true}""")
     {
@@ -216,6 +220,7 @@ internal sealed class FakeHttpHandler : HttpMessageHandler
     {
         Urls.Add(request.RequestUri!.ToString());
         Bodies.Add(request.Content is null ? "" : await request.Content.ReadAsStringAsync(ct));
+        Headers.Add(request.Headers);
 
         var (status, body) = _answers.Count > 0
             ? _answers.Dequeue()

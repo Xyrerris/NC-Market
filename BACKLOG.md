@@ -38,6 +38,13 @@ backlog non ha più punti aperti.
 occasioni su Telegram — che è la prima voce non di debito del backlog e apre la nuova
 sezione P3. Il resto dei prossimi passi è invariato.
 
+**Aggiornato il 2026-08-24**: chiusa la coda di P2.1 — `SnapshotCsvExporter.Write`,
+`NameProvider.SplitCsvLine`, `EquipmentTypes.TryParse`, `Grades.TryParse`,
+`ProductFormat.*`, la migrazione v1 → v2 e `MarketClient` hanno adesso asserzioni: da 61 a
+177 test. Con i due job in esecuzione sul server, la taratura delle soglie sui dati veri
+resta il primo dei prossimi passi; gli altri due sono estensioni. Ripulita anche la
+lista dei branch: restano `main` e `feature/docker-deploy`.
+
 Legenda priorità:
 
 - **P0** — bug che corrompono i dati o li nascondono; da fare prima di aggiungere feature.
@@ -54,7 +61,7 @@ Legenda priorità:
 | Branch di lavoro | `feature/docker-deploy`, **10 commit avanti** su `origin/main` | ✅ nessuno in sospeso: `perf/baseline-streaming` (P2.4 + P2.6) è stato unito a `main` |
 | `origin/main` | fermo ai commit iniziali | ✅ allineato: contiene tutto il lavoro fino a P2.6 |
 | Build locale | **fallisce**: SDK 8.0.204 contro target `net9.0` | ✅ verde (SDK 9.0.317, versione fissata da `global.json`) |
-| Test | nessuno | ✅ 61 test xUnit in `tests/NCMarket.Tests`, tutti verdi |
+| Test | nessuno | ✅ 177 test xUnit in `tests/NCMarket.Tests`, tutti verdi |
 | CI | nessuna | ✅ `.github/workflows/ci.yml`: build + test + build dell'immagine Docker |
 | File spuri tracciati | `p0.txt`, `p1.txt` | ✅ rimossi dal tracciamento, `.gitignore` esteso |
 | Licenza | assente | ✅ MIT ([LICENSE](LICENSE)) |
@@ -280,7 +287,7 @@ calcolano sulle inserzioni concluse, il prerequisito è soddisfatto.
 
 ### P2.1 — Nessun test ✅ FATTO
 
-Progetto `tests/NCMarket.Tests` (xUnit), 61 test, nessuna dipendenza di rete:
+Progetto `tests/NCMarket.Tests` (xUnit), 177 test, nessuna dipendenza di rete:
 
 - `MarketDbTests` — stato degli snapshot, `GetLatestSnapshotId`, deduplicazione di
   `AddProducts`, mediane, partizionamento dei bucket e finestra `--days` di
@@ -303,9 +310,45 @@ Progetto `tests/NCMarket.Tests` (xUnit), 61 test, nessuna dipendenza di rete:
 - `DbLockTests` — il secondo detentore attende e poi rinuncia; il rilascio libera il lock;
 - `CommandLineTests` — tutti i modi in cui una riga di comando può essere sbagliata.
 
-**Non ancora coperti** (vedi *Prossimi passi*): `SnapshotCsvExporter.Write`,
-`NameProvider.SplitCsvLine`, `EquipmentTypes.TryParse`, `Grades.TryParse`,
-`ProductFormat.*`, migrazione v1 → v2, `MarketClient` (richiede un handler HTTP finto).
+**Aggiunte il 2026-08-24**, a chiudere la coda che il punto 2 dei prossimi passi teneva
+aperta:
+
+- `SnapshotCsvExporterTests` — 7 casi: l'export vuoto è la sola intestazione, la riga per
+  intero di un'inserzione, base e bonus di una stat in due colonne con i ripetuti sommati,
+  una stat che questa build non conosce che si prende comunque le sue colonne, tanti gruppi
+  skill quanti ne serve all'inserzione più ricca con le righe corte riempite di celle
+  vuote, la quotatura RFC 4180, e il fatto che a decidere cosa quotare sia il separatore
+  scelto;
+- `MarketClientTests` — 14 casi: la richiesta (tipo nel percorso, finestra in query,
+  `User-Agent` dichiarato e non sovrascritto se il chiamante ne ha già uno), la lettura
+  campo per campo di un'inserzione nel formato del servizio, la risposta vuota, il 404 che
+  non si ritenta e il 503 che sì, le tre transient di fila che si arrendono conservando la
+  causa, la paginazione fino alla prima pagina corta, la de-duplicazione fra pagine e le
+  tre pagine sterili che chiudono il giro, `--max-per-type` che taglia, il progresso, e
+  l'`HttpClient` prestato che non viene chiuso;
+- `MarketDbMigrationTests` — 3 casi in più sulla v1 → v2: la deduplicazione che non perde
+  una presenza, il primo e l'ultimo avvistamento ricostruiti dagli id di snapshot, e il
+  backup lasciato accanto al file con il database che esce già alla versione corrente;
+- `NameProviderTests` — 4 casi in più: un nome quotato che contiene virgole e virgolette,
+  le righe che non sono un nome e costano solo se stesse, l'avvio offline senza cache che
+  non lascia dietro una cache vuota, e la cache fresca che non viene riscaricata;
+- `ProductFormatTests` — 9 casi: nome noto, ripiego sulle serie di grado 7 e 8, id che
+  resta numerico quando non c'è niente da inferire e quando non c'è nessun nome caricato,
+  fusione di base e bonus per stat, stat a zero comunque stampata, skill per nome e
+  probabilità, riga di dettaglio con e senza i segmenti opzionali;
+- `EquipmentTypesTests` e `GradesTests` — nomi, alias (`sword`, `divine`), forma numerica
+  lib9c, spazi e maiuscole, rifiuto che non lascia dietro un valore, e il controllo che
+  `All` copra ogni membro dichiarato nell'enum.
+
+Due dei nuovi guardiani sono stati controllati per mutazione: forzando `seen.Add` a
+riuscire sempre in `GetAllProductsAsync` cadono i due test sulla de-duplicazione, e
+togliendo una cella al riempimento delle colonne skill cade quello sul padding.
+
+**Il prezzo**: la suite passa da 1 a 10 secondi. Otto se ne vanno nei due test che
+attraversano davvero il backoff di `GetProductsPageAsync` (2s, poi 4s). È il costo di
+verificare la politica di retry sul codice vero invece che su una copia con i tempi
+azzerati, ed è la parte del comportamento che, sbagliata, si nota solo di notte sul
+server.
 
 ### P2.2 — Nessuna CI e SDK non fissato ✅ FATTO
 
@@ -627,10 +670,10 @@ ragionata e non una taratura.
 | # | Intervento | Costo | Perché in questa posizione |
 |---|---|---|---|
 | 1 | Taratura di `--sale-margin` su dati reali | basso | La soglia di default (20%) è una scelta ragionata, non una misura: con qualche giorno di snapshot si può verificare come si sposta la composizione della popolazione. Si accumula da sé mentre il job di notifica di P3.1 gira |
-| 2 | Completare la copertura dei test (P2.1, parte residua) | basso | Export CSV e parsing nomi sono ancora senza asserzioni |
-| 3 | Filtri avanzati API (`stat`, `itemIds[]`, `isCustom`) + output `--json` | basso | Già in roadmap; il JSON abilita la dashboard |
-| 4 | Mediana + MAD, o vendite on-chain via 9cscan/mimir | medio-alto | I due modi di migliorare ancora la stima, ora che la popolazione è quella giusta |
+| 2 | Filtri avanzati API (`stat`, `itemIds[]`, `isCustom`) + output `--json` | basso | Già in roadmap; il JSON abilita la dashboard |
+| 3 | Mediana + MAD, o vendite on-chain via 9cscan/mimir | medio-alto | I due modi di migliorare ancora la stima, ora che la popolazione è quella giusta |
 
 Con P1.1 chiuso non restano interventi che cambiano la correttezza del motore, con P2.7 il
 debito è chiuso e con P3.1 il risultato arriva a destinazione: il punto 1 è una misura da
-fare sui dati veri — e adesso i dati si accumulano da soli — gli altri sono estensioni.
+fare sui dati veri — e adesso i dati si accumulano da soli, perché `snapshot-job` e
+`deals-job` girano sul server — gli altri due sono estensioni.
