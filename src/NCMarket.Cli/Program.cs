@@ -279,9 +279,12 @@ async Task<int> NotifyTestAsync()
     }
 
     using var notifier = new TelegramNotifier(telegram!);
-    await notifier.SendAsync(
+
+    // Il canale dichiara MarkdownV2 per ogni messaggio, quindi anche questo va sfuggito:
+    // un punto non sfuggito non arriverebbe storto, non arriverebbe.
+    await notifier.SendAsync(MarkdownV2.Escape(
         "NC-Market — messaggio di prova.\n" +
-        "Se lo stai leggendo, le notifiche delle occasioni arriveranno in questa chat.");
+        "Se lo stai leggendo, le notifiche delle occasioni arriveranno in questa chat."));
 
     Console.WriteLine($"Messaggio di prova inviato su {notifier.Name}.");
     return 0;

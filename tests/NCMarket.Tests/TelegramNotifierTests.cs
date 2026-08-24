@@ -52,6 +52,64 @@ public sealed class TelegramNotifierTests
     }
 
     [Fact]
+    public async Task The_message_is_sent_as_MarkdownV2()
+    {
+        var handler = new FakeHttpHandler();
+        using var http = new HttpClient(handler);
+        using var notifier = new TelegramNotifier(Options, http);
+
+        await notifier.SendAsync("*una occasione*");
+
+        Assert.Contains(
+            "parse_mode=MarkdownV2", handler.Bodies[0], StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Un errore di escaping costerebbe l'intera segnalazione — e, siccome un invio
+    /// fallito non registra niente, la costerebbe di nuovo a ogni esecuzione. Il testo
+    /// riparte senza markup: qualche backslash a vista è il modo più economico di
+    /// sbagliare.
+    /// </summary>
+    [Fact]
+    public async Task A_message_Telegram_cannot_parse_goes_out_without_markup()
+    {
+        var handler = new FakeHttpHandler().Answering(
+            HttpStatusCode.BadRequest,
+            """
+            {"ok":false,"error_code":400,
+             "description":"Bad Request: can't parse entities: unexpected end"}
+            """);
+        using var http = new HttpClient(handler);
+        using var notifier = new TelegramNotifier(Options, http);
+
+        await notifier.SendAsync("*una occasione");
+
+        Assert.Equal(2, handler.Urls.Count);
+        Assert.Contains("parse_mode", handler.Bodies[0], StringComparison.Ordinal);
+        Assert.DoesNotContain("parse_mode", handler.Bodies[1], StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Telegram risponde 400 anche a una chat inesistente, che nessun secondo invio
+    /// sistema: è la distinzione fra un ripiego e un "ritenta sempre".
+    /// </summary>
+    [Fact]
+    public async Task A_refusal_that_is_not_about_the_markup_is_not_sent_again()
+    {
+        var handler = new FakeHttpHandler().Answering(
+            HttpStatusCode.BadRequest,
+            """{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}""");
+        using var http = new HttpClient(handler);
+        using var notifier = new TelegramNotifier(Options, http);
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => notifier.SendAsync("una occasione"));
+
+        Assert.Contains("chat not found", error.Message, StringComparison.Ordinal);
+        Assert.Single(handler.Urls);
+    }
+
+    [Fact]
     public void A_message_over_the_limit_is_split_between_its_lines()
     {
         var message = string.Join(

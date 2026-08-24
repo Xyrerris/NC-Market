@@ -98,6 +98,14 @@ public sealed class TelegramNotifier : INotificationChannel, IDisposable
     private readonly HttpClient _http;
     private readonly bool _ownsHttp;
 
+    /// <summary>
+    /// Set once Telegram has refused to parse a message: from then on this channel sends
+    /// without a parse mode. It is state of the instance rather than of one request
+    /// because a split alert is several requests, and the parts after the first would
+    /// otherwise walk into the same refusal one at a time.
+    /// </summary>
+    private bool _plainText;
+
     public TelegramNotifier(TelegramOptions options, HttpClient? http = null)
     {
         _options = options;
@@ -139,6 +147,11 @@ public sealed class TelegramNotifier : INotificationChannel, IDisposable
     /// <para>
     /// Parts that would come out empty are dropped: an alert ending in a newline can
     /// land exactly on the limit, and Telegram answers 400 to a message with no text.
+    /// </para>
+    /// <para>
+    /// Cutting between lines is also what keeps each part parseable on its own: the
+    /// markup of an alert never spans a newline (see <see cref="DealMessage"/>), so no
+    /// part can begin or end inside an entity Telegram would then refuse.
     /// </para>
     /// </summary>
     internal static IReadOnlyList<string> Split(string message, int max)
@@ -212,15 +225,23 @@ public sealed class TelegramNotifier : INotificationChannel, IDisposable
             HttpResponseMessage response;
             try
             {
-                using var content = new FormUrlEncodedContent(new Dictionary<string, string>
+                var form = new Dictionary<string, string>
                 {
                     ["chat_id"] = _options.ChatId,
-
-                    // No parse mode on purpose: no markup means nothing to escape, and an
-                    // item name is whatever the game decided to call it.
                     ["text"] = text,
                     ["disable_web_page_preview"] = "true",
-                });
+                };
+
+                // The alerts are written in MarkdownV2 (see DealMessage), which is what
+                // makes a price stand out from the sentence around it. Everything they
+                // insert is escaped — but if some name still gets through unescaped, the
+                // message goes out unparsed rather than not at all.
+                if (!_plainText)
+                {
+                    form["parse_mode"] = "MarkdownV2";
+                }
+
+                using var content = new FormUrlEncodedContent(form);
 
                 response = await _http.PostAsync(url, content, ct);
             }
@@ -244,6 +265,18 @@ public sealed class TelegramNotifier : INotificationChannel, IDisposable
 
                 var (description, retryAfter) = await ReadErrorAsync(response, ct);
                 var failure = Failure(response, description);
+
+                // "Bad Request: can't parse entities: ...". An escaping mistake would
+                // otherwise cost the whole alert — and, since nothing is recorded when a
+                // send fails, cost it again at every run. Sending the same text without
+                // markup costs a few backslashes in view, which is the cheaper failure.
+                if (!_plainText && IsParseFailure(response.StatusCode, description))
+                {
+                    _plainText = true;
+                    lastError = new HttpRequestException(failure);
+                    continue;
+                }
+
                 if (!IsTransient(response.StatusCode))
                 {
                     // A wrong token, an unknown chat, a bot the recipient never started:
@@ -309,6 +342,16 @@ public sealed class TelegramNotifier : INotificationChannel, IDisposable
             return (null, null);
         }
     }
+
+    /// <summary>
+    /// Whether the refusal is about the markup rather than about the request: Telegram
+    /// answers 400 to both a message it cannot parse and a chat that does not exist, and
+    /// only the first of the two is worth sending again.
+    /// </summary>
+    private static bool IsParseFailure(HttpStatusCode status, string? description) =>
+        status == HttpStatusCode.BadRequest &&
+        description is not null &&
+        description.Contains("parse", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsTransient(HttpStatusCode status) =>
         (int)status >= 500 || status == HttpStatusCode.RequestTimeout ||

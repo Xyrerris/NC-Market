@@ -20,3 +20,7 @@ p1.txt
 .idea/
 *.user
 bash.exe.stackdump
+
+# Profili di avvio dell'IDE: è lì che vanno token e chat id per il debug locale, e un
+# token di bot è una credenziale al portatore — questo file non entra nel repository.
+**/Properties/launchSettings.json
