@@ -80,7 +80,8 @@ NC-Market/
 │   │   ├── SnapshotService.cs  Orchestrazione di 'snapshot': cattura, salva, finalizza
 │   │   ├── DealService.cs      Orchestrazione di 'deals': baseline, listino da confrontare, esito
 │   │   ├── DealAlertService.cs Segnalazione delle occasioni nuove, una volta sola ciascuna
-│   │   ├── DealMessage.cs      Testo di una segnalazione (senza markup, indipendente dal canale)
+│   │   ├── DealMessage.cs      Testo di una segnalazione (quattro righe per inserzione, in MarkdownV2)
+│   │   ├── MarkdownV2.cs       Escaping di MarkdownV2, la sintassi che Telegram interpreta
 │   │   ├── INotificationChannel.cs  Astrazione del canale di notifica
 │   │   ├── TelegramNotifier.cs Invio su Telegram (Bot API) e lettura delle credenziali
 │   │   ├── NameProvider.cs     Risoluzione id -> nome per item e skill (cache locale)
@@ -349,18 +350,29 @@ quindi segnalate solo le inserzioni mai segnalate prima, tenute in `notified_dea
 `--top` contano come segnalate: il messaggio dichiara quante sono e dove vederle, mentre
 lasciarle indietro le farebbe ripresentare a ogni esecuzione senza mai elencarle.
 
-Il messaggio è testo semplice, senza markup — non c'è niente da sfuggire, e il nome di un
-item è quello che il gioco ha deciso di chiamarlo. Ogni inserzione occupa tre righe: cosa
-è, quanto costa, perché è a buon mercato.
+Il messaggio è scritto in **MarkdownV2**, la sintassi che Telegram interpreta: si legge su
+un telefono, di corsa, e un prezzo dentro un riquadro monospaziato si distingue dalla frase
+che lo circonda in un modo che il testo semplice non permette. Ogni inserzione occupa
+quattro righe — cosa è, com'è fatta, quanto costa, perché è a buon mercato — e una riga 🔎
+dichiara i filtri quando ce ne sono.
 
 ```
-NC-Market — 2 nuove occasioni su heimdall (Ring)
-Sconto ≥ 25% sulla mediana delle inserzioni concluse per item+livello+opzioni (campioni ≥ 5).
+🏷️ *NC\-Market* — 2 nuove occasioni su `heimdall`
+🔎 Ring · rarità Legendary · storico dal 2026\-08\-14
+_Sconto ≥ 25% sulla mediana delle inserzioni concluse per item \+ livello \+ opzioni \(campioni ≥ 5\)_
 
-1) Guardian Ring +7 — Ring grado 5, 4 opzioni, CP 12.450
-   142.50 NCG — sconto 41.2% su NCG/CP (38.0% sul prezzo)
-   87 CP/NCG contro una mediana di 148 su 12 inserzioni
+*1\. Guardian Ring \+7*
+Ring · grado 5 · 4 opzioni · CP `12,450`
+💰 `142.50 NCG` — sconto `41.2%` su NCG/CP \(`38.0%` sul prezzo\)
+📊 `87` CP/NCG vs mediana `148` su `12` inserzioni
 ```
+
+Il prezzo del markup è l'escaping: il nome di un item è quello che il gioco ha deciso di
+chiamarlo, e una parentesi non sfuggita non arriva storta, viene **rifiutata** da Telegram.
+Ogni valore passa quindi per `MarkdownV2.Escape` o `MarkdownV2.Code`, nessuna entità
+attraversa un a capo — così un messaggio spezzato sui 4096 caratteri resta valido parte per
+parte — e se Telegram rifiuta comunque il parsing il testo riparte senza `parse_mode`:
+qualche backslash a vista è meglio di un'occasione mai segnalata.
 
 **Se l'invio fallisce** non viene registrato niente e il comando esce con codice diverso da
 zero: la stessa occasione viene ritentata alla prossima esecuzione. È il verso giusto in

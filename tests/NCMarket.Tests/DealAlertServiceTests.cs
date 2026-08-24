@@ -97,7 +97,7 @@ public sealed class DealAlertServiceTests
         // Il messaggio ne elenca una e dichiara l'altra: sono entrambe annunciate, o la
         // seconda tornerebbe a ogni esecuzione senza mai essere elencata.
         Assert.Equal(2, first.New.Count);
-        Assert.Contains("Altre 1", Assert.Single(channel.Sent), StringComparison.Ordinal);
+        Assert.Contains("Altre `1`", Assert.Single(channel.Sent), StringComparison.Ordinal);
         Assert.False(second.Sent);
     }
 

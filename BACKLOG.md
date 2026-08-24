@@ -580,9 +580,19 @@ che Telegram contatta per consegnare a un bot i messaggi che gli scrivono. Qui n
 niente da ricevere, la segnalazione esce, quindi è una `POST` a `sendMessage` — ed è anche
 il motivo per cui la macchina che esegue il job non ha bisogno di indirizzo pubblico,
 porta in ingresso o certificato. Il canale sta dietro `INotificationChannel`: aggiungere
-Discord significa implementarla, senza toccare ciò che decide se e cosa c'è da dire. Il
-messaggio è testo semplice senza markup, così non c'è niente da sfuggire e il nome di un
-item resta quello che il gioco gli ha dato.
+Discord significa implementarla, senza toccare ciò che decide se e cosa c'è da dire.
+
+**Sul formato.** Il messaggio nasce come testo semplice — niente markup, niente da
+sfuggire — e passa a MarkdownV2 quando diventa chiaro che l'alert si legge su un telefono,
+in mezzo ad altri messaggi: quattro righe per inserzione, il nome in grassetto, ogni cifra
+in un riquadro monospaziato, i filtri su una riga a parte. Il prezzo è l'escaping, e non è
+cosmetico: il nome di un item è quello che il gioco gli ha dato, e una parentesi non
+sfuggita non arriva storta, viene rifiutata. Da qui `MarkdownV2` (`Escape` e `Code`, gli
+unici modi in cui `DealMessage` scrive un valore), l'invariante che nessuna entità
+attraversi un a capo — è ciò che rende ancora valido il taglio per righe sopra i 4096
+caratteri — e il ripiego del canale: a un `400` di parsing il testo riparte senza
+`parse_mode`, perché qualche backslash a vista costa meno di una segnalazione persa che
+nessuna esecuzione successiva recupera.
 
 **Il prezzo**: `deals` diventa un comando che scrive, cosa che prima non era. La scrittura
 è una `INSERT` per occasione e non prende il lock del database — prenderlo vorrebbe dire
@@ -593,12 +603,15 @@ codice ha già deciso di sbagliare.
 
 **Verificato da**: `DealAlertServiceTests` (5 casi: annuncio unico e silenzio alla seconda
 esecuzione, ritentativo dopo un invio fallito, occasioni oltre l'elenco comunque
-registrate, ricerca senza risposta, ricerca senza occasioni), `TelegramNotifierTests` (6
-casi: destinazione e corpo della richiesta, rifiuto definitivo non ritentato e senza token
-nel messaggio, taglio del messaggio sopra i 4096 caratteri e invio di tutte le parti,
-lettura delle credenziali), `DealMessageTests` (4 casi: contenuto, ripiego sul prezzo
-senza CP confrontabile, occasioni contate e non elencate, filtri dichiarati) e due casi in
-`MarketDbTests` per la retention delle segnalazioni e l'idempotenza della registrazione.
+registrate, ricerca senza risposta, ricerca senza occasioni), `TelegramNotifierTests` (9
+casi: destinazione e corpo della richiesta, `parse_mode` dichiarato, ripiego senza markup
+su un rifiuto di parsing e nessun ripiego su un rifiuto di altro tipo, rifiuto definitivo
+non ritentato e senza token nel messaggio, taglio del messaggio sopra i 4096 caratteri e
+invio di tutte le parti, lettura delle credenziali), `DealMessageTests` (6 casi: contenuto,
+layout per intero, ripiego sul prezzo senza CP confrontabile, occasioni contate e non
+elencate, filtri dichiarati, nome item sfuggito), `MarkdownV2Tests` (3 casi: caratteri
+speciali, testo che non ne ha, entità code) e due casi in `MarketDbTests` per la retention
+delle segnalazioni e l'idempotenza della registrazione.
 
 **Resta aperto, in prospettiva** (non necessario a chiudere questa voce): non c'è un tetto
 al numero di messaggi di una singola esecuzione — l'elenco è limitato da `--top`, ma la

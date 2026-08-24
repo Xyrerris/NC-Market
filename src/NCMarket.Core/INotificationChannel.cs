@@ -1,10 +1,16 @@
 namespace NCMarket.Core;
 
 /// <summary>
-/// Somewhere a message can be delivered. The alerts are one-way and text-only — a job
-/// that found something says so, and nothing answers back — so this is the whole
-/// contract, and adding a second destination (Discord, a webhook of one's own) means
-/// implementing it, not touching what decides that there is something to say.
+/// Somewhere a message can be delivered. The alerts are one-way — a job that found
+/// something says so, and nothing answers back — so this is the whole contract, and
+/// adding a second destination (Discord, a webhook of one's own) means implementing it,
+/// not touching what decides that there is something to say.
+/// <para>
+/// The text is Telegram MarkdownV2 (see <see cref="DealMessage"/>): bold, italics and
+/// code spans, with every value escaped. A destination that speaks something else has to
+/// translate or strip it, which is the price of a message that reads as more than one
+/// grey block on a phone.
+/// </para>
 /// </summary>
 public interface INotificationChannel
 {
