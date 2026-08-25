@@ -150,7 +150,10 @@ public static class SnapshotCsvExporter
             writer.Write(Escape(fields[i], separator));
         }
 
-        writer.WriteLine();
+        // CRLF, not Environment.NewLine: RFC 4180 ends a record with CRLF, and a bare LF
+        // would be indistinguishable from a newline quoted inside a field when the export
+        // runs on Linux. The file has to read the same wherever it was written.
+        writer.Write("\r\n");
     }
 
     /// <summary>RFC 4180 quoting: quote fields containing the separator, quotes or newlines.</summary>

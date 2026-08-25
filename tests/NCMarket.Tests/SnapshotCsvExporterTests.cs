@@ -59,8 +59,10 @@ public sealed class SnapshotCsvExporterTests
             writer, Snapshot(), products, itemNames ?? NameProvider.Empty, NameProvider.Empty,
             separator);
 
+        // Il file finisce ogni record con CRLF ovunque venga scritto, quindi tagliare le
+        // righe qui non dipende dalla piattaforma e un a capo dentro un campo resta dentro.
         return (rows, writer.ToString()
-            .Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries));
+            .Split("\r\n", StringSplitOptions.RemoveEmptyEntries));
     }
 
     /// <summary>
