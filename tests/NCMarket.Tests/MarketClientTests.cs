@@ -59,6 +59,124 @@ public sealed class MarketClientTests
     }
 
     /// <summary>
+    /// The filters go on the wire in the one shape the service actually binds: the
+    /// parameter repeated once per value. This is pinned rather than trusted because the
+    /// two shapes one would otherwise write fail in opposite ways — <c>itemIds=1,2</c> is
+    /// refused with a 422, while <c>itemIds[]=1</c> is answered 200 and <em>ignored</em>,
+    /// which is the whole unfiltered market wearing the shape of a filtered answer
+    /// (measured against b.9capi.com on 2026-08-25).
+    /// </summary>
+    [Fact]
+    public async Task A_filter_repeats_its_parameter_once_per_value()
+    {
+        var handler = Answering(Page());
+        using var http = new HttpClient(handler);
+        using var client = new MarketClient(Planet.Heimdall, http);
+
+        await client.GetProductsPageAsync(
+            EquipmentType.Ring, limit: 5, offset: 0, order: "cp_desc",
+            filter: new ListingFilter
+            {
+                ItemIds = new[] { 10181000, 10182000 },
+                IconIds = new[] { 10181000 },
+                Custom = false,
+            });
+
+        Assert.Equal(
+            $"{RingsUrl}?limit=5&offset=0&order=cp_desc" +
+            "&itemIds=10181000&itemIds=10182000&iconIds=10181000&isCustom=false",
+            handler.Urls[0]);
+    }
+
+    /// <summary>
+    /// Excluding custom craft is a filter, not the absence of one: <c>false</c> has to
+    /// reach the query string, or asking for the ordinary pieces would quietly return
+    /// both populations.
+    /// </summary>
+    [Fact]
+    public async Task Excluding_custom_craft_reaches_the_query_string()
+    {
+        var handler = Answering(Page());
+        using var http = new HttpClient(handler);
+        using var client = new MarketClient(Planet.Heimdall, http);
+
+        await client.GetProductsPageAsync(
+            EquipmentType.Ring, limit: 5, offset: 0,
+            filter: new ListingFilter { Custom = false });
+
+        Assert.EndsWith("&isCustom=false", handler.Urls[0], StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The combination the service mishandles never reaches it. Asked for ids together
+    /// with <c>isCustom=true</c> it drops the ids and answers with every custom-crafted
+    /// piece of the sub type — measured on b.9capi.com, where <c>itemIds=10181000</c>
+    /// alone returns item 10181000 and the same request plus <c>isCustom=true</c>
+    /// returns 20160003 and 20160004. That is an unfiltered answer wearing the shape of
+    /// a filtered one, so the request is refused instead of sent.
+    /// </summary>
+    [Fact]
+    public async Task Ids_asked_together_with_custom_craft_are_refused_not_sent()
+    {
+        var handler = Answering(Page());
+        using var http = new HttpClient(handler);
+        using var client = new MarketClient(Planet.Heimdall, http);
+
+        var error = await Assert.ThrowsAsync<ArgumentException>(
+            () => client.GetProductsPageAsync(
+                EquipmentType.Ring, limit: 5, offset: 0,
+                filter: new ListingFilter
+                {
+                    ItemIds = new[] { 10181000 },
+                    Custom = true,
+                }));
+
+        Assert.Empty(handler.Urls);
+        Assert.Contains("isCustom", error.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The other direction combines, and has to keep combining: excluding custom craft
+    /// from a question about one item is the ordinary way to ask it.
+    /// </summary>
+    [Fact]
+    public async Task Ids_asked_without_custom_craft_are_a_valid_pair()
+    {
+        var handler = Answering(Page());
+        using var http = new HttpClient(handler);
+        using var client = new MarketClient(Planet.Heimdall, http);
+
+        await client.GetProductsPageAsync(
+            EquipmentType.Ring, limit: 5, offset: 0,
+            filter: new ListingFilter { ItemIds = new[] { 10181000 }, Custom = false });
+
+        Assert.EndsWith(
+            "&itemIds=10181000&isCustom=false", handler.Urls[0], StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And it travels with every page of a walk, not only the first. A filter dropped
+    /// after page one would fill the answer with listings that do not match it, in an
+    /// order that makes the mixture look deliberate.
+    /// </summary>
+    [Fact]
+    public async Task A_filter_travels_with_every_page_of_the_walk()
+    {
+        var handler = Answering(Page(Id(1), Id(2)), Page(Id(3)));
+        using var http = new HttpClient(handler);
+        using var client = new MarketClient(Planet.Heimdall, http);
+
+        await client.GetAllProductsAsync(
+            EquipmentType.Ring, pageSize: 2,
+            filter: new ListingFilter { ItemIds = new[] { 10181000 } });
+
+        Assert.Equal(2, handler.Urls.Count);
+        Assert.All(
+            handler.Urls,
+            url => Assert.Contains("&itemIds=10181000", url, StringComparison.Ordinal));
+    }
+
+    /// <summary>
     /// A caller that already identified itself keeps its own name: the client adds a user
     /// agent, it does not impose one.
     /// </summary>

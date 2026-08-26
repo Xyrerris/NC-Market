@@ -1,4 +1,5 @@
 using System.Net;
+using System.Text;
 using System.Text.Json;
 using NCMarket.Core.Models;
 
@@ -52,19 +53,25 @@ public sealed class MarketClient : IMarketListingSource, IDisposable
     }
 
     /// <summary>
-    /// Fetches a single page of listings for the given equipment type. Only transient
-    /// failures (5xx, 408, 429, transport errors, timeouts) are retried; a definitive
-    /// answer such as 400 or 404 fails immediately, reporting its status code.
+    /// Fetches a single page of listings for the given equipment type, narrowed by
+    /// <paramref name="filter"/> when one is given. Only transient failures (5xx, 408,
+    /// 429, transport errors, timeouts) are retried; a definitive answer such as 400 or
+    /// 404 fails immediately, reporting its status code.
     /// </summary>
     public async Task<MarketProductsPage> GetProductsPageAsync(
         EquipmentType type,
         int limit,
         int offset,
         string order = "unit_price",
+        ListingFilter? filter = null,
         CancellationToken ct = default)
     {
-        var url = $"{_baseUrl}/Market/products/items/{(int)type}" +
-                  $"?limit={limit}&offset={offset}&order={Uri.EscapeDataString(order)}";
+        var query = new StringBuilder($"{_baseUrl}/Market/products/items/{(int)type}")
+            .Append("?limit=").Append(limit)
+            .Append("&offset=").Append(offset)
+            .Append("&order=").Append(Uri.EscapeDataString(order));
+        filter?.AppendTo(query);
+        var url = query.ToString();
 
         var lastError = default(Exception);
         for (var attempt = 0; attempt < 3; attempt++)
@@ -113,20 +120,22 @@ public sealed class MarketClient : IMarketListingSource, IDisposable
     }
 
     /// <summary>
-    /// Fetches all listings for the given equipment type, paginating automatically.
-    /// The <c>totalCount</c> field is not populated by current deployments (always 0),
-    /// so pagination stops on the first short or empty page instead. Results are
-    /// de-duplicated by product id; the progress callback receives (fetched, totalCount)
-    /// where totalCount may be 0 (unknown). The default order is <c>cp_desc</c> because
-    /// the service does not use a stable secondary sort key: orders with many tied values
-    /// (e.g. <c>unit_price</c>) shuffle ties between requests, causing pages to overlap
-    /// and listings to be skipped, while combat point values are almost always distinct.
+    /// Fetches all listings for the given equipment type — or all those that pass
+    /// <paramref name="filter"/> — paginating automatically. The <c>totalCount</c> field
+    /// is not populated by current deployments (always 0), so pagination stops on the
+    /// first short or empty page instead. Results are de-duplicated by product id; the
+    /// progress callback receives (fetched, totalCount) where totalCount may be 0
+    /// (unknown). The default order is <c>cp_desc</c> because the service does not use a
+    /// stable secondary sort key: orders with many tied values (e.g. <c>unit_price</c>)
+    /// shuffle ties between requests, causing pages to overlap and listings to be
+    /// skipped, while combat point values are almost always distinct.
     /// </summary>
     public async Task<IReadOnlyList<ItemProduct>> GetAllProductsAsync(
         EquipmentType type,
         string order = "cp_desc",
         int pageSize = 1000,
         int? maxItems = null,
+        ListingFilter? filter = null,
         Action<int, int>? progress = null,
         CancellationToken ct = default)
     {
@@ -137,7 +146,7 @@ public sealed class MarketClient : IMarketListingSource, IDisposable
 
         while (maxItems is null || results.Count < maxItems.Value)
         {
-            var page = await GetProductsPageAsync(type, pageSize, offset, order, ct);
+            var page = await GetProductsPageAsync(type, pageSize, offset, order, filter, ct);
             if (page.ItemProducts.Count == 0)
             {
                 break;

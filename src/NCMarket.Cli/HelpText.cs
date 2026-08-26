@@ -23,6 +23,14 @@ internal static class HelpText
                                               crystal_per_price, crystal_per_price_desc)
                        --limit <n>           default: 20
                        --offset <n>          default: 0
+                       --item-ids <id[,id]>  solo gli item indicati (es. 10181000, la
+                                             Transcendent Sword di elemento Fire)
+                       --icon-ids <id[,id]>  solo le icone indicate
+                       --custom true|false   solo i pezzi da custom craft (true) o solo
+                                             gli altri (false); default: entrambi.
+                                             'true' non si combina con --item-ids e
+                                             --icon-ids: il servizio li ignorerebbe, e i
+                                             pezzi da custom craft hanno id propri
                        --details             scheda completa per inserzione: statistiche
                                              (ATK, HP, DEF, ...) base e bonus, skill con
                                              probabilità/potenza, cristalli, venditore
@@ -114,6 +122,7 @@ internal static class HelpText
         Esempi:
           ncmarket fetch --type weapon --order price --limit 10
           ncmarket fetch --type ring --order cp_desc --limit 5 --details
+          ncmarket fetch --type weapon --item-ids 10181000 --custom false
           ncmarket snapshot --planet odin
           ncmarket history --item 10152001
           ncmarket stats --type ring --top 20

@@ -23,12 +23,44 @@ internal static class ConsoleReport
     public static string Scope(EquipmentType? type) =>
         type is null ? "tutti gli equipaggiamenti" : type.Value.ToString();
 
+    /// <summary>
+    /// Describes the narrowing the market service applied, as a suffix of the header
+    /// line. A filtered answer that reads like an unfiltered one is the mistake this
+    /// prevents — the same reason <c>deals</c> spells out its own filters.
+    /// </summary>
+    public static string Scope(ListingFilter filter)
+    {
+        if (filter.IsEmpty)
+        {
+            return "";
+        }
+
+        var parts = new List<string>(3);
+        if (filter.ItemIds.Count > 0)
+        {
+            parts.Add("item " + string.Join(", ", filter.ItemIds.Select(id => id.ToString(Culture))));
+        }
+
+        if (filter.IconIds.Count > 0)
+        {
+            parts.Add("icona " + string.Join(", ", filter.IconIds.Select(id => id.ToString(Culture))));
+        }
+
+        if (filter.Custom is bool custom)
+        {
+            parts.Add(custom ? "solo custom craft" : "senza custom craft");
+        }
+
+        return " — " + string.Join(" · ", parts);
+    }
+
     // ------------------------------------------------------------------ fetch
 
     public static void Listings(
         Planet planet,
         EquipmentType type,
         string order,
+        ListingFilter filter,
         MarketProductsPage page,
         NameProvider names,
         NameProvider skillNames,
@@ -38,7 +70,8 @@ internal static class ConsoleReport
             ? $"{page.TotalCount} inserzioni totali"
             : $"prime {page.ItemProducts.Count} inserzioni";
         Console.WriteLine(
-            $"Mercato {planet.Name} — {type} — {totalInfo}, ordinate per '{order}':");
+            $"Mercato {planet.Name} — {type} — {totalInfo}, " +
+            $"ordinate per '{order}'{Scope(filter)}:");
         Console.WriteLine();
 
         if (page.ItemProducts.Count == 0)

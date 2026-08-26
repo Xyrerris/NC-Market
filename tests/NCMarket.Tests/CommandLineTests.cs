@@ -113,6 +113,28 @@ public sealed class CommandLineTests
     }
 
     [Fact]
+    public void Fetch_accepts_the_filters_the_service_applies()
+    {
+        var options = Parse(
+            "fetch", "--type", "weapon", "--item-ids", "10181000,10182000", "--custom", "true");
+
+        Assert.Equal("10181000,10182000", options.GetValueOrDefault("item-ids"));
+        Assert.Equal("true", options.GetValueOrDefault("custom"));
+    }
+
+    /// <summary>
+    /// The service documents <c>stat</c> alongside <c>itemIds</c> and <c>iconIds</c>, and
+    /// it narrows nothing: an unknown value is answered 200 with the full listing. An
+    /// option that silently does not apply is what this parser exists to prevent, so
+    /// <c>--stat</c> is not one — asking for it is an error, not a filter.
+    /// </summary>
+    [Fact]
+    public void The_filter_the_service_ignores_is_not_an_option()
+    {
+        Assert.Contains("--stat", Reject("fetch", "--stat", "ATK"), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Notify_test_takes_no_options_at_all()
     {
         Parse("notify-test");

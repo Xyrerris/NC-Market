@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using NCMarket.Cli;
 using NCMarket.Core;
@@ -65,7 +66,7 @@ catch (Exception e)
 
 async Task<int> FetchAsync()
 {
-    if (!TryGetType(required: true, out var type))
+    if (!TryGetType(required: true, out var type) || !TryGetFilter(out var filter))
     {
         return 2;
     }
@@ -78,10 +79,11 @@ async Task<int> FetchAsync()
     var skillNames = await LoadSkillNamesAsync();
 
     using var client = new MarketClient(planet);
-    var page = await client.GetProductsPageAsync(type!.Value, limit, offset, order);
+    var page = await client.GetProductsPageAsync(type!.Value, limit, offset, order, filter);
 
     ConsoleReport.Listings(
-        planet, type.Value, order, page, names, skillNames, options.ContainsKey("details"));
+        planet, type.Value, order, filter, page, names, skillNames,
+        options.ContainsKey("details"));
     return 0;
 }
 
@@ -491,6 +493,78 @@ bool TryGetTypes(out EquipmentType[] types)
     }
 
     types = wanted.Distinct().ToArray();
+    return true;
+}
+
+/// I filtri che il market service applica oltre al tipo nella rotta.
+bool TryGetFilter(out ListingFilter filter)
+{
+    filter = ListingFilter.None;
+
+    if (!TryGetIds("item-ids", out var itemIds) || !TryGetIds("icon-ids", out var iconIds))
+    {
+        return false;
+    }
+
+    bool? custom = null;
+    if (options.TryGetValue("custom", out var raw))
+    {
+        if (!bool.TryParse(raw, out var wanted))
+        {
+            Console.Error.WriteLine(
+                $"Valore non valido per '--custom': '{raw}'. Valori ammessi: true, false.");
+            return false;
+        }
+
+        custom = wanted;
+    }
+
+    filter = new ListingFilter { ItemIds = itemIds, IconIds = iconIds, Custom = custom };
+
+    // Prima di scaricare i nomi e di interrogare il servizio: la combinazione che il
+    // market service non sa rispondere si riconosce senza chiedergliela.
+    filter.Validate();
+    return true;
+}
+
+/// Elenco di id separati da virgola, come '--types' e '--grade' per i loro valori.
+bool TryGetIds(string key, out int[] ids)
+{
+    ids = Array.Empty<int>();
+    if (!options.TryGetValue(key, out var raw))
+    {
+        return true;
+    }
+
+    var wanted = new List<int>();
+    var tokens = raw.Split(
+        ',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    foreach (var token in tokens)
+    {
+        if (!int.TryParse(token, NumberStyles.Integer, CultureInfo.InvariantCulture, out var id)
+            || id <= 0)
+        {
+            Console.Error.WriteLine(
+                $"Id non valido per '--{key}': '{token}'. Gli id sono numeri interi " +
+                "positivi separati da virgola (es. --item-ids 10181000,10182000).");
+            return false;
+        }
+
+        wanted.Add(id);
+    }
+
+    // Un filtro vuoto non restringe nulla: '--item-ids ,,' passerebbe per un filtro
+    // applicato e restituirebbe l'intero sottotipo, che è il modo in cui questa API
+    // sbaglia già da sé (vedi ListingFilter).
+    if (wanted.Count == 0)
+    {
+        Console.Error.WriteLine(
+            $"L'opzione '--{key}' non indica alcun id: indicane almeno uno oppure ometti " +
+            "l'opzione.");
+        return false;
+    }
+
+    ids = wanted.Distinct().ToArray();
     return true;
 }
 

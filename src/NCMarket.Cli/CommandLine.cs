@@ -18,7 +18,11 @@ internal sealed class CommandLine
 
     private static readonly Dictionary<string, string[]> ByVerb = new(StringComparer.Ordinal)
     {
-        ["fetch"] = new[] { "planet", "type", "order", "limit", "offset", "details", "no-names" },
+        ["fetch"] = new[]
+        {
+            "planet", "type", "order", "limit", "offset", "item-ids", "icon-ids", "custom",
+            "details", "no-names",
+        },
         ["snapshot"] = new[] { "planet", "db", "types", "max-per-type" },
         ["snapshots"] = new[] { "planet", "db" },
         ["history"] = new[] { "planet", "db", "item", "no-names" },

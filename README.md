@@ -46,7 +46,26 @@ Note operative rilevate sul servizio in produzione:
   al ~77% e alcune inserzioni vengono saltate. Per gli snapshot NC-Market pagina quindi
   con `cp_desc` (Combat Point quasi sempre distinti: sovrapposizione misurata 0%);
 - pagine da 1000 elementi sono un buon compromesso (5000 richiede ~96 s e rischia
-  timeout); su Odin le sole Weapon contano ~60.000 inserzioni.
+  timeout); su Odin le sole Weapon contano ~60.000 inserzioni;
+- la rotta accetta anche i filtri `itemIds`, `iconIds` e `isCustom`, che **restringono
+  davvero** il risultato, e li lega dal parametro **ripetuto una volta per valore**
+  (`itemIds=10181000&itemIds=10182000`). Le altre due forme sbagliano in versi opposti:
+  `itemIds=1,2` viene rifiutata con `422`, mentre `itemIds[]=1` riceve `200` ed è
+  **ignorata** — cioè restituisce l'intero listino con l'aspetto di una risposta
+  filtrata;
+- `isCustom=true` **sovrascrive** `itemIds` e `iconIds`: chiesti insieme, gli id spariscono
+  e la risposta è l'intero listino dei pezzi da custom craft (`itemIds=10181000` da solo
+  restituisce l'item 10181000; con `isCustom=true` restituisce 20160003 e 20160004). Non è
+  un capriccio del servizio: un pezzo da custom craft ha un id suo — la gamma `2016…`
+  invece della `1018…` di una Transcendent ordinaria — quindi "questo item, ma custom" non
+  nomina niente. NC-Market rifiuta la combinazione invece di spedirla; `isCustom=false`
+  con gli id si combina regolarmente;
+- il filtro `stat`, che la documentazione del servizio elenca accanto ai precedenti,
+  **non restringe nulla** su questo deployment: né per nome (`stat=ATK`, `stat=Thorn`)
+  né per valore numerico di `StatType`, né sotto `statType` o `stats`, e un valore
+  inesistente come `stat=PIPPO` riceve `200` con il listino intero. Per questo NC-Market
+  non lo espone: un'opzione che non si applica in silenzio è ciò che la validazione della
+  riga di comando esiste per impedire. (Misure del 2026-08-25 su `b.9capi.com`.)
 
 I prezzi sono espressi in **NCG**. I nomi di item e skill vengono risolti scaricando (con
 cache locale) i file `item_name.csv` e `skill_name.csv` dal repo ufficiale del client
@@ -75,6 +94,7 @@ NC-Market/
 │   │   ├── EquipmentType.cs    Enum equipaggiamenti + parsing
 │   │   ├── Models/             DTO della risposta del market service
 │   │   ├── MarketClient.cs     Client HTTP con paginazione automatica
+│   │   ├── ListingFilter.cs    Filtri che il servizio applica alla query (item, icona, custom)
 │   │   ├── IMarketListingSource.cs  Astrazione del listino corrente (la implementa MarketClient)
 │   │   ├── ICaptureProgress.cs Avanzamento di una cattura, riportato mentre avviene
 │   │   ├── SnapshotService.cs  Orchestrazione di 'snapshot': cattura, salva, finalizza
@@ -215,6 +235,11 @@ dotnet run --project src/NCMarket.Cli -- fetch --type weapon --order price --lim
 # Scheda completa per inserzione: tutte le statistiche e il dettaglio delle skill
 # (categoria, elemento, probabilità, potenza, cooldown)
 dotnet run --project src/NCMarket.Cli -- fetch --type ring --order cp_desc --limit 5 --details
+
+# Solo un item preciso: 10181000 è la Transcendent Sword di elemento Fire. Il filtro
+# è applicato dal servizio, quindi la risposta costa una pagina invece dell'intero
+# sottotipo; --custom false esclude i pezzi da custom craft
+dotnet run --project src/NCMarket.Cli -- fetch --type weapon --item-ids 10181000 --custom false
 
 # Storicizza il listino completo dei 5 equipaggiamenti su Heimdall (pianeta di default)
 dotnet run --project src/NCMarket.Cli -- snapshot
@@ -479,8 +504,10 @@ di fallire sul `VACUUM`.
   [Rilevazione delle vendite](#rilevazione-delle-vendite)). Resta da fare l'incrocio con
   le transazioni `BuyProduct` via 9cscan/mimir, che sostituirebbe l'euristica col dato
   reale.
-- **Filtri avanzati**: il servizio supporta anche `stat`, `itemIds[]`, `iconIds[]`,
-  `isCustom` sulla stessa rotta — esporli nella CLI.
+- **Filtri avanzati** ✅ — `fetch --item-ids`, `--icon-ids` e `--custom` passano al
+  servizio i filtri che applica sulla stessa rotta, così una domanda su un singolo item
+  costa una pagina e non un sottotipo intero. `stat` resta fuori: misurato, non
+  restringe nulla (vedi [Fonte dati](#fonte-dati)).
 
 ### Step 3 — Valutazioni (obiettivo finale)
 - **Motore di pricing**: prezzo equo stimato per item/level/opzioni sulla base della
