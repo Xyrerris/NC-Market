@@ -282,7 +282,7 @@ e il piano di query che passa da `ix_listings_valuation` e non da `ix_listings_b
 
 ---
 
-## F3 — Parser del messaggio
+## F3 — Parser del messaggio ✅ FATTO
 
 **Dove**: `src/NCMarket.Core/ValuationRequestParser.cs` (nuovo),
 `src/NCMarket.Core/ValuationMessage.cs` (nuovo)
@@ -325,13 +325,57 @@ filtro che non si applica.
 Gli errori nominano il token e dicono cosa manca. "Non ho capito" non è un messaggio
 d'errore, è una scrollata di spalle.
 
-**Fatto quando**: il parser legge il messaggio d'esempio in qualunque ordine di righe e
-produce l'eco.
+**Fatto**: `ValuationRequestParser.TryParse(messaggio, pianeta, out query, out errore)`,
+nella forma che `CommandLine.TryParse` usa già — un messaggio storto è un errore che nomina
+il token, non un'eccezione da catturare nel ciclo di polling — e `ValuationMessage.Echo`
+per l'eco. La mappa degli alias si costruisce leggendo `GameEnums.StatTypeName` sui valori
+1-64 e scartando quelli che rispondono `StatNN`: è così che la scansione distingue una stat
+vera da una casella vuota, ed è perché una stat aggiunta domani a quello switch è già
+parsabile senza toccare il parser. Sei decisioni che il piano lasciava aperte:
 
-**Verificato da**: `ValuationRequestParserTests` — ordine invertito, tutto su una riga,
-separatori nelle tre forme, alias e sinonimi, `si`/`sì`/`yes`/`no`, skill assente = no,
-livello assente = +0, elemento assente respinto, numero nudo respinto, stat sconosciuta
-respinta nominandola, più di quattro opzioni respinte, testo dell'eco per intero.
+- **il pianeta è un parametro, non un token.** Il messaggio descrive un pezzo, non dove
+  cercarlo: il pianeta lo sa la chat, e su un altro pianeta ci si sposta col bottone di F5
+  senza riscrivere niente. Un `odin` scritto nel messaggio è quindi un token non
+  riconosciuto, che è la risposta onesta finché quel bottone non c'è;
+- **l'eco chiama il tipo `Weapon`, non `Sword`.** L'esempio del piano scriveva l'alias
+  ricevuto, ma un'eco che restituisce la parola di chi scrive non conferma niente, e
+  `Sword` suggerirebbe per giunta che l'item è stato identificato — cioè esattamente ciò
+  che una valutazione senza `item_id` non può fare. `Weapon` è anche il nome che stampano
+  già `deals` e la tabella di console;
+- **i numeri escono nel formato del progetto**, `CP 151,216,255`, non nel formato del
+  gioco da cui sono entrati. Il parser accetta tutte e tre le grafie perché è il gioco a
+  mostrarne una; l'eco ne stampa una sola, la stessa di un alert e di un CSV, perché due
+  formati di numero nella stessa chat sono la deriva che la regola invariante esiste per
+  impedire;
+- **zero opzioni è un pezzo, non un errore.** L'input diceva "1-4", ma un pezzo senza
+  opzioni esiste e `ValuationKey` lo prevede: rifiutarlo per intercettare le righe di
+  opzione che non sono arrivate rifiuterebbe anche la domanda legittima. A distinguere i
+  due casi è l'eco, che scrive *senza opzioni* — che è il mestiere dell'eco, non del
+  parser;
+- **`skill` da solo vale sì, e un sì/no isolato si lega in avanti.** Nessuno scrive la
+  parola *skill* per dire che il pezzo non ce l'ha, e `con skill` / `senza skill` sono le
+  parole con cui l'eco stessa lo dice: un'eco che non si può rimandare indietro corretta è
+  una conversazione a senso unico. Un sì/no che non si lega a niente resta un errore che
+  nomina il token;
+- **il valore di una stat è facoltativo.** Serve a essere consumato — è ciò che impedisce
+  a `1.404.374` di ricadere nella regola del numero nudo — ma non entra nella chiave e
+  viene buttato: `ATK DEF HIT` descrive lo stesso bucket di `ATK 1.404.374 DEF …`, e
+  rifiutarlo sarebbe una richiesta di dati che non vengono usati.
+
+**Verificato da**: `ValuationRequestParserTests` — messaggio d'esempio letto campo per
+campo, ordine delle righe invertito, tutto su una riga, separatori nelle tre forme, valore
+dell'opzione consumato e buttato nelle quattro forme, alias e sinonimi (compreso uno preso
+da `GameEnums` e mai scritto nel parser), `si`/`sì`/`yes`/`no`/`con`/`senza` e `skill` da
+solo, custom craft nelle sue grafie, stessa stat due volte che è una sola, pezzo senza
+opzioni, `Normal` che riempie il campo ancora libero, pianeta del parametro, elemento
+assente respinto nominando gli elementi, rarità e tipo assenti nominati insieme, numero
+nudo respinto con l'errore che nomina i tre modi in cui poteva essere scritto, stat sconosciuta respinta per
+nome, più di quattro opzioni respinte, campo risposto due volte respinto invece che
+sovrascritto, parola chiave senza il suo valore, messaggio vuoto che riceve un esempio.
+`ValuationMessageTests` — testo dell'eco per intero, i campi mai scritti che ci sono lo
+stesso, *senza opzioni*, custom craft che appare solo quando c'è, il tipo che è `Weapon` e
+non l'alias ricevuto, il CP che rientra nella grafia del progetto da tutte e tre le sue, la
+rarità senza nome mostrata col numero.
 
 ---
 
