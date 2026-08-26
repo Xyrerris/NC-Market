@@ -99,6 +99,87 @@ public enum BaselinePopulation
 public sealed record ListingOutcomes(int Total, int Open, int LikelySold, int LikelyWithdrawn);
 
 /// <summary>
+/// What became of a single listing, by the same heuristic
+/// <see cref="MarketDb.GetPriceBaselines"/> applies to a whole bucket:
+/// <see cref="ListingOutcomes"/> is the count of these.
+/// </summary>
+public enum ListingOutcome
+{
+    /// <summary>Still on sale, or its disappearance is not observable yet.</summary>
+    Open,
+
+    /// <summary>Gone from the market at a price compatible with a sale.</summary>
+    LikelySold,
+
+    /// <summary>Gone from the market well above the going rate, so more likely pulled.</summary>
+    LikelyWithdrawn,
+}
+
+/// <summary>
+/// One listing comparable to the piece being valued, reduced to what an answer is made
+/// of. <see cref="ItemId"/> and <see cref="ProductId"/> are carried so that a widened
+/// bucket can be taken apart — a range from 11 to 333 NCG is unusable until the 333 can
+/// be seen for the outlier it is.
+/// </summary>
+public sealed record ComparableListing(
+    Guid ProductId,
+    int ItemId,
+    int Level,
+    ElementalType Element,
+    double Price,
+    int CombatPoint,
+    DateTime LastSeenAtUtc,
+    ListingOutcome Outcome);
+
+/// <summary>
+/// The comparables of a bucket, with the classification split of the whole bucket. The
+/// split covers every listing matched, not only the population a caller keeps: it is what
+/// says how much a <see cref="BaselinePopulation.Sold"/> answer can be trusted, and a
+/// caller that filtered first would have nothing left to judge it by.
+/// </summary>
+public sealed record ComparableSet(
+    ListingOutcomes Outcomes,
+    IReadOnlyList<ComparableListing> Listings);
+
+/// <summary>
+/// Which listings count as comparable. Every field left null is a filter not applied,
+/// which is exactly how the widening ladder of <see cref="ValuationService"/> climbs: it
+/// drops fields rather than replacing the query.
+/// </summary>
+public sealed record ComparableFilter
+{
+    /// <summary>Equipment sub type. Always filtered: nothing compares across it.</summary>
+    public required EquipmentType Type { get; init; }
+
+    /// <summary>lib9c grade (rarity). Always filtered, for the same reason.</summary>
+    public required int Grade { get; init; }
+
+    /// <summary>Element; null merges all five.</summary>
+    public ElementalType? Element { get; init; }
+
+    /// <summary>Enhancement level; null merges every level.</summary>
+    public int? Level { get; init; }
+
+    /// <summary>
+    /// Exact set of option stat types the listing must carry (lib9c <c>StatType</c>
+    /// values); null does not constrain the options. Mutually exclusive with
+    /// <see cref="OptionStatCount"/>, which is the looser form of the same filter.
+    /// </summary>
+    public IReadOnlySet<int>? OptionStats { get; init; }
+
+    /// <summary>
+    /// Number of distinct option stat types the listing must carry, whichever they are.
+    /// </summary>
+    public int? OptionStatCount { get; init; }
+
+    /// <summary>Whether the listing must carry a skill; null does not constrain it.</summary>
+    public bool? HasSkill { get; init; }
+
+    /// <summary>Whether the listing must be custom craft; null merges both populations.</summary>
+    public bool? ByCustomCraft { get; init; }
+}
+
+/// <summary>
 /// The baselines of a query together with the population they were measured on, so a
 /// caller can state what it is comparing against instead of implying it.
 /// </summary>
@@ -280,6 +361,14 @@ public sealed class MarketDb : IDisposable
             CREATE INDEX IF NOT EXISTS ix_listings_baseline ON listings(
                 planet, last_seen_at_utc, item_id, level, option_count,
                 price, combat_point, item_sub_type, last_seen_snapshot_id);
+
+            -- Filter columns of GetComparables, the query behind a valuation. It cannot
+            -- cover that query and is not meant to: the option stats live inside
+            -- stats_json, which no index can reach, so the rows are visited anyway. What
+            -- it does is cut the visit down to a bucket — five small columns, not the
+            -- second doubling of the database that ix_listings_baseline cost.
+            CREATE INDEX IF NOT EXISTS ix_listings_valuation ON listings(
+                planet, item_sub_type, grade, elemental_type, level);
             """);
     }
 
@@ -975,11 +1064,237 @@ public sealed class MarketDb : IDisposable
     }
 
     /// <summary>
+    /// The listings comparable to a piece described from the outside (see
+    /// <see cref="ValuationKey"/>), each classified the way
+    /// <see cref="GetPriceBaselines"/> classifies the members of a bucket: gone from the
+    /// market below the going rate is a likely sale, gone well above it a likely
+    /// withdrawal, everything else still open. The two paths share
+    /// <see cref="GetCoverageFrontier"/> and the ask-median comparison rather than each
+    /// keeping a copy, because two copies of one heuristic drift.
+    /// <para>
+    /// Which listings match is decided in two places, and it has to be: the sub type, the
+    /// grade, the element and the level are columns, so SQL narrows the table down to a
+    /// bucket through <c>ix_listings_valuation</c>; the option stats and the skill live
+    /// inside <c>stats_json</c> and <c>skills_json</c>, which no index reaches, so they
+    /// are matched in memory over the rows that survived. A bucket is tens of listings,
+    /// which is what makes the second half affordable.
+    /// </para>
+    /// <para>
+    /// The result is ordered by price, cheapest first.
+    /// </para>
+    /// </summary>
+    /// <param name="sinceUtc">
+    /// Keep a listing only when it was still on sale within the window, i.e. its last
+    /// sighting falls inside it. Null uses the whole history.
+    /// </param>
+    public ComparableSet GetComparables(
+        string planet,
+        ComparableFilter filter,
+        DateTime? sinceUtc = null,
+        double saleMarginPercent = DefaultSaleMarginPercent)
+    {
+        if (filter.OptionStats is not null && filter.OptionStatCount is not null)
+        {
+            // The looser filter would swallow the stricter one without a trace, and the
+            // caller would get an answer to a question it did not ask.
+            throw new ArgumentException(
+                "Un filtro sui comparabili porta l'insieme delle stat-opzione oppure il " +
+                "loro numero, non entrambi.",
+                nameof(filter));
+        }
+
+        var matched = ReadComparables(planet, filter, sinceUtc);
+        if (matched.Count == 0)
+        {
+            return new ComparableSet(
+                new ListingOutcomes(0, 0, 0, 0), Array.Empty<ComparableListing>());
+        }
+
+        var frontier = GetCoverageFrontier(planet);
+        var tolerated = 1 + saleMarginPercent / 100;
+
+        var scratch = new List<double>(matched.Count);
+        foreach (var row in matched)
+        {
+            scratch.Add(row.Listing.Price);
+        }
+
+        var medianAsk = Median(scratch);
+
+        int open = 0, likelySold = 0, likelyWithdrawn = 0;
+        var listings = new List<ComparableListing>(matched.Count);
+        foreach (var row in matched)
+        {
+            ListingOutcome outcome;
+            if (!frontier.TryGetValue(row.SubType, out var lastProof)
+                || lastProof <= row.LastSeenSnapshotId)
+            {
+                outcome = ListingOutcome.Open;
+                open++;
+            }
+            else if (medianAsk > 0 && row.Listing.Price > medianAsk * tolerated)
+            {
+                outcome = ListingOutcome.LikelyWithdrawn;
+                likelyWithdrawn++;
+            }
+            else
+            {
+                outcome = ListingOutcome.LikelySold;
+                likelySold++;
+            }
+
+            listings.Add(row.Listing with { Outcome = outcome });
+        }
+
+        listings.Sort((a, b) => a.Price.CompareTo(b.Price));
+
+        return new ComparableSet(
+            new ListingOutcomes(matched.Count, open, likelySold, likelyWithdrawn),
+            listings);
+    }
+
+    /// <summary>One comparable, plus the two fields only the classification needs.</summary>
+    private readonly record struct ComparableRow(
+        ComparableListing Listing, int SubType, long LastSeenSnapshotId);
+
+    /// <summary>
+    /// The comparables query carrying only the filters that were actually asked for, for
+    /// the reason spelled out on <see cref="BaselineQuery"/>: <c>$p IS NULL OR col = $p</c>
+    /// is not sargable and would cost the index, and the widening ladder removes one
+    /// predicate at a time, so the constant-SQL form would be the wrong shape here twice
+    /// over.
+    /// </summary>
+    internal static string ComparableQuery(ComparableFilter filter, DateTime? sinceUtc)
+    {
+        var sql = new StringBuilder("""
+            SELECT product_id, item_id, level, elemental_type, price, combat_point,
+                   last_seen_at_utc, item_sub_type, last_seen_snapshot_id,
+                   stats_json, skills_json
+            FROM listings
+            WHERE planet = $planet
+              AND item_sub_type = $subType
+              AND grade = $grade
+            """);
+
+        if (filter.Element is not null)
+        {
+            sql.Append("\n  AND elemental_type = $elemental");
+        }
+
+        if (filter.Level is not null)
+        {
+            sql.Append("\n  AND level = $level");
+        }
+
+        if (filter.ByCustomCraft is not null)
+        {
+            sql.Append("\n  AND by_custom_craft = $custom");
+        }
+
+        if (sinceUtc is not null)
+        {
+            // The unary plus keeps this term out of index selection, and it has to. Left
+            // as a plain column reference, SQLite answers the whole query from
+            // ix_listings_baseline on (planet, last_seen_at_utc) — a range over every
+            // listing of the planet in the window, none of which it can rule out from the
+            // index, because neither the grade nor the element is in it. Hidden this way,
+            // the five equalities win, ix_listings_valuation cuts the visit down to the
+            // bucket, and the window is checked on the handful of rows left. A no-op on
+            // the value itself: same text, same comparison, same rows.
+            sql.Append("\n  AND +last_seen_at_utc >= $since");
+        }
+
+        return sql.Append(';').ToString();
+    }
+
+    /// <summary>
+    /// The rows matching <paramref name="filter"/>, unclassified. The JSON columns are
+    /// deserialized only when a filter needs them: the skills of a bucket are read when
+    /// the skill is asked about and never otherwise.
+    /// </summary>
+    private List<ComparableRow> ReadComparables(
+        string planet, ComparableFilter filter, DateTime? sinceUtc)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = ComparableQuery(filter, sinceUtc);
+        cmd.Parameters.AddWithValue("$planet", planet);
+        cmd.Parameters.AddWithValue("$subType", (int)filter.Type);
+        cmd.Parameters.AddWithValue("$grade", filter.Grade);
+
+        if (filter.Element is not null)
+        {
+            cmd.Parameters.AddWithValue("$elemental", (int)filter.Element.Value);
+        }
+
+        if (filter.Level is not null)
+        {
+            cmd.Parameters.AddWithValue("$level", filter.Level.Value);
+        }
+
+        if (filter.ByCustomCraft is not null)
+        {
+            cmd.Parameters.AddWithValue("$custom", filter.ByCustomCraft.Value ? 1 : 0);
+        }
+
+        if (sinceUtc is not null)
+        {
+            cmd.Parameters.AddWithValue(
+                "$since", sinceUtc.Value.ToString("O", CultureInfo.InvariantCulture));
+        }
+
+        var matchesOptions = filter.OptionStats is not null || filter.OptionStatCount is not null;
+
+        var rows = new List<ComparableRow>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            if (matchesOptions)
+            {
+                var options = ValuationKey.OptionStatsOf(DeserializeOrEmpty<StatModel>(reader, 9));
+                if (filter.OptionStats is not null && !options.SetEquals(filter.OptionStats))
+                {
+                    continue;
+                }
+
+                if (filter.OptionStatCount is not null && options.Count != filter.OptionStatCount)
+                {
+                    continue;
+                }
+            }
+
+            if (filter.HasSkill is not null
+                && DeserializeOrEmpty<SkillModel>(reader, 10).Count > 0 != filter.HasSkill.Value)
+            {
+                continue;
+            }
+
+            rows.Add(new ComparableRow(
+                new ComparableListing(
+                    Guid.Parse(reader.GetString(0)),
+                    reader.GetInt32(1),
+                    reader.GetInt32(2),
+                    (ElementalType)reader.GetInt32(3),
+                    reader.GetDouble(4),
+                    reader.GetInt32(5),
+                    ParseUtc(reader.GetString(6)),
+                    ListingOutcome.Open),
+                reader.GetInt32(7),
+                reader.GetInt64(8)));
+        }
+
+        return rows;
+    }
+
+    /// <summary>
     /// Per equipment type, the id of the most recent snapshot of a planet that is proof
     /// of what was on sale: complete, untruncated, and covering that type. A listing
     /// last seen before its type's frontier is gone from the market; one last seen at or
     /// after it may simply still be listed. Types never captured that way are absent
     /// from the map, so nothing about them is inferred.
+    /// <para>
+    /// Shared by <see cref="GetPriceBaselines"/> and <see cref="GetComparables"/>: what
+    /// counts as proof that a listing left the market is one decision, not two.
+    /// </para>
     /// </summary>
     private Dictionary<int, long> GetCoverageFrontier(string planet)
     {

@@ -471,6 +471,170 @@ public sealed class MarketDbTests
                 "COVERING INDEX ix_listings_baseline", StringComparison.Ordinal));
     }
 
+    /// <summary>A grade-8 weapon, the piece the valuation of the plan is about.</summary>
+    private static ItemProduct Weapon(
+        decimal price = 100m,
+        ElementalType element = ElementalType.Fire,
+        int level = 0,
+        int grade = 8,
+        int[]? options = null,
+        bool skill = true) =>
+        TestData.Product(
+            itemId: 10181000,
+            level: level,
+            price: price,
+            grade: grade,
+            itemSubType: (int)EquipmentType.Weapon,
+            elementalType: (int)element,
+            optionStats: options ?? new[] { 2, 3 },
+            hasSkill: skill);
+
+    private static ComparableFilter WeaponFilter(
+        ElementalType? element = ElementalType.Fire, int? level = 0) =>
+        new()
+        {
+            Type = EquipmentType.Weapon,
+            Grade = 8,
+            Element = element,
+            Level = level,
+        };
+
+    /// <summary>
+    /// The columns of the bucket. Everything a valuation compares against comes from this
+    /// query, so what it lets through is what an answer is made of: another element at
+    /// grade 8 is another item, another grade another price scale, another planet another
+    /// market.
+    /// </summary>
+    [Fact]
+    public void GetComparables_collects_the_triple_and_nothing_around_it()
+    {
+        using var temp = new TempDatabase();
+        using var db = temp.Open();
+
+        TestData.AddCompleteSnapshot(db, Now, new[]
+        {
+            Weapon(price: 10m),
+            Weapon(price: 20m),
+            Weapon(price: 900m, element: ElementalType.Water),
+            Weapon(price: 900m, grade: 7),
+            Weapon(price: 900m, level: 7),
+            TestData.Product(
+                price: 900m, grade: 8, itemSubType: (int)EquipmentType.Ring,
+                elementalType: (int)ElementalType.Fire, optionStats: new[] { 2, 3 },
+                hasSkill: true),
+        }, types: new[] { EquipmentType.Weapon, EquipmentType.Ring });
+
+        TestData.AddCompleteSnapshot(
+            db, Now, new[] { Weapon(price: 900m) }, planet: "odin",
+            types: new[] { EquipmentType.Weapon });
+
+        var comparables = db.GetComparables("heimdall", WeaponFilter());
+
+        Assert.Equal(new[] { 10d, 20d }, comparables.Listings.Select(l => l.Price));
+        Assert.Equal(2, comparables.Outcomes.Total);
+        Assert.All(comparables.Listings, l => Assert.Equal(ElementalType.Fire, l.Element));
+    }
+
+    /// <summary>
+    /// The options are the one part of the key no index can reach: they are matched by
+    /// reading <c>stats_json</c> back on the rows the SQL already narrowed down.
+    /// </summary>
+    [Fact]
+    public void GetComparables_matches_the_options_out_of_the_json()
+    {
+        using var temp = new TempDatabase();
+        using var db = temp.Open();
+
+        TestData.AddCompleteSnapshot(db, Now, new[]
+        {
+            Weapon(price: 10m, options: new[] { 2, 3 }),
+            Weapon(price: 900m, options: new[] { 2, 5 }),
+            Weapon(price: 900m, options: new[] { 2, 3, 5 }),
+            Weapon(price: 900m, options: new[] { 2 }),
+            Weapon(price: 20m, options: new[] { 2, 3 }, skill: false),
+        }, types: new[] { EquipmentType.Weapon });
+
+        var exact = db.GetComparables(
+            "heimdall",
+            WeaponFilter() with { OptionStats = new HashSet<int> { 3, 2 }, HasSkill = true });
+
+        // The looser form of the same filter: the stats may differ, their number may not.
+        var byCount = db.GetComparables(
+            "heimdall", WeaponFilter() with { OptionStatCount = 2 });
+
+        Assert.Equal(new[] { 10d }, exact.Listings.Select(l => l.Price));
+        Assert.Equal(new[] { 10d, 20d, 900d }, byCount.Listings.Select(l => l.Price));
+    }
+
+    /// <summary>
+    /// The two forms of the option filter are one question asked twice, and the looser one
+    /// would swallow the stricter without a trace. Same rule as <c>deals --dicount</c>:
+    /// what does not apply is an error, not a silent no-op.
+    /// </summary>
+    [Fact]
+    public void A_comparables_filter_carries_the_option_set_or_its_size_but_not_both()
+    {
+        using var temp = new TempDatabase();
+        using var db = temp.Open();
+
+        Assert.Throws<ArgumentException>(() => db.GetComparables(
+            "heimdall",
+            WeaponFilter() with { OptionStats = new HashSet<int> { 2 }, OptionStatCount = 1 }));
+    }
+
+    [Fact]
+    public void GetComparables_keeps_the_listings_still_on_sale_inside_the_window()
+    {
+        using var temp = new TempDatabase();
+        using var db = temp.Open();
+
+        TestData.AddCompleteSnapshot(
+            db, Now.AddDays(-30), new[] { Weapon(price: 900m) },
+            types: new[] { EquipmentType.Weapon });
+        TestData.AddCompleteSnapshot(
+            db, Now, new[] { Weapon(price: 10m) }, types: new[] { EquipmentType.Weapon });
+
+        var window = db.GetComparables("heimdall", WeaponFilter(), Now.AddDays(-7));
+        var everything = db.GetComparables("heimdall", WeaponFilter());
+
+        Assert.Equal(new[] { 10d }, window.Listings.Select(l => l.Price));
+        Assert.Equal(2, everything.Listings.Count);
+    }
+
+    /// <summary>
+    /// Unlike the baseline query this one cannot be covered — <c>stats_json</c> has to be
+    /// read from the table — so what the index has to do is cut the visit down to a
+    /// bucket. The window is where that goes wrong: written plainly, the range on
+    /// <c>last_seen_at_utc</c> sends SQLite to <c>ix_listings_baseline</c> and the whole
+    /// planet's recent listings get visited one by one, which nothing about the answer
+    /// would reveal. Hence the window here, and hence the second assertion.
+    /// </summary>
+    [Fact]
+    public void The_comparables_of_a_bucket_are_found_through_the_valuation_index()
+    {
+        using var temp = new TempDatabase();
+        using var db = temp.Open();
+        TestData.AddCompleteSnapshot(
+            db, Now, new[] { Weapon() }, types: new[] { EquipmentType.Weapon });
+
+        using var conn = temp.Connect();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText =
+            "EXPLAIN QUERY PLAN " + MarketDb.ComparableQuery(WeaponFilter(), Now.AddDays(-7));
+
+        var plan = new List<string>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            plan.Add(reader.GetString(reader.GetOrdinal("detail")));
+        }
+
+        Assert.Contains(
+            plan, line => line.Contains("ix_listings_valuation", StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            plan, line => line.Contains("ix_listings_baseline", StringComparison.Ordinal));
+    }
+
     private static long Scalar(SqliteConnection conn, string sql)
     {
         using var cmd = conn.CreateCommand();

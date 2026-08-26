@@ -132,7 +132,7 @@ combinazione impossibile.
 
 ---
 
-## F2 — `ValuationKey` e `ValuationService`
+## F2 — `ValuationKey` e `ValuationService` ✅ FATTO
 
 **Dove**: `src/NCMarket.Core/ElementalType.cs` (nuovo),
 `src/NCMarket.Core/Valuation.cs` (nuovo),
@@ -219,7 +219,7 @@ allarga di un passo e **registra quale**:
 |---|---|---|
 | 0 | chiave esatta | — |
 | 1 | senza elemento | *stimato su tutti gli elementi* |
-| 2 | livello riportato a +0 | *livelli diversi accorpati* |
+| 2 | senza livello | *livelli diversi accorpati* |
 | 3 | stesso numero di opzioni invece dello stesso insieme | *opzioni diverse dalle tue* |
 | 4 | solo tipo + grado + skill | *stima larga* |
 
@@ -234,15 +234,51 @@ la finestra temporale, e — se il CP è stato fornito — il percentile del pez
 comparabili. Nessun campo "prezzo stimato": non esiste un numero solo, e non averlo nel
 tipo impedisce a un chiamante di inventarselo.
 
-**Fatto quando**: dato un `ValuationQuery`, il servizio restituisce l'intervallo e il
-passo di allargamento, oppure dichiara che i dati non bastano.
+**Fatto**: `ElementalType` con `Elementals.TryParse` costruito invertendo
+`GameEnums.ElementalTypeName`; `ValuationKey` con uguaglianza strutturale scritta a mano —
+il compilatore confronterebbe l'insieme delle stat per riferimento, e due chiavi fatte
+delle stesse opzioni diventerebbero due bucket senza che niente lo mostri;
+`MarketDb.GetComparables` con l'indice `ix_listings_valuation`; `ValuationService.Evaluate`
+con la scala a cinque passi. Tre decisioni che il piano lasciava aperte:
 
-**Verificato da**: `ValuationServiceTests` — bucket esatto sufficiente, ogni passo della
-scala preso solo quando serve e sempre riportato, esaurimento della scala, ripiego da
-`Sold` a `Listed` dichiarato, percentile con e senza CP, insieme di stat che distingue
-due bucket, skill che distingue due bucket. `MarketDbTests` — comparabili raccolti per
-terna, filtro sulle opzioni dal JSON, uso del nuovo indice nel piano di query (come già
-fa il test su `ix_listings_baseline`), finestra temporale.
+- **il passo 2 accorpa i livelli, non li riporta a +0.** Le due letture della riga erano
+  in disaccordo fra la colonna del bucket e quella della dichiarazione; vince la seconda,
+  perché confrontare un +7 con dei +0 non è allargare il bucket ma cambiarlo. Ogni passo
+  toglie un predicato e contiene quello prima: è ciò che rende la scala una scala e
+  permette al passo, da solo, di dire cosa è stato lasciato cadere;
+- **il ripiego su `Listed` avviene prima di allargare, non dopo.** L'ordine inverso è la
+  lettura naturale — prima il bucket, poi la popolazione — ed è sbagliato oggi e per un
+  pezzo: con due snapshot nessuna inserzione risulta conclusa, quindi ogni domanda
+  riceverebbe una *stima larga* mentre il bucket esatto sta lì inutilizzato. Prezzi
+  richiesti del pezzo giusto dicono più di vendite di un pezzo all'incirca simile;
+- **la chiave nel risultato è il pezzo come è stato descritto**, non il bucket misurato:
+  una `ValuationKey` non sa dire "qualunque elemento". A dire cosa è stato allargato è il
+  passo, e i due insieme nominano il bucket esattamente.
+
+Sull'indice c'è una **misura che ha cambiato la query**. Con la finestra temporale scritta
+per esteso, `EXPLAIN QUERY PLAN` risponde
+`SEARCH listings USING INDEX ix_listings_baseline (planet=? AND last_seen_at_utc>?)`:
+`ix_listings_valuation` non viene mai usato e la valutazione visita una per una tutte le
+inserzioni recenti del pianeta, perché né il grado né l'elemento stanno in quell'indice.
+Il termine della finestra viaggia quindi come `+last_seen_at_utc >= $since` — il più unario
+lo tiene fuori dalla scelta dell'indice senza toccarne il valore — così vincono le cinque
+uguaglianze e la finestra si applica sulle poche righe rimaste. È lo stesso genere di
+errore di P2.7: un indice creato per una query che la query non usa, e nessun risultato
+sbagliato a segnalarlo.
+
+**Verificato da**: `ValuationServiceTests` — bucket esatto sufficiente, i quattro passi
+della scala presi uno alla volta solo quando servono e sempre riportati con la loro
+dichiarazione, esaurimento della scala che risponde `InsufficientData` senza intervallo,
+`Sold` misurato quando i campioni conclusi bastano e ripiego su `Listed` dichiarato al
+passo esatto quando non bastano, percentile con e senza CP e con comparabili senza CP,
+opzioni/skill/custom craft che tengono fuori dal bucket esatto una pila di inserzioni
+care, un altro pianeta che non è un passo della scala. `ValuationKeyTests` — la stat base
+che non è un'opzione, la stessa stat tirata due volte che è una sola, uguaglianza e hash
+strutturali, ogni campo che distingue due bucket. `MarketDbTests` — comparabili raccolti
+per terna (altro elemento, altro grado, altro tipo, altro pianeta esclusi), filtro sulle
+opzioni dal JSON nelle due forme, insieme e numero insieme rifiutati, finestra temporale,
+e il piano di query che passa da `ix_listings_valuation` e non da `ix_listings_baseline`.
+`ElementalsTests` — nomi, valori lib9c, e i nomi parsati che sono quelli mostrati.
 
 ---
 
