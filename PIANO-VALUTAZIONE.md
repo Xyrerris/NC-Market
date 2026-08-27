@@ -379,7 +379,7 @@ rarità senza nome mostrata col numero.
 
 ---
 
-## F4 — Il verbo `bot`
+## F4 — Il verbo `bot` ✅ FATTO
 
 **Dove**: `src/NCMarket.Core/TelegramBot.cs` (nuovo),
 `src/NCMarket.Core/TelegramUpdateSource.cs` (nuovo),
@@ -423,14 +423,75 @@ fallisce, e lo fa in un momento che non ha niente a che vedere con la causa.
 un processo lungo, quindi diventa il comando di default dell'immagine. Gli Scheduled Task
 di snapshot e deals restano dove sono.
 
-**Fatto quando**: il bot risponde con l'eco e l'intervallo a un messaggio da una chat
-autorizzata, ignora le altre, e sopravvive a un riavvio senza rileggere la coda.
+**Fatto**: `ncmarket bot`, `TelegramUpdateSource` (long polling di `getUpdates`, con la
+classificazione dei rifiuti: `409` a parte, definitivi a parte, ritentabili a parte) e
+`TelegramBot`, che è tutto ciò che esiste solo perché il processo sta in piedi per giorni —
+allowlist, limite di frequenza, offset in `bot_state`, e la regola che un messaggio storto
+non ferma il ciclo. La risposta è l'eco di F3 più `ValuationMessage.Answer`, cioè
+l'intervallo con i suoi campioni, la sua popolazione e la sua finestra. Sette decisioni che
+il piano lasciava aperte:
+
+- **il database si apre per messaggio e si chiude, invece che in sola lettura.** Le due
+  strade che il piano indicava non erano equivalenti: read-only non regge, perché l'offset
+  è una scrittura ed è proprio lo stato che il bot deve conservare; e `DbLock` è peggio del
+  problema che risolve, perché metterebbe le domande in coda dietro a uno snapshot da
+  trenta minuti — una risposta che non arriva è indistinguibile da un bot fermo. Aprire e
+  chiudere intorno a ogni messaggio costa millisecondi su una cosa che parte da una
+  persona, lascia il `VACUUM` libero, e la domanda che capita proprio lì dentro riceve
+  "riprova fra qualche secondo" invece di far cadere il processo;
+- **l'allowlist sostituisce la chat di destinazione, non la affianca.**
+  `NCMARKET_TELEGRAM_CHAT_ID` non serve a `bot`: un bot risponde a chi scrive, e pretendere
+  la variabile delle notifiche sarebbe una configurazione che non viene usata. Quindi
+  `TelegramOptions.ChatId` è diventato facoltativo e `TelegramNotifier` ha imparato a
+  scrivere a una chat data — una sola implementazione di `sendMessage`, con lo stesso
+  spezzettamento, gli stessi tentativi e lo stesso ripiego senza `parse_mode`;
+- **l'offset avanza anche sui messaggi a cui non si risponde**: chat fuori allowlist,
+  messaggi oltre il limite di frequenza, aggiornamenti senza testo, e perfino quelli la cui
+  gestione è finita in eccezione. Un messaggio letto è un messaggio consumato: l'alternativa
+  è che uno solo di essi blocchi la coda per sempre, e nulla di ciò che sta dietro venga mai
+  risposto;
+- **il limite di frequenza spiega il silenzio una volta per finestra**, poi tace. La
+  risposta a troppi messaggi non può essere altri messaggi, ma un silenzio senza causa fa
+  riscrivere;
+- **il testo della risposta è di F4, non di F5.** "Rispondere con l'eco e l'intervallo" non
+  si può fare senza dire l'intervallo: `ValuationMessage.Answer` scrive minimo, mediana e
+  massimo, i comparabili, la popolazione, la finestra, il passo di allargamento quando c'è e
+  il percentile quando il CP è stato dato. Resta a F5 ciò che F5 aggiunge davvero — i
+  bottoni, il flusso guidato e il markup;
+- **tutto il messaggio passa da `MarkdownV2.Escape` in un colpo solo.** È lecito
+  esattamente perché niente di ciò che scrive il mittente sopravvive nella risposta: ogni
+  pezzo viene da un enum parsato, da un numero o dal testo italiano di questo progetto,
+  quindi non c'è alcuna entità da spezzare. Il markup vero arriva con F5;
+- **gli aggiornamenti senza testo vengono restituiti, non scartati.** Una foto o un
+  ingresso in un gruppo non hanno risposta, ma buttarli nel lettore butterebbe anche il loro
+  id, che è l'unica cosa che li fa superare.
+
+Il modello di deploy è cambiato, ma **non** nel modo che il piano dava per scontato. Il
+piano diceva che il bot "diventa il comando di default dell'immagine"; farlo legherebbe i
+job al bot. Un processo lungo che esce su `409` o su un token rifiutato porterebbe via il
+container in cui gli Scheduled Task entrano con `docker exec`: un problema di credenziali
+Telegram fermerebbe gli snapshot, che con Telegram non c'entrano niente. Il default resta
+quindi `idle`, e la stessa immagine fa due ruoli scelti da `NCMARKET_ROLE`, in due risorse
+distinte sullo stesso volume. Restano un'immagine sola e un database solo: condividerlo è
+previsto, perché WAL, `busy_timeout` e il lock su `<database>.lock` valgono fra processi e
+quindi anche fra container.
+
+Ctrl+C e SIGTERM sono lo stesso ordine — l'uno di una persona, l'altro di Docker — e in
+entrambi i casi il ciclo esce dopo aver scritto l'offset dell'ultimo messaggio risposto.
 
 **Verificato da**: `TelegramBotTests` su un `HttpMessageHandler` finto, come già fa
-`TelegramNotifierTests` — chat fuori allowlist ignorata senza risposta, offset avanzato e
-riletto dopo un riavvio simulato, `409` riportato e non ritentato, limite di frequenza,
-dispatch dei comandi, errore del parser che diventa un messaggio e non un'eccezione che
-ferma il polling.
+`TelegramNotifierTests` — pezzo risposto con eco e intervallo, chat fuori allowlist
+ignorata senza risposta ma con l'offset avanzato, offset scritto e riletto da un secondo
+processo che riparte da lì, `409` riportato senza ritentare e senza il token nel messaggio,
+limite di frequenza con un solo avviso, dispatch dei comandi compresa la menzione
+`/valuta@NomeDelBot` di un gruppo, comando sconosciuto nominato, errore del parser che
+diventa un messaggio mentre il ciclo prosegue, aggiornamento senza testo che avanza
+l'offset in silenzio, errore di rete ritentato invece che fatale, risposta indirizzata alla
+chat che ha chiesto, allowlist assente che non fa partire il bot e id non numerico
+nominato. `ValuationMessageTests` — testo della risposta per intero, passo di allargamento
+dichiarato, percentile assente senza CP, dati insufficienti che dicono quanto hanno trovato
+e non danno alcun prezzo. `CommandLineTests` — le opzioni di `bot`, e le credenziali che
+non sono opzioni.
 
 ---
 
@@ -501,5 +562,5 @@ alla v1.
 |---|---|---|
 | ~~I filtri `itemIds[]`/`stat` non sono utilizzabili~~ | ~~F1~~ | Chiuso: `itemIds` funziona ed è ciò che serve alla risposta live; `stat` non funziona e non viene esposto |
 | Lo storico resta troppo corto | La stima vale quanto un listino | Il bot dichiara popolazione, campioni e finestra a ogni risposta |
-| Il bot tiene il database aperto | `prune` fallisce sul `VACUUM` | Connessione read-only e rilascio tra i messaggi (F4) |
+| ~~Il bot tiene il database aperto~~ | ~~`prune` fallisce sul `VACUUM`~~ | Chiuso: il bot apre il database per messaggio e lo richiude; una domanda che capita dentro un `VACUUM` riceve "riprova fra qualche secondo" (F4) |
 | Il testo libero resta fragile | Stime sbagliate che sembrano giuste | Eco dell'interpretazione (F3) e flusso guidato (F5) |

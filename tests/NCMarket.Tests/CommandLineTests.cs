@@ -135,6 +135,28 @@ public sealed class CommandLineTests
     }
 
     [Fact]
+    public void The_bot_takes_the_planet_and_the_two_knobs_of_a_valuation()
+    {
+        var options = Parse("bot", "--planet", "odin", "--days", "30", "--min-samples", "3");
+
+        Assert.Equal("odin", options.GetValueOrDefault("planet"));
+        Assert.Equal(30, options.GetInt("days", 0, min: 0));
+        Assert.Equal(3, options.GetInt("min-samples", 5, min: 1));
+    }
+
+    /// <summary>
+    /// Il token e l'allowlist sono variabili d'ambiente, come per le notifiche: una
+    /// credenziale passata come opzione finisce nella cronologia della shell e
+    /// nell'elenco dei processi della macchina.
+    /// </summary>
+    [Fact]
+    public void The_bot_does_not_take_its_credentials_on_the_command_line()
+    {
+        Assert.Contains(
+            "--token", Reject("bot", "--token", "123456:AA"), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Notify_test_takes_no_options_at_all()
     {
         Parse("notify-test");

@@ -220,6 +220,9 @@ public sealed class MarketDb : IDisposable
 
     private const long SchemaVersion = 4;
 
+    /// <summary>Row of <c>bot_state</c> holding the Telegram offset.</summary>
+    private const string TelegramOffsetKey = "telegram_offset";
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     private readonly SqliteConnection _conn;
@@ -339,6 +342,16 @@ public sealed class MarketDb : IDisposable
             CREATE TABLE IF NOT EXISTS notified_deals(
                 product_id TEXT PRIMARY KEY,
                 notified_at_utc TEXT NOT NULL
+            ) WITHOUT ROWID;
+
+            -- State of the long-running processes, one row per thing to remember. Today
+            -- the only one is the Telegram offset (see GetTelegramOffset), which has to
+            -- outlive the process or a restart rereads the queue of messages, or loses
+            -- it. Created here rather than by a migration, like notified_deals: it is
+            -- new, not changed, so any existing database acquires it on open.
+            CREATE TABLE IF NOT EXISTS bot_state(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             ) WITHOUT ROWID;
 
             CREATE INDEX IF NOT EXISTS ix_listings_planet_subtype ON listings(planet, item_sub_type);
@@ -1394,6 +1407,40 @@ public sealed class MarketDb : IDisposable
 
         tx.Commit();
         return recorded;
+    }
+
+    /// <summary>
+    /// The update the bot has to resume from — the id after the last one it answered —
+    /// or null on a database no bot has ever polled with.
+    /// <para>
+    /// It lives in the database and not in a file of its own because it is state of the
+    /// same deployment as everything else here: one volume to mount, one thing to back
+    /// up. What it buys is a restart that neither answers yesterday's messages a second
+    /// time nor drops the ones that arrived while the container was down.
+    /// </para>
+    /// </summary>
+    public long? GetTelegramOffset()
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT value FROM bot_state WHERE key = $key;";
+        cmd.Parameters.AddWithValue("$key", TelegramOffsetKey);
+        return cmd.ExecuteScalar() is string value
+               && long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var offset)
+            ? offset
+            : null;
+    }
+
+    /// <inheritdoc cref="GetTelegramOffset"/>
+    public void SetTelegramOffset(long offset)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO bot_state(key, value) VALUES($key, $value)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            """;
+        cmd.Parameters.AddWithValue("$key", TelegramOffsetKey);
+        cmd.Parameters.AddWithValue("$value", offset.ToString(CultureInfo.InvariantCulture));
+        cmd.ExecuteNonQuery();
     }
 
     /// <summary>

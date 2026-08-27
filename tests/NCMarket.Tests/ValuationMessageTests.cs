@@ -134,4 +134,91 @@ public sealed class ValuationMessageTests
             "Ho letto: grado 9 Weapon", ValuationMessage.Echo(Query(grade: 9)),
             StringComparison.Ordinal);
     }
+
+    /// <summary>
+    /// The answer of the example bucket: a range, its median, and every line that keeps
+    /// the range from being read as more than it is.
+    /// </summary>
+    [Fact]
+    public void The_answer_is_a_range_with_what_it_was_measured_on()
+    {
+        var answer = ValuationMessage.Answer(Query(), Result());
+
+        Assert.Equal(
+            """
+            💰 11.00 NCG – 333.00 NCG · mediana 41.00 NCG
+            📊 7 comparabili · prezzi richiesti · heimdall · visti dal 2026-08-14 al 2026-08-24
+            📈 Il CP del pezzo sta nel 60° percentile del gruppo
+            ⚠️ Prezzi richiesti: è quanto si chiede, non quanto si paga
+            """,
+            answer);
+    }
+
+    /// <summary>
+    /// A widened bucket and an exact one look identical unless the answer says which is
+    /// which — and the key cannot say it, because a key has no way to mean "any element".
+    /// </summary>
+    [Fact]
+    public void A_widened_bucket_declares_what_was_given_up()
+    {
+        var answer = ValuationMessage.Answer(
+            Query(), Result() with { Step = ValuationStep.AnyElement });
+
+        Assert.Contains(
+            "🔎 Bucket allargato: stimato su tutti gli elementi", answer,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Without a combat point the piece cannot be placed among its comparables, and the
+    /// line is left out rather than guessed at.
+    /// </summary>
+    [Fact]
+    public void Without_a_combat_point_there_is_no_percentile_line()
+    {
+        var answer = ValuationMessage.Answer(
+            Query(combatPoint: null), Result() with { CpPercentile = null });
+
+        Assert.DoesNotContain("percentile", answer, StringComparison.Ordinal);
+        Assert.Contains("mediana", answer, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// No range at all, and the count of what the widest bucket did find: "two listings"
+    /// and "nothing whatsoever" are different answers, and neither of them is a price.
+    /// </summary>
+    [Fact]
+    public void Not_enough_data_says_how_far_it_got_and_gives_no_range()
+    {
+        var answer = ValuationMessage.Answer(
+            Query(),
+            Result() with
+            {
+                Status = ValuationStatus.InsufficientData,
+                Step = ValuationStep.TypeAndGrade,
+                Comparables = 2,
+                Prices = null,
+            });
+
+        Assert.Contains("2 inserzioni sulle 5 che servono", answer, StringComparison.Ordinal);
+        Assert.DoesNotContain("NCG", answer, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The bucket of the plan: seven listings between 11 and 333 NCG around a median of
+    /// 41, measured on asking prices because nothing has been observed to conclude yet.
+    /// </summary>
+    private static ValuationResult Result() =>
+        new(ValuationStatus.Ok,
+            Query().Key,
+            ValuationStep.Exact,
+            Comparables: 7,
+            BaselinePopulation.Listed,
+            PopulationFallback: false,
+            new ListingOutcomes(7, 7, 0, 0),
+            new PriceRange(11, 24, 41, 120, 333),
+            new DateTime(2026, 8, 14, 9, 0, 0, DateTimeKind.Utc),
+            new DateTime(2026, 8, 24, 9, 0, 0, DateTimeKind.Utc),
+            CpPercentile: 60,
+            Array.Empty<ComparableListing>());
 }

@@ -1,14 +1,38 @@
 #!/bin/sh
 # Entrypoint del container NC-Market.
 #
-#   idle          il container resta vivo senza fare nulla: e' la modalita' usata
-#                 dagli Scheduled Task di Coolify, che eseguono i comandi via
-#                 `docker exec` dentro un container gia' in esecuzione.
+#   idle          comando di default: il container resta vivo senza fare nulla,
+#                 in attesa degli Scheduled Task di Coolify, che eseguono i
+#                 comandi al suo interno via `docker exec`.
+#   bot           il bot Telegram resta in ascolto e risponde alle chat
+#                 autorizzate. E' un processo lungo, quindi e' il processo del
+#                 container: se esce (token sbagliato, 409) esce il container.
 #   <comando>     qualsiasi altra cosa viene passata alla CLI, cosi' che
 #                 `docker run <immagine> snapshot --planet odin` funzioni.
+#
+# La stessa immagine serve percio' due risorse distinte, e a sceglierne il ruolo
+# e' NCMARKET_ROLE=idle|bot. Tenerle separate e' il punto: i job non devono
+# fermarsi perche' il bot non riesce a parlare con Telegram.
 set -e
 
+if [ "$#" -eq 0 ] || [ "$1" = "idle" ]; then
+  set -- "${NCMARKET_ROLE:-idle}"
+fi
+
 case "$1" in
+  bot)
+    shift
+    # Con argomenti espliciti valgono quelli; senza, pianeta e opzioni arrivano
+    # dall'ambiente come per gli altri job.
+    if [ "$#" -gt 0 ]; then
+      exec ncmarket bot "$@"
+    fi
+
+    # Volutamente non quotata: e' l'unico modo di passare piu' opzioni da una
+    # sola variabile d'ambiente.
+    # shellcheck disable=SC2086
+    exec ncmarket bot --planet "${NCMARKET_PLANET:-heimdall}" ${NCMARKET_BOT_ARGS:-}
+    ;;
   idle)
     echo "NC-Market pronto. In attesa degli Scheduled Task (dati in ${XDG_DATA_HOME:-/data}/NCMarket)."
     exec sleep infinity

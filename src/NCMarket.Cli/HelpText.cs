@@ -86,6 +86,19 @@ internal static class HelpText
                      Invia un messaggio di prova sul canale di notifica: verifica token e
                      chat senza aspettare la prima occasione
 
+          bot        Resta in ascolto su Telegram e risponde "quanto vale questo pezzo?"
+                     a chi scrive dalle chat autorizzate. È l'unico comando che non
+                     termina da sé: si ferma con Ctrl+C o con lo stop del container
+                       --days <n>            finestra storica in giorni per le
+                                             valutazioni (default: tutto lo storico)
+                       --min-samples <n>     comparabili minimi prima che il bucket
+                                             venga allargato di un passo, default: 5
+                     Il messaggio descrive il pezzo come lo si legge sull'oggetto —
+                     'Transcendent Sword Fire +7 / ATK 1.404.374 / skill si' — con le
+                     righe in ordine libero; il bot risponde con come lo ha letto e con
+                     l'intervallo di prezzo dei comparabili, dichiarando su quanti
+                     campioni e su quale popolazione
+
           export     Esporta uno snapshot in CSV flat: una riga per inserzione,
                      statistiche in colonne <stat>_base/<stat>_bonus e skill in
                      colonne skill1_*/skill2_*
@@ -107,11 +120,19 @@ internal static class HelpText
                                    (default: %LOCALAPPDATA%\NCMarket\ncmarket.db)
           --no-names               non risolvere i nomi di item e skill
 
-        Notifiche (deals --notify, notify-test) — configurate da variabili d'ambiente e
-        non da opzioni, perché un token di bot è una credenziale e le opzioni finiscono
+        Telegram (deals --notify, notify-test, bot) — configurato da variabili d'ambiente
+        e non da opzioni, perché un token di bot è una credenziale e le opzioni finiscono
         nella cronologia della shell e nell'elenco dei processi:
           NCMARKET_TELEGRAM_TOKEN     token del bot, da @BotFather
-          NCMARKET_TELEGRAM_CHAT_ID   chat di destinazione (negativo per gruppi e canali)
+          NCMARKET_TELEGRAM_CHAT_ID   chat di destinazione delle notifiche (negativo per
+                                      gruppi e canali)
+          NCMARKET_TELEGRAM_ALLOWED_CHATS
+                                      solo per 'bot': elenco di id, separati da virgola,
+                                      delle chat a cui rispondere (es. 123456789 oppure
+                                      123456789,-1001234567890). Obbligatoria — un bot in
+                                      ascolto risponderebbe altrimenti a chiunque ne trovi
+                                      lo username. I messaggi dalle altre chat vengono
+                                      ignorati in silenzio
 
         Ogni comando accetta soltanto le proprie opzioni: un'opzione sconosciuta, ripetuta
         o priva di valore fa terminare la CLI con codice 2 senza eseguire nulla.
@@ -133,6 +154,8 @@ internal static class HelpText
           ncmarket deals --type ring --from-snapshot --min-samples 3
           ncmarket notify-test
           ncmarket deals --from-snapshot --discount 30 --notify
+          ncmarket bot
+          ncmarket bot --planet odin --days 30
           ncmarket export --type weapon --sep ;
           ncmarket export --snapshot 2 --out listino.csv
           ncmarket prune --dry-run

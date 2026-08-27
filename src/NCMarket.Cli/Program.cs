@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Text;
 using NCMarket.Cli;
 using NCMarket.Core;
@@ -34,6 +35,7 @@ try
         "export" => await ExportAsync(),
         "prune" => Prune(),
         "notify-test" => await NotifyTestAsync(),
+        "bot" => await BotAsync(),
         _ => throw new InvalidOperationException(
             $"Comando '{verb}' dichiarato in CommandLine ma non implementato."),
     };
@@ -291,6 +293,77 @@ async Task<int> NotifyTestAsync()
     Console.WriteLine($"Messaggio di prova inviato su {notifier.Name}.");
     return 0;
 }
+
+/// Il bot Telegram: l'unico comando che non finisce da sé. Gli altri fanno una cosa e
+/// tornano; questo sta in piedi finché non lo si ferma, e tutto ciò che ha di diverso —
+/// allowlist, limite di frequenza, offset che sopravvive a un riavvio — esiste per quel
+/// motivo (vedi TelegramBot).
+async Task<int> BotAsync()
+{
+    // Prima di tutto il resto: un bot senza allowlist non deve partire, e scoprirlo
+    // trovandolo aperto a Internet è il modo peggiore di leggere quella riga.
+    if (!TelegramBotOptions.TryFromEnvironment(out var botOptions, out var botError))
+    {
+        Console.Error.WriteLine(botError);
+        return 2;
+    }
+
+    var planet = GetPlanet();
+    var days = options.GetInt("days", 0, min: 0);
+    var defaults = new ValuationDefaults
+    {
+        Planet = planet,
+        MinSamples = options.GetInt("min-samples", 5, min: 1),
+        Days = days > 0 ? days : null,
+    };
+
+    var dbPath = DbPath();
+
+    // Il database si apre all'avvio per dire subito se non si apre — e si richiude:
+    // il bot ne apre uno per messaggio, perché una connessione tenuta per giorni
+    // farebbe fallire il VACUUM del prune settimanale.
+    using (var db = OpenDb())
+    {
+        Console.WriteLine($"Database: {db.DbPath}");
+    }
+
+    using var http = new HttpClient
+    {
+        Timeout = botOptions!.PollTimeout + TimeSpan.FromSeconds(30),
+    };
+    using var updates = new TelegramUpdateSource(botOptions.Token, botOptions.PollTimeout, http);
+    using var replies = new TelegramNotifier(new TelegramOptions { Token = botOptions.Token }, http);
+
+    using var stopping = new CancellationTokenSource();
+
+    // Ctrl+C in mano a una persona, SIGTERM in mano a Docker: sono lo stesso ordine, e
+    // in entrambi i casi conviene che l'offset dell'ultimo messaggio risposto sia già
+    // scritto invece che perso con il processo.
+    Console.CancelKeyPress += (_, e) =>
+    {
+        e.Cancel = true;
+        stopping.Cancel();
+    };
+    using var sigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, context =>
+    {
+        context.Cancel = true;
+        stopping.Cancel();
+    });
+
+    var bot = new TelegramBot(
+        botOptions, updates, replies, () => new MarketDb(dbPath), defaults, BotLog);
+
+    await bot.RunAsync(stopping.Token);
+    BotLog("Fermato.");
+    return 0;
+}
+
+/// Le righe che il bot lascia sul log del container: datate, perché l'unica domanda che
+/// ci si fa leggendole è quando è successo.
+void BotLog(string message) =>
+    Console.WriteLine(
+        DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) +
+        "Z  " + message);
 
 async Task<int> ExportAsync()
 {

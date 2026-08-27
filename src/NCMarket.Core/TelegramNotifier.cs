@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net;
 using System.Text;
 using System.Text.Json;
@@ -25,7 +26,13 @@ public sealed record TelegramOptions
 
     public required string Token { get; init; }
 
-    public required string ChatId { get; init; }
+    /// <summary>
+    /// Chat the alerts go to. Null for the bot of <see cref="TelegramBot"/>, which has
+    /// none: it answers whoever wrote to it, so the destination is a property of the
+    /// message and not of the configuration. <see cref="TryFromEnvironment"/> still
+    /// requires it, because a job that announces has to know where.
+    /// </summary>
+    public string? ChatId { get; init; }
 
     /// <summary>
     /// Reads the configuration from the environment. Returns false — naming the variables
@@ -76,7 +83,7 @@ public sealed record TelegramOptions
 /// machine running the job needs no public address, no inbound port and no certificate.
 /// </para>
 /// </summary>
-public sealed class TelegramNotifier : INotificationChannel, IDisposable
+public sealed class TelegramNotifier : INotificationChannel, IReplyChannel, IDisposable
 {
     /// <summary>
     /// Characters Telegram accepts in one message. A longer text is not truncated by the
@@ -124,7 +131,25 @@ public sealed class TelegramNotifier : INotificationChannel, IDisposable
     /// Telegram refused the message (wrong token, unknown chat, a bot the recipient never
     /// started) or kept failing after three attempts.
     /// </exception>
-    public async Task SendAsync(string message, CancellationToken ct = default)
+    public Task SendAsync(string message, CancellationToken ct = default) =>
+        SendAsync(
+            message,
+            _options.ChatId
+            ?? throw new InvalidOperationException(
+                "Questo canale non ha una chat di destinazione: è stato costruito per " +
+                "rispondere a chi scrive (vedi TelegramBot), non per annunciare."),
+            ct);
+
+    /// <summary>
+    /// Sends the message to <paramref name="chatId"/>, which is how the bot answers the
+    /// chat that asked: same splitting, same retries, same fallback to unparsed text as
+    /// an alert, because none of that has anything to do with who is being written to.
+    /// </summary>
+    /// <inheritdoc cref="SendAsync(string, CancellationToken)"/>
+    public Task SendAsync(long chatId, string message, CancellationToken ct = default) =>
+        SendAsync(message, chatId.ToString(CultureInfo.InvariantCulture), ct);
+
+    private async Task SendAsync(string message, string chatId, CancellationToken ct)
     {
         var parts = Split(message, MaxMessageLength);
         for (var i = 0; i < parts.Count; i++)
@@ -134,7 +159,7 @@ public sealed class TelegramNotifier : INotificationChannel, IDisposable
                 await Task.Delay(PartDelay, ct);
             }
 
-            await PostAsync(parts[i], ct);
+            await PostAsync(parts[i], chatId, ct);
         }
     }
 
@@ -208,7 +233,7 @@ public sealed class TelegramNotifier : INotificationChannel, IDisposable
         return parts;
     }
 
-    private async Task PostAsync(string text, CancellationToken ct)
+    private async Task PostAsync(string text, string chatId, CancellationToken ct)
     {
         var url = $"https://api.telegram.org/bot{_options.Token}/sendMessage";
         var delay = TimeSpan.FromSeconds(1);
@@ -227,7 +252,7 @@ public sealed class TelegramNotifier : INotificationChannel, IDisposable
             {
                 var form = new Dictionary<string, string>
                 {
-                    ["chat_id"] = _options.ChatId,
+                    ["chat_id"] = chatId,
                     ["text"] = text,
                     ["disable_web_page_preview"] = "true",
                 };

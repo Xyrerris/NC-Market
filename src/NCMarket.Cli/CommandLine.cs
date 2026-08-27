@@ -34,6 +34,12 @@ internal sealed class CommandLine
             "notify",
         },
         ["export"] = new[] { "planet", "db", "snapshot", "type", "out", "sep", "no-names" },
+
+        // The bot answers questions about one planet against the history of one database.
+        // Token and allowlist are environment variables, for the reason notify-test
+        // states: a bot token is a bearer credential, and an allowlist passed on a command
+        // line ends up in the process list of the machine.
+        ["bot"] = new[] { "planet", "db", "days", "min-samples" },
         ["prune"] = new[] { "db", "days", "dry-run" },
 
         // The credentials of the notification channel are environment variables, not

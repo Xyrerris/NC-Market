@@ -79,6 +79,112 @@ public static class ValuationMessage
     }
 
     /// <summary>
+    /// The valuation itself: a range, what it was measured on, and what had to be given
+    /// up to measure it. There is no single price anywhere in it, because
+    /// <see cref="ValuationResult"/> does not carry one — inside a bucket the price
+    /// follows neither the combat point nor the option values, so a number would be a
+    /// precision nobody measured.
+    /// <para>
+    /// Every line after the range is there to keep the range from being read as more than
+    /// it is: how many listings are behind it, whether those are sales or asking prices,
+    /// how far the bucket had to be widened. With a database of two snapshots the honest
+    /// answer is nearly always "this is what people ask", and a bot that said so only in
+    /// its documentation would be a bot that never says so.
+    /// </para>
+    /// </summary>
+    public static string Answer(ValuationQuery query, ValuationResult result)
+    {
+        if (result.Status != ValuationStatus.Ok || result.Prices is null)
+        {
+            return Insufficient(query, result);
+        }
+
+        var prices = result.Prices;
+        var sb = new StringBuilder("💰 ")
+            .Append(Ncg(prices.Min))
+            .Append(" – ")
+            .Append(Ncg(prices.Max))
+            .Append(" · mediana ")
+            .Append(Ncg(prices.Median))
+            .Append('\n');
+
+        sb.Append("📊 ")
+          .Append(result.Comparables.ToString("N0", Culture))
+          .Append(result.Comparables == 1 ? " comparabile · " : " comparabili · ")
+          .Append(PopulationName(result.Population))
+          .Append(" · ")
+          .Append(query.Planet.Name)
+          .Append(Window(result));
+
+        if (result.Step != ValuationStep.Exact)
+        {
+            // The key in the result is the piece as it was described, not the bucket that
+            // was measured: only the step knows what was given up, so only the step can
+            // say it.
+            sb.Append("\n🔎 Bucket allargato: ").Append(result.StepDeclaration);
+        }
+
+        if (result.CpPercentile is int percentile)
+        {
+            sb.Append("\n📈 Il CP del pezzo sta nel ")
+              .Append(percentile.ToString(Culture))
+              .Append("° percentile del gruppo");
+        }
+
+        if (result.Population == BaselinePopulation.Listed)
+        {
+            sb.Append("\n⚠️ ")
+              .Append(result.PopulationFallback
+                  ? "Vendite osservate troppo poche: è quanto si chiede, non quanto si paga"
+                  : "Prezzi richiesti: è quanto si chiede, non quanto si paga");
+        }
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// What is said when the whole ladder was not enough. It reports what the widest
+    /// bucket did find, because "two listings" and "none at all" are different answers —
+    /// and neither of them is a range: one invented on two samples reads exactly like one
+    /// measured on fifty.
+    /// </summary>
+    private static string Insufficient(ValuationQuery query, ValuationResult result) =>
+        "🤷 Non ho abbastanza dati per questo pezzo. Anche allargando fino alla stima " +
+        "larga (stesso tipo, stessa rarità, stessa presenza di skill) ho trovato " +
+        result.Comparables.ToString("N0", Culture) +
+        (result.Comparables == 1 ? " inserzione" : " inserzioni") +
+        " sulle " + query.MinSamples.ToString("N0", Culture) + " che servono.\n" +
+        "La risposta arriva da sé man mano che lo storico si allunga: il meccanismo c'è, " +
+        "i campioni no.";
+
+    /// <summary>
+    /// When the comparables were last seen. Those dates are most of what says whether a
+    /// range can be trusted, and they are written the way the rest of the project writes
+    /// them.
+    /// </summary>
+    private static string Window(ValuationResult result)
+    {
+        if (result.OldestSeenUtc is not DateTime oldest
+            || result.NewestSeenUtc is not DateTime newest)
+        {
+            return "";
+        }
+
+        var from = oldest.ToString("yyyy-MM-dd", Culture);
+        var to = newest.ToString("yyyy-MM-dd", Culture);
+        return from == to ? $" · visti il {from}" : $" · visti dal {from} al {to}";
+    }
+
+    /// <summary>
+    /// What the range was measured on, in the words that keep the difference visible: a
+    /// sale and an asking price are not the same claim about a piece.
+    /// </summary>
+    private static string PopulationName(BaselinePopulation population) =>
+        population == BaselinePopulation.Sold ? "vendite stimate" : "prezzi richiesti";
+
+    private static string Ncg(double price) => price.ToString("N2", Culture) + " NCG";
+
+    /// <summary>
     /// The options, named and counted. A piece with none is a piece the parser was told
     /// nothing about, and saying so is what lets the reader notice that the four lines
     /// they typed did not arrive.

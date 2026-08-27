@@ -104,6 +104,13 @@ NC-Market/
 │   │   ├── MarkdownV2.cs       Escaping di MarkdownV2, la sintassi che Telegram interpreta
 │   │   ├── INotificationChannel.cs  Astrazione del canale di notifica
 │   │   ├── TelegramNotifier.cs Invio su Telegram (Bot API) e lettura delle credenziali
+│   │   ├── TelegramUpdateSource.cs  Lettura dei messaggi scritti al bot (long polling)
+│   │   ├── TelegramBot.cs      Il bot: allowlist, limite di frequenza, offset, dispatch
+│   │   ├── ElementalType.cs    Enum elementi (Normal, Fire, Water, Land, Wind) + parsing
+│   │   ├── Valuation.cs        Chiave, scala di allargamento e risultato di una valutazione
+│   │   ├── ValuationService.cs Dal pezzo descritto all'intervallo di prezzo dei comparabili
+│   │   ├── ValuationRequestParser.cs  Dal messaggio libero alla richiesta di valutazione
+│   │   ├── ValuationMessage.cs Eco dell'interpretazione e testo della risposta
 │   │   ├── NameProvider.cs     Risoluzione id -> nome per item e skill (cache locale)
 │   │   ├── ProductFormat.cs    Formattazione statistiche e skill delle inserzioni
 │   │   ├── SnapshotCsvExporter.cs  Export CSV flat di uno snapshot
@@ -116,7 +123,7 @@ NC-Market/
 │       ├── ConsoleProgress.cs  Avanzamento di una cattura sulla console
 │       ├── HelpText.cs         Testo del comando 'help'
 │       └── Program.cs          Comandi: fetch, snapshot, snapshots, history, stats, deals,
-│                               export, prune, notify-test
+│                               export, prune, notify-test, bot
 └── tests/
     └── NCMarket.Tests/         xUnit: schema e migrazioni, baseline, vendite, prune, deals,
                                 notifiche, servizi, CLI
@@ -184,6 +191,11 @@ notified_deals(               -- occasioni già segnalate da 'deals --notify'
                               -- mercato live, che contiene inserzioni mai storicizzate
     notified_at_utc TEXT      -- ISO 8601
 )
+
+bot_state(                    -- stato dei processi lunghi; oggi solo il bot Telegram
+    key TEXT PK,              -- 'telegram_offset'
+    value TEXT                -- id del primo aggiornamento non ancora letto, es. '431'
+)
 ```
 
 `product_id` è stabile e immutabile per tutta la vita di un'inserzione (un cambio di
@@ -219,7 +231,7 @@ WAL, così la copia contiene anche le ultime scritture) e il database viene comp
 con `VACUUM`. I database v2 e v3 acquisiscono le colonne `status` e `max_per_type` in
 place, senza backup: quelle migrazioni non sono distruttive. Gli snapshot già presenti
 valgono come catture integrali, che è ciò che `snapshot` fa quando `--max-per-type` non
-viene passato. Le tabelle e gli indici *nuovi* — `notified_deals` è l'ultimo — non hanno
+viene passato. Le tabelle e gli indici *nuovi* — `bot_state` è l'ultimo — non hanno
 migrazione né numero di versione: sono creati `IF NOT EXISTS` a ogni apertura, quindi un
 database esistente li acquisisce da sé. Il database usa il journal WAL, quindi accanto al file
 possono comparire i file di servizio `-wal` e `-shm`, più un file `.lock` vuoto usato
@@ -290,6 +302,13 @@ dotnet run --project src/NCMarket.Cli -- deals --from-snapshot --discount 30 --n
 
 # Messaggio di prova, per verificare token e chat senza aspettare la prima occasione
 dotnet run --project src/NCMarket.Cli -- notify-test
+
+# Il bot: resta in ascolto e risponde "quanto vale questo pezzo?" a chi scrive dalle
+# chat autorizzate (vedi "Il bot Telegram"). Non termina da sé: si ferma con Ctrl+C
+dotnet run --project src/NCMarket.Cli -- bot
+
+# Valutazioni sui soli ultimi 30 giorni di storico, con bucket più piccoli accettati
+dotnet run --project src/NCMarket.Cli -- bot --planet odin --days 30 --min-samples 3
 
 # Export CSV "flat" di uno snapshot: una riga per inserzione, statistiche in colonne
 # <stat>_base/<stat>_bonus (hp, atk, def, cri, hit, spd, drv, drr, cdmg, armorpen,
@@ -411,6 +430,72 @@ Il canale è dietro un'interfaccia (`INotificationChannel`), quindi aggiungerne 
 Discord, un webhook proprio — significa implementarla, senza toccare ciò che decide se e
 cosa c'è da dire.
 
+### Il bot Telegram
+
+`ncmarket bot` è il verso opposto: non manda notifiche, **riceve domande**. Si scrive al
+bot un pezzo come lo si legge sull'oggetto e risponde con quanto vale, cioè con
+l'intervallo di prezzo delle inserzioni comparabili nello storico.
+
+```
+Transcendent Sword Fire +7
+ATK 1.404.374
+DEF 3.359.312
+skill si
+CP 151.216.255
+```
+
+```
+Ho letto: Transcendent Weapon · Fire · +7 · opzioni ATK, DEF · con skill · CP 151,216,255
+
+💰 11.00 NCG – 333.00 NCG · mediana 41.00 NCG
+📊 7 comparabili · prezzi richiesti · heimdall · visti dal 2026-08-14 al 2026-08-24
+📈 Il CP del pezzo sta nel 60° percentile del gruppo
+⚠️ Prezzi richiesti: è quanto si chiede, non quanto si paga
+```
+
+L'ordine delle righe è libero e va bene anche tutto su una riga; rarità, tipo ed elemento
+servono sempre, il resto ha un default che l'eco dichiara. **L'eco è la prima riga della
+risposta e non un vezzo**: su testo libero una lettura sbagliata non produce un errore
+visibile, produce la valutazione di un altro pezzo, giusta in tutto tranne che nel pezzo.
+Un intervallo, e non un numero, perché dentro un bucket il prezzo non segue né il CP né il
+valore delle opzioni (correlazioni di rango fra `-0,42` e `+0,03`): un numero solo sarebbe
+una precisione che nessuno ha misurato. La riga `📊` dice sempre su quanti comparabili e su
+quale popolazione — con lo storico corto la risposta è quasi sempre *prezzi richiesti*, che
+è quanto si chiede e non quanto si paga.
+
+**Configurazione** — al token si aggiunge una variabile:
+
+| Variabile | A cosa serve |
+|---|---|
+| `NCMARKET_TELEGRAM_TOKEN` | lo stesso token delle notifiche |
+| `NCMARKET_TELEGRAM_ALLOWED_CHATS` | **obbligatoria**: id delle chat a cui rispondere, separati da virgola (negativi per gruppi e canali) |
+
+`NCMARKET_TELEGRAM_CHAT_ID` non serve al bot: un bot risponde a chi scrive, non a una chat
+decisa in configurazione. L'allowlist invece è obbligatoria e senza di essa `bot` esce con
+codice 2 all'avvio — un bot in ascolto risponde a chiunque ne trovi lo username, e ogni
+messaggio è una query su SQLite. I messaggi dalle altre chat vengono ignorati **in
+silenzio**: rispondere "non sei autorizzato" conferma che il bot esiste e invita a
+insistere. C'è anche un limite di 10 messaggi al minuto per chat, con una sola riga di
+spiegazione la prima volta che scatta.
+
+Punti di funzionamento che vale la pena conoscere:
+
+- **long polling, non webhook**, per la stessa ragione per cui una notifica è una `POST`:
+  nessun indirizzo pubblico, nessuna porta in ingresso, nessun certificato;
+- **un solo poller per token.** Due processi sullo stesso bot si prendono un `409` da
+  Telegram a vicenda — è il caso di un redeploy che lascia vivo il vecchio container. Il
+  409 viene riconosciuto e detto ("un'altra istanza sta già leggendo"), non ritentato
+  finché uno dei due vince a caso;
+- **l'offset è scritto nel database** (`bot_state`), quindi un riavvio non rilegge la coda
+  né la perde. Avanza anche sui messaggi che il bot decide di non rispondere: un messaggio
+  ignorato è un messaggio letto;
+- **il database si apre per messaggio e si richiude.** Una connessione tenuta aperta per
+  giorni farebbe fallire il `VACUUM` del `prune` settimanale, e in un momento che non ha
+  niente a che vedere con la causa. Se una domanda capita proprio dentro un `prune`, la
+  risposta è "riprova fra qualche secondo" invece della caduta del bot;
+- **un messaggio storto è una risposta**, non un'eccezione: l'errore nomina il token che
+  non ha capito e il ciclo prosegue.
+
 Test:
 
 ```bash
@@ -433,6 +518,12 @@ Punti chiave:
   scheduler (Scheduled Task di Coolify) esegua i comandi al suo interno. Qualsiasi altro
   argomento viene passato alla CLI, quindi `docker run <immagine> snapshot --planet odin`
   funziona anche in esecuzione one-shot;
+- **la stessa immagine fa due ruoli**, scelti da `NCMARKET_ROLE`: `idle` (default) è il
+  container dei job, `bot` è il bot Telegram (vedi [Il bot Telegram](#il-bot-telegram)).
+  Vanno tenuti in due risorse distinte sullo stesso volume, perché falliscono in modi
+  diversi: il bot è un processo lungo che **esce** se Telegram risponde `409` o rifiuta il
+  token, mentre `idle` non esce mai. Nello stesso container, un problema di credenziali del
+  bot porterebbe via anche il container in cui gli Scheduled Task entrano con `docker exec`;
 - lo script `docker/snapshot-job` è il job da schedulare: esegue `snapshot` e, se
   `NCMARKET_EXPORT=1`, anche l'`export` CSV in `/data/NCMarket/exports`. Esce con codice
   diverso da zero in caso di errore, così lo scheduler può notificare il fallimento;
@@ -463,6 +554,33 @@ segrete) e un secondo *Scheduled Task* con comando `deals-job`, sfasato di qualc
 dal primo (es. `10 */6 * * *`) perché confronta lo snapshot che quello ha appena
 catturato. Prima di aspettare la prima occasione conviene verificare il canale con
 `docker exec <container> ncmarket notify-test`.
+
+**Il bot è una seconda risorsa**, non un'aggiunta alla prima: stessa immagine, stesso
+volume `/data`, ma un'Application a sé con `NCMARKET_ROLE=bot`. Così i job restano in un
+container che non esce mai, e un token sbagliato ferma il bot e basta.
+
+| | Risorsa *job* | Risorsa *bot* |
+|---|---|---|
+| `NCMARKET_ROLE` | assente (o `idle`) | `bot` |
+| Storage `/data` | il volume esistente | **lo stesso volume**, stesso nome |
+| `NCMARKET_PLANET` | sì | sì |
+| `NCMARKET_TELEGRAM_TOKEN` | sì (per `deals-job`) | sì |
+| `NCMARKET_TELEGRAM_CHAT_ID` | sì, è dove arrivano gli avvisi | no, risponde a chi scrive |
+| `NCMARKET_TELEGRAM_ALLOWED_CHATS` | no | **sì**, obbligatoria |
+| `NCMARKET_BOT_ARGS` | no | facoltativa (`--days 30 --min-samples 3`) |
+| Scheduled Task | `snapshot-job`, `deals-job`, `prune` | nessuno |
+
+Due processi sullo stesso token si prendono un `409` a vicenda, quindi la risorsa del bot
+va **fermata prima di essere riavviata**: se il deploy avvia il container nuovo mentre il
+vecchio è ancora vivo, il nuovo esce nominando il conflitto. Nel dubbio è il log a dirlo,
+con quelle parole.
+
+I due container condividono il database e questo è previsto: WAL, `busy_timeout` e il lock
+su `<database>.lock` valgono fra processi, quindi anche fra container sullo stesso volume.
+L'unico attrito residuo è che il bot **non** prende quel lock — se lo prendesse resterebbe
+muto per la mezz'ora di uno snapshot — quindi un messaggio che capitasse nell'istante esatto
+del `VACUUM` può far fallire quel `prune`. La finestra è di millisecondi per messaggio;
+schedulare il `prune` a un'ora in cui nessuno scrive al bot la chiude.
 
 Grazie all'archiviazione deduplicata (schema v2) uno snapshot scrive per intero solo le
 inserzioni mai viste prima; quelle già note costano ~20 byte l'una. La crescita del
