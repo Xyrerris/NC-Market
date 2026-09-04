@@ -663,8 +663,13 @@ di fallire sul `VACUUM`.
   restringe nulla (vedi [Fonte dati](#fonte-dati)).
 
 ### Step 3 — Valutazioni (obiettivo finale)
-- **Motore di pricing**: prezzo equo stimato per item/level/opzioni sulla base della
-  serie storica (mediane mobili, percentili per grade/CP).
+- **Motore di pricing** ✅ — `ValuationService` risponde "quanto vale questo pezzo?" a
+  partire da ciò che il proprietario legge sull'oggetto (rarità, tipo, elemento, livello,
+  opzioni, skill), allargando il bucket dei comparabili un passo alla volta e dichiarando
+  fino a dove è arrivato. La risposta è un **intervallo** e non un prezzo equo: dentro un
+  bucket il prezzo non segue né il CP né il valore delle opzioni, quindi un numero solo
+  sarebbe una precisione mai misurata. Si chiede al bot Telegram (vedi
+  [Il bot Telegram](#il-bot-telegram)).
 - **Segnalazione occasioni** ✅ — comando `deals`: confronto tra le offerte correnti
   (mercato live o ultimo snapshot) e le mediane storiche di prezzo e NCG/CP per
   terna (item, livello, numero di opzioni), calcolate sulle inserzioni stimate vendute,
