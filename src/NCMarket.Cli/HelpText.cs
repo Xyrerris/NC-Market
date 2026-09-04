@@ -97,7 +97,10 @@ internal static class HelpText
                      'Transcendent Sword Fire +7 / ATK 1.404.374 / skill si' — con le
                      righe in ordine libero; il bot risponde con come lo ha letto e con
                      l'intervallo di prezzo dei comparabili, dichiarando su quanti
-                     campioni e su quale popolazione
+                     campioni e su quale popolazione. In chat, '/valuta' senza argomenti
+                     chiede rarità, tipo, elemento e skill coi bottoni, e sotto ogni
+                     risposta ci sono i comparabili, la stima senza elemento e l'altro
+                     pianeta
 
           export     Esporta uno snapshot in CSV flat: una riga per inserzione,
                      statistiche in colonne <stat>_base/<stat>_bonus e skill in

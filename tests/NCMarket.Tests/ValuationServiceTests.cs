@@ -59,7 +59,8 @@ public sealed class ValuationServiceTests
         ValuationKey key,
         int minSamples = 5,
         int? combatPoint = null,
-        BaselinePopulation population = BaselinePopulation.Listed) =>
+        BaselinePopulation population = BaselinePopulation.Listed,
+        ValuationStep start = ValuationStep.Exact) =>
         new ValuationService(db).Evaluate(new ValuationQuery
         {
             Planet = Planet.Heimdall,
@@ -67,6 +68,7 @@ public sealed class ValuationServiceTests
             MinSamples = minSamples,
             CombatPoint = combatPoint,
             Population = population,
+            StartStep = start,
         });
 
     private static void Sell(MarketDb db, params ItemProduct[] products) =>
@@ -112,6 +114,36 @@ public sealed class ValuationServiceTests
         Assert.Equal(ValuationStep.AnyElement, result.Step);
         Assert.Equal("stimato su tutti gli elementi", result.StepDeclaration);
         Assert.Equal(5, result.Comparables);
+    }
+
+    /// <summary>
+    /// The ladder can be climbed from higher up, which is what the "senza elemento" button
+    /// of the bot asks for. What the test is really about is that the result is
+    /// indistinguishable from the one a bucket too small would have produced: the answer
+    /// declares where the range was measured, never whether that rung was reached or
+    /// requested.
+    /// </summary>
+    [Fact]
+    public void A_ladder_started_higher_up_gives_up_the_element_without_being_forced_to()
+    {
+        using var temp = new TempDatabase();
+        using var db = temp.Open();
+        Sell(db,
+            Piece(10m),
+            Piece(20m),
+            Piece(30m),
+            Piece(40m),
+            Piece(100m),
+            Piece(50m, element: ElementalType.Water));
+
+        // Il bucket esatto basterebbe: cinque comparabili sono i cinque richiesti.
+        Assert.Equal(ValuationStep.Exact, Evaluate(db, Key()).Step);
+
+        var widened = Evaluate(db, Key(), start: ValuationStep.AnyElement);
+
+        Assert.Equal(ValuationStep.AnyElement, widened.Step);
+        Assert.Equal("stimato su tutti gli elementi", widened.StepDeclaration);
+        Assert.Equal(6, widened.Comparables);
     }
 
     [Fact]

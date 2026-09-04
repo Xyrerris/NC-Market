@@ -24,10 +24,12 @@ public sealed class ValuationService
 
     /// <summary>
     /// Values the piece described by <paramref name="query"/>. Climbs
-    /// <see cref="ValuationSteps.Ladder"/> from the exact bucket outwards and returns the
-    /// first step that holds at least <see cref="ValuationQuery.MinSamples"/> comparables,
-    /// or a <see cref="ValuationStatus.InsufficientData"/> result carrying what the widest
-    /// step did find.
+    /// <see cref="ValuationSteps.Ladder"/> outwards from
+    /// <see cref="ValuationQuery.StartStep"/> — the exact bucket unless a wider one was
+    /// asked for — and returns the first step that holds at least
+    /// <see cref="ValuationQuery.MinSamples"/> comparables, or a
+    /// <see cref="ValuationStatus.InsufficientData"/> result carrying what the widest step
+    /// did find.
     /// <para>
     /// At every step the preferred population is tried first and the fallback to
     /// <see cref="BaselinePopulation.Listed"/> happens <em>before</em> widening, not after:
@@ -43,6 +45,14 @@ public sealed class ValuationService
 
         foreach (var step in ValuationSteps.Ladder)
         {
+            // A ladder climbed from higher up is still the same ladder: the rungs below
+            // the one asked for are skipped rather than removed, so a widening that was
+            // chosen and one that was forced produce the very same result.
+            if (step < query.StartStep)
+            {
+                continue;
+            }
+
             var set = _db.GetComparables(
                 query.Planet.Name, FilterFor(query.Key, step), query.SinceUtc,
                 query.SaleMarginPercent);

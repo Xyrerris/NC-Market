@@ -105,12 +105,14 @@ NC-Market/
 │   │   ├── INotificationChannel.cs  Astrazione del canale di notifica
 │   │   ├── TelegramNotifier.cs Invio su Telegram (Bot API) e lettura delle credenziali
 │   │   ├── TelegramUpdateSource.cs  Lettura dei messaggi scritti al bot (long polling)
-│   │   ├── TelegramBot.cs      Il bot: allowlist, limite di frequenza, offset, dispatch
+│   │   ├── TelegramBot.cs      Il bot: allowlist, frequenza, offset, dispatch, flusso guidato
+│   │   ├── InlineKeyboard.cs   I bottoni sotto un messaggio e il loro reply_markup
 │   │   ├── ElementalType.cs    Enum elementi (Normal, Fire, Water, Land, Wind) + parsing
 │   │   ├── Valuation.cs        Chiave, scala di allargamento e risultato di una valutazione
 │   │   ├── ValuationService.cs Dal pezzo descritto all'intervallo di prezzo dei comparabili
 │   │   ├── ValuationRequestParser.cs  Dal messaggio libero alla richiesta di valutazione
-│   │   ├── ValuationMessage.cs Eco dell'interpretazione e testo della risposta
+│   │   ├── ValuationCallback.cs  Cosa portano i bottoni: la domanda, non un id di sessione
+│   │   ├── ValuationMessage.cs Eco dell'interpretazione, risposta ed elenco dei comparabili
 │   │   ├── NameProvider.cs     Risoluzione id -> nome per item e skill (cache locale)
 │   │   ├── ProductFormat.cs    Formattazione statistiche e skill delle inserzioni
 │   │   ├── SnapshotCsvExporter.cs  Export CSV flat di uno snapshot
@@ -445,12 +447,14 @@ CP 151.216.255
 ```
 
 ```
-Ho letto: Transcendent Weapon · Fire · +7 · opzioni ATK, DEF · con skill · CP 151,216,255
+🏷️ Ho letto: Transcendent Weapon · Fire · +7 · opzioni ATK, DEF · con skill · CP 151,216,255
 
 💰 11.00 NCG – 333.00 NCG · mediana 41.00 NCG
 📊 7 comparabili · prezzi richiesti · heimdall · visti dal 2026-08-14 al 2026-08-24
 📈 Il CP del pezzo sta nel 60° percentile del gruppo
 ⚠️ Prezzi richiesti: è quanto si chiede, non quanto si paga
+
+[🔍 Vedi i comparabili] [🌐 Senza elemento] [🪐 Su odin]
 ```
 
 L'ordine delle righe è libero e va bene anche tutto su una riga; rarità, tipo ed elemento
@@ -462,6 +466,33 @@ valore delle opzioni (correlazioni di rango fra `-0,42` e `+0,03`): un numero so
 una precisione che nessuno ha misurato. La riga `📊` dice sempre su quanti comparabili e su
 quale popolazione — con lo storico corto la risposta è quasi sempre *prezzi richiesti*, che
 è quanto si chiede e non quanto si paga.
+
+**Il flusso guidato** — `/valuta` senza argomenti chiede i campi uno per uno coi bottoni:
+otto rarità, cinque tipi, cinque elementi, skill sì o no. Sono quattro campi su sei senza
+possibilità di sbagliarli, e restano da scrivere solo le opzioni (con `+7` e `CP` se si
+vuole), o nemmeno quelle se il pezzo non ne ha. Quello che si preme viene riscritto come il
+messaggio che una persona avrebbe scritto e dato allo **stesso** parser: c'è una sola
+lettura di un pezzo in questo progetto, non due che possono divergere. La conversazione a
+metà sta **in memoria** e un riavvio la perde — costa un `/valuta` ripetuto, e il bot lo
+dice invece di rispondere qualcos'altro. Un comando la chiude, e se durante il flusso si
+scrive comunque il pezzo per intero vince il pezzo scritto.
+
+**I bottoni sotto la risposta** valgono quanto la risposta:
+
+- **Vedi i comparabili** elenca le inserzioni su cui l'intervallo è costruito, dalla più
+  economica, con livello, elemento, CP, ultimo avvistamento ed esito. Un `11 – 333 NCG`
+  senza dettaglio è inutilizzabile; col dettaglio si vede subito che i 333 sono un fuori
+  scala e la mediana no;
+- **Senza elemento** rifà la stessa stima dal primo gradino della scala, e **Su odin** la
+  rifà sull'altro pianeta: due domande che altrimenti costerebbero riscrivere il messaggio
+  da capo.
+
+Un bottone **porta con sé la domanda intera**, non un id di sessione: sta in 64 byte
+(quanto Telegram concede a `callback_data`), quindi funziona ancora dopo un redeploy e non
+costa al bot un pezzo di memoria per ogni risposta data. Un messaggio resta sul telefono
+per settimane, e un bottone che rispondesse *non me lo ricordo più* sarebbe un bottone
+rotto. L'asimmetria con la conversazione è voluta: quella è una cosa che sta succedendo
+adesso, questa è una domanda già fatta.
 
 **Configurazione** — al token si aggiunge una variabile:
 
@@ -494,7 +525,11 @@ Punti di funzionamento che vale la pena conoscere:
   niente a che vedere con la causa. Se una domanda capita proprio dentro un `prune`, la
   risposta è "riprova fra qualche secondo" invece della caduta del bot;
 - **un messaggio storto è una risposta**, non un'eccezione: l'errore nomina il token che
-  non ha capito e il ciclo prosegue.
+  non ha capito e il ciclo prosegue;
+- **una pressione viene confermata prima della risposta.** Telegram gira una rotella sul
+  bottone finché non arriva `answerCallbackQuery`, quindi la conferma parte prima della
+  query sul database — e se non riesce non si porta via la risposta, perché costa una
+  rotella e non un messaggio.
 
 Test:
 

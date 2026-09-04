@@ -299,6 +299,248 @@ public sealed class TelegramBotTests
         Assert.Equal(Stranger, Assert.Single(telegram.Replies).ChatId);
     }
 
+    /// <summary>
+    /// Il flusso guidato. Quattro campi su sei sono enumerabili, e un bottone è la
+    /// differenza fra un campo che non si può sbagliare e uno che sì: restano da scrivere
+    /// soltanto le opzioni, che è esattamente ciò che il piano chiedeva a F5.
+    /// </summary>
+    [Fact]
+    public async Task The_guided_flow_asks_the_four_enumerable_fields_and_then_the_options()
+    {
+        using var temp = new TempDatabase();
+        using (var db = temp.Open())
+        {
+            FillMarket(db);
+        }
+
+        var telegram = new FakeTelegram()
+            .Delivers((1, Allowed, "/valuta"))
+            .Presses((2, Allowed, Press(DialogField.Grade, (int)Grade.Transcendent)))
+            .Presses((3, Allowed, Press(DialogField.Type, (int)EquipmentType.Weapon)))
+            .Presses((4, Allowed, Press(DialogField.Element, (int)ElementalType.Fire)))
+            .Presses((5, Allowed, Press(DialogField.Skill, 1)))
+            .Delivers((6, Allowed, "ATK 1.404.374 DEF 3.359.312"));
+
+        await RunAsync(temp, telegram);
+
+        Assert.Equal(6, telegram.Replies.Count);
+        Assert.Contains("rarità", telegram.Replies[0].Text, StringComparison.Ordinal);
+        Assert.Equal(Grades.All.Length, Labels(telegram.Replies[0].Markup).Count);
+        Assert.Contains("tipo", telegram.Replies[1].Text, StringComparison.Ordinal);
+        Assert.Contains("elemento", telegram.Replies[2].Text, StringComparison.Ordinal);
+        Assert.Contains("skill", telegram.Replies[3].Text, StringComparison.Ordinal);
+        Assert.Contains("opzioni", telegram.Replies[4].Text, StringComparison.Ordinal);
+
+        // La stima arriva senza che sia stato scritto altro che i numeri delle opzioni, e
+        // il pezzo è quello dei bottoni: il flusso guidato scrive il messaggio che una
+        // persona avrebbe scritto e lo dà allo stesso parser.
+        var answer = telegram.Replies[5].Text;
+        Assert.Contains("Transcendent Weapon", answer, StringComparison.Ordinal);
+        Assert.Contains("con skill", answer, StringComparison.Ordinal);
+        Assert.Contains("NCG", answer, StringComparison.Ordinal);
+
+        // Ogni pressione va confermata, o il telefono continua a girare la rotella sul
+        // bottone come se il bot non avesse sentito.
+        Assert.Equal(new[] { "cb2", "cb3", "cb4", "cb5" }, telegram.Acknowledged);
+    }
+
+    /// <summary>
+    /// L'ultimo passo è l'unico che si scrive, quindi è l'unico la cui tastiera è una via
+    /// d'uscita dallo scrivere: un pezzo senza opzioni è un pezzo vero, e chiederlo a
+    /// parole vorrebbe dire far scrivere "niente".
+    /// </summary>
+    [Fact]
+    public async Task The_last_step_of_the_guided_flow_can_be_answered_with_a_button_too()
+    {
+        using var temp = new TempDatabase();
+        var telegram = new FakeTelegram()
+            .Delivers((1, Allowed, "/valuta"))
+            .Presses((2, Allowed, Press(DialogField.Grade, (int)Grade.Mythic)))
+            .Presses((3, Allowed, Press(DialogField.Type, (int)EquipmentType.Ring)))
+            .Presses((4, Allowed, Press(DialogField.Element, (int)ElementalType.Water)))
+            .Presses((5, Allowed, Press(DialogField.Skill, 0)))
+            .Presses((6, Allowed, Press(DialogField.NoOptions)));
+
+        await RunAsync(temp, telegram);
+
+        var answer = telegram.Replies[5].Text;
+        Assert.Contains("Mythic Ring", answer, StringComparison.Ordinal);
+        Assert.Contains("senza opzioni", answer, StringComparison.Ordinal);
+        Assert.Contains("senza skill", answer, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// I bottoni sotto una risposta portano con sé la domanda intera, quindi funzionano
+    /// anche dopo un redeploy: un messaggio resta sul telefono per settimane, e un bottone
+    /// che rispondesse "non me lo ricordo più" sarebbe un bottone rotto.
+    /// </summary>
+    [Fact]
+    public async Task The_buttons_under_an_answer_outlive_the_process_that_sent_them()
+    {
+        using var temp = new TempDatabase();
+        using (var db = temp.Open())
+        {
+            FillMarket(db);
+        }
+
+        var first = await RunAsync(temp, new FakeTelegram().Delivers((1, Allowed, Piece)));
+
+        var markup = Assert.Single(first.Replies).Markup;
+        Assert.Equal(
+            new[] { "🔍 Vedi i comparabili", "🌐 Senza elemento", "🪐 Su odin" },
+            Labels(markup));
+
+        // Secondo processo, stesso database, bottone del primo.
+        var second = await RunAsync(
+            temp,
+            new FakeTelegram().Presses((2, Allowed, Button(markup, "Vedi i comparabili"))));
+
+        var listing = Assert.Single(second.Replies).Text;
+        Assert.Contains("comparabili, dal più economico", listing, StringComparison.Ordinal);
+        Assert.Contains("NCG", listing, StringComparison.Ordinal);
+        Assert.Equal(new[] { "cb2" }, second.Acknowledged);
+    }
+
+    /// <summary>
+    /// "Senza elemento" è il primo gradino della scala preso apposta invece che per
+    /// necessità, e la risposta lo dichiara come dichiara ogni altro allargamento.
+    /// </summary>
+    [Fact]
+    public async Task The_widen_button_asks_the_same_piece_on_every_element()
+    {
+        using var temp = new TempDatabase();
+        using (var db = temp.Open())
+        {
+            FillMarket(db);
+        }
+
+        var first = await RunAsync(temp, new FakeTelegram().Delivers((1, Allowed, Piece)));
+        Assert.DoesNotContain(
+            "Bucket allargato", Assert.Single(first.Replies).Text, StringComparison.Ordinal);
+
+        var second = await RunAsync(
+            temp,
+            new FakeTelegram().Presses(
+                (2, Allowed, Button(first.Replies[0].Markup, "Senza elemento"))));
+
+        var answer = Assert.Single(second.Replies).Text;
+        Assert.Contains(
+            "Bucket allargato: stimato su tutti gli elementi", answer, StringComparison.Ordinal);
+
+        // Allargato una volta, non si riallarga: il bottone prometterebbe una risposta
+        // diversa e restituirebbe la stessa.
+        Assert.DoesNotContain(
+            Labels(second.Replies[0].Markup),
+            label => label.Contains("Senza elemento", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Il pianeta è l'unica cosa della domanda che non stava nel messaggio, quindi è
+    /// l'unico bottone che c'è sempre — anche sotto una risposta che non ha trovato dati,
+    /// dove invece i comparabili non ci sono da elencare.
+    /// </summary>
+    [Fact]
+    public async Task The_other_planet_is_one_press_away_and_offers_the_way_back()
+    {
+        using var temp = new TempDatabase();
+        using (var db = temp.Open())
+        {
+            FillMarket(db);
+        }
+
+        var first = await RunAsync(temp, new FakeTelegram().Delivers((1, Allowed, Piece)));
+
+        var second = await RunAsync(
+            temp,
+            new FakeTelegram().Presses((2, Allowed, Button(first.Replies[0].Markup, "Su odin"))));
+
+        var reply = Assert.Single(second.Replies);
+        Assert.Contains("Non ho abbastanza dati", reply.Text, StringComparison.Ordinal);
+        Assert.Equal(new[] { "🪐 Su heimdall" }, Labels(reply.Markup));
+    }
+
+    /// <summary>
+    /// Una tastiera sopravvive al processo che l'ha mandata, quindi può arrivare un
+    /// bottone di una versione che non esiste più. Nominarlo costa un messaggio; ignorarlo
+    /// costerebbe un bottone indistinguibile da un bot fermo.
+    /// </summary>
+    [Fact]
+    public async Task A_button_nobody_here_wrote_is_named_instead_of_ignored()
+    {
+        using var temp = new TempDatabase();
+        var telegram = new FakeTelegram().Presses((1, Allowed, "v0|qualcosa|di|vecchio"));
+
+        await RunAsync(temp, telegram);
+
+        Assert.Contains(
+            "Questo bottone non lo conosco", Assert.Single(telegram.Replies).Text,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// La conversazione sta in memoria e un riavvio la perde: è accettabile, costa un
+    /// /valuta ripetuto, e va detto invece che lasciato scoprire.
+    /// </summary>
+    [Fact]
+    public async Task A_guided_flow_lost_to_a_restart_says_so()
+    {
+        using var temp = new TempDatabase();
+        var telegram = new FakeTelegram().Presses(
+            (1, Allowed, Press(DialogField.Element, (int)ElementalType.Fire)));
+
+        await RunAsync(temp, telegram);
+
+        Assert.Contains(
+            "Non ho più questa domanda in corso", Assert.Single(telegram.Replies).Text,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Chi ha aperto il flusso guidato e poi ha scritto il pezzo per intero per abitudine
+    /// riceve la valutazione del pezzo che ha scritto. L'alternativa è rispondere "due
+    /// rarità" a un messaggio perfettamente buono, che si legge come un bot rotto e non
+    /// come un bot che stava aspettando.
+    /// </summary>
+    [Fact]
+    public async Task A_whole_piece_typed_during_the_guided_flow_wins_over_the_flow()
+    {
+        using var temp = new TempDatabase();
+        var telegram = new FakeTelegram()
+            .Delivers((1, Allowed, "/valuta"))
+            .Presses((2, Allowed, Press(DialogField.Grade, (int)Grade.Transcendent)))
+            .Presses((3, Allowed, Press(DialogField.Type, (int)EquipmentType.Weapon)))
+            .Presses((4, Allowed, Press(DialogField.Element, (int)ElementalType.Fire)))
+            .Presses((5, Allowed, Press(DialogField.Skill, 1)))
+            .Delivers((6, Allowed, "Mythic Ring Water skill no ATK 1"));
+
+        await RunAsync(temp, telegram);
+
+        var answer = telegram.Replies[5].Text;
+        Assert.Contains("Mythic Ring", answer, StringComparison.Ordinal);
+        Assert.DoesNotContain("Due rarità", answer, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Un comando è un ricominciare da capo per definizione: qualunque domanda a metà
+    /// fosse aperta, non è di quella che parla il messaggio.
+    /// </summary>
+    [Fact]
+    public async Task A_command_closes_the_guided_flow()
+    {
+        using var temp = new TempDatabase();
+        var telegram = new FakeTelegram()
+            .Delivers((1, Allowed, "/valuta"))
+            .Presses((2, Allowed, Press(DialogField.Grade, (int)Grade.Transcendent)))
+            .Delivers((3, Allowed, "/annulla"))
+            .Delivers((4, Allowed, "Mythic Ring Water ATK 1"));
+
+        await RunAsync(temp, telegram);
+
+        Assert.Contains(
+            "lasciamo perdere", telegram.Replies[2].Text, StringComparison.Ordinal);
+        Assert.Contains("Mythic Ring", telegram.Replies[3].Text, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void A_bot_without_an_allowlist_does_not_start()
     {
@@ -335,6 +577,47 @@ public sealed class TelegramBotTests
         });
     }
 
+    /// <summary>The data a button of the guided flow carries, as the bot writes it.</summary>
+    private static string Press(DialogField field, int value = 0) =>
+        ValuationCallback.Encode(field, value);
+
+    /// <summary>The labels of a keyboard, in reading order.</summary>
+    private static IReadOnlyList<string> Labels(string? markup) =>
+        Keyboard(markup).Select(b => b.Text).ToList();
+
+    /// <summary>
+    /// The data behind the button whose label contains <paramref name="label"/>, which is
+    /// what a phone sends back when it is pressed.
+    /// </summary>
+    private static string Button(string? markup, string label)
+    {
+        foreach (var (text, data) in Keyboard(markup))
+        {
+            if (text.Contains(label, StringComparison.Ordinal))
+            {
+                return data;
+            }
+        }
+
+        Assert.Fail($"Nessun bottone '{label}' fra {string.Join(", ", Labels(markup))}.");
+        return "";
+    }
+
+    /// <summary>The buttons of a <c>reply_markup</c>, flattened out of their rows.</summary>
+    private static List<(string Text, string Data)> Keyboard(string? markup)
+    {
+        Assert.NotNull(markup);
+
+        using var json = JsonDocument.Parse(markup!);
+        return json.RootElement.GetProperty("inline_keyboard")
+            .EnumerateArray()
+            .SelectMany(row => row.EnumerateArray())
+            .Select(b => (
+                b.GetProperty("text").GetString()!,
+                b.GetProperty("callback_data").GetString()!))
+            .ToList();
+    }
+
     private static void WithEnvironment(string? token, string? chats, Action body)
     {
         var oldToken = Environment.GetEnvironmentVariable(TelegramOptions.TokenVariable);
@@ -356,10 +639,10 @@ public sealed class TelegramBotTests
 }
 
 /// <summary>
-/// Telegram, reduced to the two calls the bot makes. It answers <c>getUpdates</c> from a
-/// script and records what <c>sendMessage</c> was asked to deliver; when the script runs
-/// out it cancels <see cref="Stopping"/>, which is what ends a loop whose only ordinary
-/// way out is cancellation.
+/// Telegram, reduced to the three calls the bot makes. It answers <c>getUpdates</c> from a
+/// script and records what <c>sendMessage</c> and <c>answerCallbackQuery</c> were asked to
+/// deliver; when the script runs out it cancels <see cref="Stopping"/>, which is what ends
+/// a loop whose only ordinary way out is cancellation.
 /// </summary>
 internal sealed class FakeTelegram : HttpMessageHandler
 {
@@ -368,8 +651,11 @@ internal sealed class FakeTelegram : HttpMessageHandler
     /// <summary>Full URLs of the polls, in order — the offset travels in there.</summary>
     public List<string> Polls { get; } = new();
 
-    /// <summary>What was sent back, and to whom.</summary>
-    public List<(long ChatId, string Text)> Replies { get; } = new();
+    /// <summary>What was sent back, to whom, and with which buttons under it.</summary>
+    public List<(long ChatId, string Text, string? Markup)> Replies { get; } = new();
+
+    /// <summary>Ids of the presses the bot said it had heard.</summary>
+    public List<string> Acknowledged { get; } = new();
 
     /// <summary>Cancelled once the script is exhausted, to stop the bot.</summary>
     public CancellationTokenSource Stopping { get; } = new();
@@ -381,6 +667,22 @@ internal sealed class FakeTelegram : HttpMessageHandler
             "{\"update_id\":" + u.Id +
             ",\"message\":{\"chat\":{\"id\":" + u.Chat +
             "},\"text\":" + JsonSerializer.Serialize(u.Text) + "}}"));
+
+        return Answers(HttpStatusCode.OK, "{\"ok\":true,\"result\":[" + result + "]}");
+    }
+
+    /// <summary>
+    /// Queues one poll answering with these button presses. The chat is the one the
+    /// pressed message belongs to, which is also where the answer goes: the bot writes to
+    /// a chat, not to whoever pressed.
+    /// </summary>
+    public FakeTelegram Presses(params (long Id, long Chat, string Data)[] presses)
+    {
+        var result = string.Join(",", presses.Select(p =>
+            "{\"update_id\":" + p.Id +
+            ",\"callback_query\":{\"id\":\"cb" + p.Id +
+            "\",\"data\":" + JsonSerializer.Serialize(p.Data) +
+            ",\"message\":{\"chat\":{\"id\":" + p.Chat + "}}}}"));
 
         return Answers(HttpStatusCode.OK, "{\"ok\":true,\"result\":[" + result + "]}");
     }
@@ -399,7 +701,18 @@ internal sealed class FakeTelegram : HttpMessageHandler
         if (url.Contains("/sendMessage", StringComparison.Ordinal))
         {
             var form = await request.Content!.ReadAsStringAsync(ct);
-            Replies.Add((long.Parse(Field(form, "chat_id")), Field(form, "text")));
+            var markup = Field(form, "reply_markup");
+            Replies.Add((
+                long.Parse(Field(form, "chat_id")),
+                Field(form, "text"),
+                markup.Length == 0 ? null : markup));
+            return Ok("""{"ok":true}""");
+        }
+
+        if (url.Contains("/answerCallbackQuery", StringComparison.Ordinal))
+        {
+            var form = await request.Content!.ReadAsStringAsync(ct);
+            Acknowledged.Add(Field(form, "callback_query_id"));
             return Ok("""{"ok":true}""");
         }
 

@@ -5,16 +5,16 @@ using NCMarket.Core.Models;
 namespace NCMarket.Core;
 
 /// <summary>
-/// The words a valuation is said in. For now that is one line — the echo of how a
-/// message was read — which belongs here and not to the presentation of the answer: it
-/// is the cheapest defence a free-text parser has, and the answer is not worth showing
-/// until it is clear which piece it is about.
+/// The words a valuation is said in: the echo of how a message was read, the range that
+/// answers it, and the listings that range was built on.
 /// <para>
-/// A misread message does not produce a visible failure. It produces a valuation of a
-/// different piece, correct in every respect except the one that matters, and nothing in
-/// its shape says so. One line of echo turns that into something the reader catches at a
-/// glance — the same principle as <c>deals --dicount 30</c> being an error instead of a
-/// filter that silently does not apply.
+/// The echo belongs here and not to the presentation of the answer: it is the cheapest
+/// defence a free-text parser has, and the answer is not worth showing until it is clear
+/// which piece it is about. A misread message does not produce a visible failure. It
+/// produces a valuation of a different piece, correct in every respect except the one that
+/// matters, and nothing in its shape says so. One line of echo turns that into something
+/// the reader catches at a glance — the same principle as <c>deals --dicount 30</c> being
+/// an error instead of a filter that silently does not apply.
 /// </para>
 /// <para>
 /// Two things the echo says differently from how they may have been written, and both on
@@ -32,15 +32,27 @@ namespace NCMarket.Core;
 /// comes back out is this project's spelling of it.</item>
 /// </list>
 /// <para>
-/// The text is plain, not <see cref="MarkdownV2"/>. Nothing written by the sender
-/// survives into it — every part comes from a parsed enum or a number — so a caller
-/// sending it to Telegram can hand the whole line to <see cref="MarkdownV2.Escape"/> in
-/// one call, which is safe precisely because there is no entity in it to break.
+/// <b>The text is <see cref="MarkdownV2"/>, which Telegram parses.</b> That is what sets
+/// the figures apart from the sentences around them, and it comes with the rules the
+/// alerts already follow (see <see cref="DealMessage"/>): every value goes through
+/// <see cref="MarkdownV2.Code"/> and every fixed sentence through
+/// <see cref="MarkdownV2.Escape"/> — here by way of <c>Text</c>, so that the escaping is
+/// something the prose cannot forget rather than something each string has to remember.
+/// No entity spans a newline, which is what lets <see cref="TelegramNotifier.Split"/> cut
+/// a long list between its lines without leaving half an entity in either part.
 /// </para>
 /// </summary>
 public static class ValuationMessage
 {
     private static readonly CultureInfo Culture = CultureInfo.InvariantCulture;
+
+    /// <summary>
+    /// Comparables written out one by one before the list starts summarizing itself. A
+    /// bucket is small by construction, but the widest rung of the ladder can hold
+    /// hundreds, and past a screenful the list stops being what makes a range checkable
+    /// and becomes something to scroll past.
+    /// </summary>
+    private const int MaxListings = 20;
 
     /// <summary>
     /// How <paramref name="query"/> was understood, in one line. Every field of the key
@@ -51,28 +63,26 @@ public static class ValuationMessage
     public static string Echo(ValuationQuery query)
     {
         var key = query.Key;
-        var sb = new StringBuilder("Ho letto: ")
-            .Append(GradeName(key.Grade))
-            .Append(' ')
-            .Append(key.Type)
-            .Append(" · ")
-            .Append(Elementals.Name(key.Element))
-            .Append(" · +")
-            .Append(key.Level.ToString(Culture))
-            .Append(" · ")
-            .Append(Options(key))
-            .Append(key.HasSkill ? " · con skill" : " · senza skill");
+        var sb = new StringBuilder("🏷️ ")
+            .Append(Text("Ho letto: "))
+            .Append('*')
+            .Append(Text(GradeName(key.Grade) + " " + key.Type))
+            .Append('*')
+            .Append(Text(" · " + Elementals.Name(key.Element)))
+            .Append(Text(" · +" + key.Level.ToString(Culture)))
+            .Append(Text(" · " + Options(key)))
+            .Append(Text(key.HasSkill ? " · con skill" : " · senza skill"));
 
         // Custom craft shows only when it is on. It is a rarity, its default is no, and a
         // line that carries every negative answer stops being read.
         if (key.ByCustomCraft)
         {
-            sb.Append(" · custom craft");
+            sb.Append(Text(" · custom craft"));
         }
 
         if (query.CombatPoint is int cp)
         {
-            sb.Append(" · CP ").Append(cp.ToString("N0", Culture));
+            sb.Append(Text(" · CP ")).Append(Code(cp.ToString("N0", Culture)));
         }
 
         return sb.ToString();
@@ -102,18 +112,18 @@ public static class ValuationMessage
         var prices = result.Prices;
         var sb = new StringBuilder("💰 ")
             .Append(Ncg(prices.Min))
-            .Append(" – ")
+            .Append(Text(" – "))
             .Append(Ncg(prices.Max))
-            .Append(" · mediana ")
+            .Append(Text(" · mediana "))
             .Append(Ncg(prices.Median))
             .Append('\n');
 
         sb.Append("📊 ")
-          .Append(result.Comparables.ToString("N0", Culture))
-          .Append(result.Comparables == 1 ? " comparabile · " : " comparabili · ")
-          .Append(PopulationName(result.Population))
-          .Append(" · ")
-          .Append(query.Planet.Name)
+          .Append(Code(result.Comparables.ToString("N0", Culture)))
+          .Append(Text(result.Comparables == 1 ? " comparabile · " : " comparabili · "))
+          .Append(Text(PopulationName(result.Population)))
+          .Append(Text(" · "))
+          .Append(Code(query.Planet.Name))
           .Append(Window(result));
 
         if (result.Step != ValuationStep.Exact)
@@ -121,25 +131,100 @@ public static class ValuationMessage
             // The key in the result is the piece as it was described, not the bucket that
             // was measured: only the step knows what was given up, so only the step can
             // say it.
-            sb.Append("\n🔎 Bucket allargato: ").Append(result.StepDeclaration);
+            sb.Append("\n🔎 ")
+              .Append(Text("Bucket allargato: " + result.StepDeclaration));
         }
 
         if (result.CpPercentile is int percentile)
         {
-            sb.Append("\n📈 Il CP del pezzo sta nel ")
-              .Append(percentile.ToString(Culture))
-              .Append("° percentile del gruppo");
+            sb.Append("\n📈 ")
+              .Append(Text("Il CP del pezzo sta nel "))
+              .Append(Code(percentile.ToString(Culture)))
+              .Append(Text("° percentile del gruppo"));
         }
 
         if (result.Population == BaselinePopulation.Listed)
         {
             sb.Append("\n⚠️ ")
-              .Append(result.PopulationFallback
+              .Append(Text(result.PopulationFallback
                   ? "Vendite osservate troppo poche: è quanto si chiede, non quanto si paga"
-                  : "Prezzi richiesti: è quanto si chiede, non quanto si paga");
+                  : "Prezzi richiesti: è quanto si chiede, non quanto si paga"));
         }
 
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// The listings the range was built on, cheapest first. A range from 11 to 333 NCG is
+    /// unusable as a range: with the listings under it, the 333 is visibly one piece
+    /// somebody priced at random, and the median visibly is not.
+    /// <para>
+    /// It repeats the echo, because it is a message of its own arriving under a button
+    /// that may have been pressed on an answer from days ago — and a column of prices with
+    /// nothing saying which piece they belong to would be worse than no column at all.
+    /// </para>
+    /// </summary>
+    public static string Comparables(ValuationQuery query, ValuationResult result)
+    {
+        var sb = new StringBuilder(Echo(query)).Append("\n\n");
+        var listings = result.Listings.OrderBy(l => l.Price).ToList();
+
+        if (listings.Count == 0)
+        {
+            return sb.Append("🤷 ")
+                     .Append(Text(
+                         "Non ho comparabili da elencare: anche il bucket più largo della " +
+                         "scala è rimasto vuoto."))
+                     .ToString();
+        }
+
+        sb.Append("🔍 ")
+          .Append(Code(listings.Count.ToString("N0", Culture)))
+          .Append(Text(listings.Count == 1
+              ? " comparabile:"
+              : listings.Count <= MaxListings
+                  ? " comparabili, dal più economico:"
+                  : " comparabili, i " + MaxListings.ToString(Culture) + " più economici:"));
+
+        foreach (var (listing, index) in listings.Take(MaxListings).Select((l, i) => (l, i + 1)))
+        {
+            sb.Append('\n').Append(Text(index.ToString(Culture) + ". "));
+            Append(sb, listing);
+        }
+
+        if (listings.Count > MaxListings)
+        {
+            sb.Append("\n➕ ")
+              .Append(Text("Altri "))
+              .Append(Code((listings.Count - MaxListings).ToString("N0", Culture)))
+              .Append(Text(" non elencati, tutti più cari di questi."));
+        }
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// One listing on one line: what it costs, the two fields a widened bucket may have
+    /// merged (level and element), the combat point that places it, when it was last seen
+    /// and what became of it. No entity crosses the newline that ends it, so the list can
+    /// be cut between any two of its lines.
+    /// </summary>
+    private static void Append(StringBuilder sb, ComparableListing listing)
+    {
+        sb.Append(Ncg(listing.Price))
+          .Append(Text(" · +" + listing.Level.ToString(Culture) + " " +
+                       Elementals.Name(listing.Element)));
+
+        // A listing without a combat point is not a listing whose combat point is zero:
+        // the field is left out rather than printed as a number that would read like one.
+        if (listing.CombatPoint > 0)
+        {
+            sb.Append(Text(" · CP ")).Append(Code(listing.CombatPoint.ToString("N0", Culture)));
+        }
+
+        sb.Append(Text(" · "))
+          .Append(Code(listing.LastSeenAtUtc.ToString("yyyy-MM-dd", Culture)))
+          .Append(Text(" · " + OutcomeName(listing.Outcome)));
     }
 
     /// <summary>
@@ -149,13 +234,20 @@ public static class ValuationMessage
     /// measured on fifty.
     /// </summary>
     private static string Insufficient(ValuationQuery query, ValuationResult result) =>
-        "🤷 Non ho abbastanza dati per questo pezzo. Anche allargando fino alla stima " +
-        "larga (stesso tipo, stessa rarità, stessa presenza di skill) ho trovato " +
-        result.Comparables.ToString("N0", Culture) +
-        (result.Comparables == 1 ? " inserzione" : " inserzioni") +
-        " sulle " + query.MinSamples.ToString("N0", Culture) + " che servono.\n" +
-        "La risposta arriva da sé man mano che lo storico si allunga: il meccanismo c'è, " +
-        "i campioni no.";
+        new StringBuilder("🤷 ")
+            .Append(Text(
+                "Non ho abbastanza dati per questo pezzo. Anche allargando fino alla " +
+                "stima larga (stesso tipo, stessa rarità, stessa presenza di skill) ho " +
+                "trovato "))
+            .Append(Code(result.Comparables.ToString("N0", Culture)))
+            .Append(Text(result.Comparables == 1 ? " inserzione" : " inserzioni"))
+            .Append(Text(" sulle "))
+            .Append(Code(query.MinSamples.ToString("N0", Culture)))
+            .Append(Text(" che servono.\n"))
+            .Append(Text(
+                "La risposta arriva da sé man mano che lo storico si allunga: il " +
+                "meccanismo c'è, i campioni no."))
+            .ToString();
 
     /// <summary>
     /// When the comparables were last seen. Those dates are most of what says whether a
@@ -172,7 +264,9 @@ public static class ValuationMessage
 
         var from = oldest.ToString("yyyy-MM-dd", Culture);
         var to = newest.ToString("yyyy-MM-dd", Culture);
-        return from == to ? $" · visti il {from}" : $" · visti dal {from} al {to}";
+        return from == to
+            ? Text(" · visti il ") + Code(from)
+            : Text(" · visti dal ") + Code(from) + Text(" al ") + Code(to);
     }
 
     /// <summary>
@@ -182,7 +276,20 @@ public static class ValuationMessage
     private static string PopulationName(BaselinePopulation population) =>
         population == BaselinePopulation.Sold ? "vendite stimate" : "prezzi richiesti";
 
-    private static string Ncg(double price) => price.ToString("N2", Culture) + " NCG";
+    /// <summary>
+    /// What became of one listing, by the heuristic the rest of the project applies to a
+    /// whole bucket (see <see cref="ListingOutcome"/>): gone at a plausible price is a
+    /// sale, gone well above the going rate is a withdrawal, everything else is still on
+    /// sale.
+    /// </summary>
+    private static string OutcomeName(ListingOutcome outcome) => outcome switch
+    {
+        ListingOutcome.LikelySold => "probabile vendita",
+        ListingOutcome.LikelyWithdrawn => "probabile ritiro",
+        _ => "in vendita",
+    };
+
+    private static string Ncg(double price) => Code(price.ToString("N2", Culture) + " NCG");
 
     /// <summary>
     /// The options, named and counted. A piece with none is a piece the parser was told
@@ -204,4 +311,15 @@ public static class ValuationMessage
         Enum.IsDefined(typeof(Grade), grade)
             ? ((Grade)grade).ToString()
             : "grado " + grade.ToString(Culture);
+
+    /// <summary>
+    /// Prose, escaped. Every fixed sentence of this file goes through here rather than
+    /// being written with its backslashes already in it: the Italian is full of full stops
+    /// and parentheses, MarkdownV2 gives a meaning to both, and an escape forgotten once
+    /// does not produce an ugly message — it produces no message at all.
+    /// </summary>
+    private static string Text(string text) => MarkdownV2.Escape(text);
+
+    /// <summary>A figure, in the monospace box every figure of this project is printed in.</summary>
+    private static string Code(string value) => MarkdownV2.Code(value);
 }

@@ -49,6 +49,14 @@ public sealed record TelegramBotOptions
     public TimeSpan RetryDelay { get; init; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
+    /// How long a guided flow left halfway keeps waiting. It expires because it is the one
+    /// thing in this bot that changes what a plain message means: a conversation forgotten
+    /// a week ago would otherwise fold today's message into last week's half-described
+    /// piece.
+    /// </summary>
+    public TimeSpan DialogExpiry { get; init; } = TimeSpan.FromMinutes(30);
+
+    /// <summary>
     /// Reads the configuration from the environment, naming what is missing instead of
     /// starting a bot that is half configured.
     /// </summary>
@@ -119,13 +127,29 @@ public sealed record TelegramBotOptions
 /// </summary>
 public interface IReplyChannel
 {
-    Task SendAsync(long chatId, string message, CancellationToken ct = default);
+    /// <summary>
+    /// Sends <paramref name="message"/> to <paramref name="chatId"/>, with the buttons of
+    /// <paramref name="keyboard"/> under it when there is something worth offering next.
+    /// </summary>
+    Task SendAsync(
+        long chatId,
+        string message,
+        InlineKeyboard? keyboard = null,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Says that a press was heard. It is separate from the answer because it is not one:
+    /// Telegram spins a small clock on the pressed button until this arrives, and the
+    /// answer may take a database query longer.
+    /// </summary>
+    Task AcknowledgeAsync(string callbackId, CancellationToken ct = default);
 }
 
 /// <summary>
 /// What the bot values pieces against: the planet, and the two knobs the CLI exposes. The
-/// planet is not read from the message (see <see cref="ValuationRequestParser"/>) — a
-/// message describes a piece, not where to look for it.
+/// planet is not read from a message (see <see cref="ValuationRequestParser"/>) — a
+/// message describes a piece, not where to look for it — but it <em>is</em> read from a
+/// button, because "su odin" is the same piece asked about somewhere else.
 /// </summary>
 public sealed record ValuationDefaults
 {
@@ -143,16 +167,26 @@ public sealed record ValuationDefaults
 }
 
 /// <summary>
-/// The chatbot. It polls Telegram for messages, answers the ones coming from a chat on
-/// the allowlist, and keeps doing so for as long as the process lives.
+/// The chatbot. It polls Telegram for messages and button presses, answers the ones
+/// coming from a chat on the allowlist, and keeps doing so for as long as the process
+/// lives.
 /// <para>
 /// Nothing here decides anything about a valuation: a message becomes a query in
 /// <see cref="ValuationRequestParser"/>, the query becomes a range in
 /// <see cref="ValuationService"/>, and the range becomes words in
 /// <see cref="ValuationMessage"/>. What is left is everything that only matters because
 /// the process stands up for days and anyone can write to it — the allowlist, the rate
-/// limit, the offset that survives a restart, and the rule that one bad message must not
-/// stop the loop.
+/// limit, the offset that survives a restart, the rule that one bad message must not stop
+/// the loop — plus the one thing that only matters because a conversation has two ends:
+/// the guided flow.
+/// </para>
+/// <para>
+/// <b>The guided flow is the only state kept in memory, and a restart loses it.</b> That
+/// is affordable because it costs a repeated <c>/valuta</c>, and it is the honest shape of
+/// the thing: a half-asked question belongs to a conversation happening now. What must
+/// <em>not</em> be lost is a button under an answer already sent — a message sits on a
+/// phone for weeks — so those carry the whole query with them (see
+/// <see cref="ValuationCallback"/>) and work whoever restarted what.
 /// </para>
 /// <para>
 /// <b>The database is opened per message and closed again.</b> A connection held for days
@@ -170,25 +204,71 @@ public sealed class TelegramBot
     private static readonly TimeSpan RateWindow = TimeSpan.FromMinutes(1);
 
     /// <summary>
-    /// What the bot says when it is asked what it does, and when it is asked to value
-    /// nothing in particular. F5 turns the second case into the guided flow; until then
-    /// the example is the whole documentation of the format.
+    /// What the bot says when it is asked what it does. The example is the whole
+    /// documentation of the free-text format — the fast path, for whoever has got the hang
+    /// of it — and the line before last is the way in for everybody else.
     /// </summary>
-    private const string Help =
-        "Scrivimi il pezzo come lo leggi sull'oggetto e ti dico quanto vale, per esempio:\n" +
-        "\n" +
-        "Transcendent Sword Fire +7\n" +
-        "ATK 1.404.374\n" +
-        "DEF 3.359.312\n" +
-        "skill si\n" +
-        "CP 151.216.255\n" +
-        "\n" +
-        "L'ordine delle righe non conta, e va bene anche tutto su una riga. Rarità, tipo " +
-        "ed elemento servono sempre; livello (+0 se non lo scrivi), skill, custom craft e " +
-        "CP sono facoltativi.\n" +
-        "\n" +
-        "Rispondo con come ho letto il messaggio — così un errore di lettura si vede " +
-        "subito — e con l'intervallo di prezzo delle inserzioni comparabili.";
+    private static readonly string Help = string.Join('\n', new[]
+    {
+        MarkdownV2.Escape(
+            "Scrivimi il pezzo come lo leggi sull'oggetto e ti dico quanto vale, per esempio:"),
+        "",
+        MarkdownV2.Code("Transcendent Sword Fire +7"),
+        MarkdownV2.Code("ATK 1.404.374"),
+        MarkdownV2.Code("DEF 3.359.312"),
+        MarkdownV2.Code("skill si"),
+        MarkdownV2.Code("CP 151.216.255"),
+        "",
+        MarkdownV2.Escape(
+            "L'ordine delle righe non conta, e va bene anche tutto su una riga. Rarità, " +
+            "tipo ed elemento servono sempre; livello (+0 se non lo scrivi), skill, " +
+            "custom craft e CP sono facoltativi."),
+        "",
+        MarkdownV2.Escape("Se preferisci non scrivere niente, ") +
+        MarkdownV2.Code("/valuta") +
+        MarkdownV2.Escape(" te li chiede uno per uno, coi bottoni."),
+        "",
+        MarkdownV2.Escape(
+            "Rispondo con come ho letto il messaggio — così un errore di lettura si vede " +
+            "subito — e con l'intervallo di prezzo delle inserzioni comparabili."),
+    });
+
+    /// <summary>The eight rarities, four to a row so that each stays readable on a phone.</summary>
+    private static readonly InlineKeyboard GradeButtons = InlineKeyboard.Wrap(
+        Grades.All.Select(g => new InlineButton(
+            g.ToString(), ValuationCallback.Encode(DialogField.Grade, (int)g))),
+        perRow: 4);
+
+    private static readonly InlineKeyboard TypeButtons = InlineKeyboard.Wrap(
+        EquipmentTypes.All.Select(t => new InlineButton(
+            t.ToString(), ValuationCallback.Encode(DialogField.Type, (int)t))),
+        perRow: 3);
+
+    private static readonly InlineKeyboard ElementButtons = InlineKeyboard.Wrap(
+        Elementals.All.Select(e => new InlineButton(
+            Elementals.Name(e), ValuationCallback.Encode(DialogField.Element, (int)e))),
+        perRow: 3);
+
+    private static readonly InlineKeyboard SkillButtons = InlineKeyboard.Wrap(
+        new[]
+        {
+            new InlineButton("Con skill", ValuationCallback.Encode(DialogField.Skill, 1)),
+            new InlineButton("Senza skill", ValuationCallback.Encode(DialogField.Skill, 0)),
+        },
+        perRow: 2);
+
+    /// <summary>
+    /// The last step is the only one that is typed, so it is the only one whose keyboard
+    /// is a way out of typing: a piece with no option at all is a real piece, and asking
+    /// for it in words would mean asking somebody to write "niente".
+    /// </summary>
+    private static readonly InlineKeyboard OptionButtons = InlineKeyboard.Wrap(
+        new[]
+        {
+            new InlineButton("Nessuna opzione", ValuationCallback.Encode(DialogField.NoOptions)),
+            new InlineButton("Annulla", ValuationCallback.Encode(DialogField.Cancel)),
+        },
+        perRow: 2);
 
     private readonly TelegramBotOptions _options;
     private readonly ITelegramUpdateSource _updates;
@@ -198,6 +278,7 @@ public sealed class TelegramBot
     private readonly Action<string>? _log;
     private readonly Func<DateTime> _clock;
     private readonly Dictionary<long, ChatRate> _rates = new();
+    private readonly Dictionary<long, Dialog> _dialogs = new();
 
     public TelegramBot(
         TelegramBotOptions options,
@@ -283,13 +364,15 @@ public sealed class TelegramBot
     }
 
     /// <summary>
-    /// Answers one update, or deliberately does not. The two silences — an update that
-    /// carries no text, and a chat that is not on the allowlist — are the only paths that
-    /// produce nothing at all.
+    /// Answers one update, or deliberately does not. The two silences — an update that is
+    /// neither text nor a press, and a chat that is not on the allowlist — are the only
+    /// paths that produce nothing at all.
     /// </summary>
     private async Task HandleAsync(TelegramUpdate update, CancellationToken ct)
     {
-        if (update.ChatId == 0 || string.IsNullOrWhiteSpace(update.Text))
+        if (update.ChatId == 0
+            || (string.IsNullOrWhiteSpace(update.Text)
+                && string.IsNullOrWhiteSpace(update.CallbackData)))
         {
             return;
         }
@@ -302,6 +385,22 @@ public sealed class TelegramBot
             return;
         }
 
+        // Before the database, and before the rate limit too: an acknowledgement is not an
+        // answer, it is what tells the phone the button was heard. Even a press refused for
+        // frequency deserves to stop spinning, and a failed acknowledgement must not cost
+        // the answer that is about to be sent.
+        if (update.CallbackId is string callbackId)
+        {
+            try
+            {
+                await _replies.AcknowledgeAsync(callbackId, ct);
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                Log($"Conferma del bottone non riuscita: {e.Message}");
+            }
+        }
+
         if (!Allow(update.ChatId, out var warn))
         {
             if (warn)
@@ -312,29 +411,29 @@ public sealed class TelegramBot
                         "Troppi messaggi: ne leggo al massimo " +
                         _options.MessagesPerMinute.ToString(CultureInfo.InvariantCulture) +
                         " al minuto. Riprova fra poco."),
-                    ct);
+                    ct: ct);
             }
 
             return;
         }
 
-        // Everything the answer is made of comes from a parsed enum, a number or the
-        // fixed Italian text of this project — nothing of the sender's survives into it —
-        // so the whole reply can be escaped in one call. There is no entity in it to
-        // break, which is what makes that safe (see ValuationMessage).
-        await _replies.SendAsync(update.ChatId, MarkdownV2.Escape(Answer(update.Text!)), ct);
+        var reply = update.CallbackData is string data
+            ? Pressed(update.ChatId, data)
+            : Answer(update.ChatId, update.Text!);
+
+        await _replies.SendAsync(update.ChatId, reply.Text, reply.Keyboard, ct);
     }
 
     /// <summary>
-    /// The text to answer with. A command is dispatched on its first token; anything else
-    /// is a piece to value, because that is what people write to this bot.
+    /// The answer to a written message. A command is dispatched on its first token;
+    /// anything else is a piece to value, because that is what people write to this bot.
     /// </summary>
-    private string Answer(string message)
+    private Reply Answer(long chatId, string message)
     {
         var text = message.Trim();
         if (!text.StartsWith('/'))
         {
-            return Valuation(text);
+            return Typed(chatId, text);
         }
 
         var end = text.IndexOfAny(new[] { ' ', '\t', '\n', '\r' });
@@ -349,13 +448,183 @@ public sealed class TelegramBot
             command = command[..at];
         }
 
+        // A command is a fresh start by definition: whatever half-asked question was open,
+        // it is not what this message is about.
+        var had = _dialogs.Remove(chatId);
+
         return command switch
         {
-            "/start" or "/help" or "/aiuto" => Help,
-            "/valuta" => string.IsNullOrWhiteSpace(rest) ? Help : Valuation(rest),
-            _ => $"Non conosco il comando '{command}'. Ho /valuta e /aiuto — e per una " +
-                 "valutazione il comando non serve: scrivimi il pezzo e basta.",
+            "/start" or "/help" or "/aiuto" => new Reply(Help),
+            "/valuta" => string.IsNullOrWhiteSpace(rest) ? Start(chatId) : Valuation(rest),
+            "/annulla" => Plain(had
+                ? "Va bene, lasciamo perdere. Quando vuoi ricominci con /valuta, oppure " +
+                  "mi scrivi il pezzo e basta."
+                : "Non c'era niente da annullare."),
+            _ => Plain(
+                $"Non conosco il comando '{command}'. Ho /valuta, /annulla e /aiuto — e " +
+                "per una valutazione il comando non serve: scrivimi il pezzo e basta."),
         };
+    }
+
+    /// <summary>
+    /// A message written while a guided flow is open. The flow only gets this far when it
+    /// is waiting for the options, which are the one thing buttons cannot ask for.
+    /// <para>
+    /// What is typed is joined to what was pressed and the join is parsed as one message:
+    /// one parser and one echo, so a piece described half by buttons and half by hand is
+    /// answered exactly like one described entirely by hand.
+    /// </para>
+    /// <para>
+    /// When the join does not parse but the message alone does, the message wins and the
+    /// flow is dropped. That is somebody who opened the guided flow and then wrote the
+    /// piece out in full from habit: the alternative is answering "due rarità" to a
+    /// perfectly good message, which reads as a bot that has broken rather than one that
+    /// was waiting.
+    /// </para>
+    /// </summary>
+    private Reply Typed(long chatId, string text)
+    {
+        if (!TryDialog(chatId, out var dialog))
+        {
+            return Valuation(text);
+        }
+
+        // Either way the conversation ends here: with the answer it was waiting for, or
+        // because a message arrived instead of the press it had asked for, and leaving the
+        // keyboard alive would leave two half-questions open at once.
+        _dialogs.Remove(chatId);
+        if (!dialog.IsComplete)
+        {
+            return Valuation(text);
+        }
+
+        var joined = (dialog.Prefix() + " " + text).Trim();
+        return ValuationRequestParser.TryParse(joined, _defaults.Planet, out _, out _)
+               || !ValuationRequestParser.TryParse(text, _defaults.Planet, out _, out _)
+            ? Valuation(joined)
+            : Valuation(text);
+    }
+
+    /// <summary>
+    /// The answer to a press. The two vocabularies are told apart by the data itself (see
+    /// <see cref="ValuationCallback"/>), and data belonging to neither is named rather
+    /// than ignored: a button that does nothing at all cannot be told from a bot that has
+    /// stopped.
+    /// </summary>
+    private Reply Pressed(long chatId, string data)
+    {
+        if (ValuationCallback.TryDecodeDialog(data, out var field, out var value))
+        {
+            return Answered(chatId, field, value);
+        }
+
+        if (ValuationCallback.TryDecode(data, out var action, out var query))
+        {
+            // Widening and changing planet are already in the query the button carries:
+            // what is left for the action to say is whether the answer is the range or the
+            // listings under it.
+            return action == ValuationAction.Comparables ? Listing(query!) : Valuation(query!);
+        }
+
+        Log($"Bottone non riconosciuto: '{data}'.");
+        return Plain(
+            "Questo bottone non lo conosco: sarà di una versione precedente del bot. " +
+            "Riscrivimi il pezzo, o ricomincia con /valuta.");
+    }
+
+    /// <summary>One field of the guided flow, answered by a press.</summary>
+    private Reply Answered(long chatId, DialogField field, int value)
+    {
+        if (field == DialogField.Cancel)
+        {
+            _dialogs.Remove(chatId);
+            return Plain("Va bene, lasciamo perdere. Quando vuoi ricominci con /valuta.");
+        }
+
+        if (!TryDialog(chatId, out var dialog))
+        {
+            // In memory and only in memory: a restart, or half an hour of silence, and the
+            // conversation is gone. Saying so costs one message, and is the whole price of
+            // not keeping conversations in the database.
+            return Plain(
+                "Non ho più questa domanda in corso: mi sono riavviato, o è passato " +
+                "troppo tempo. Ricomincia con /valuta.");
+        }
+
+        switch (field)
+        {
+            case DialogField.Grade when Enum.IsDefined(typeof(Grade), value):
+                dialog.Grade = (Grade)value;
+                break;
+            case DialogField.Type when Enum.IsDefined(typeof(EquipmentType), value):
+                dialog.Type = (EquipmentType)value;
+                break;
+            case DialogField.Element when Enum.IsDefined(typeof(ElementalType), value):
+                dialog.Element = (ElementalType)value;
+                break;
+            case DialogField.Skill:
+                dialog.HasSkill = value == 1;
+                break;
+            case DialogField.NoOptions when dialog.IsComplete:
+                _dialogs.Remove(chatId);
+                return Valuation(dialog.Prefix());
+            default:
+                Log("Bottone fuori posto: " + field +
+                    " = " + value.ToString(CultureInfo.InvariantCulture) + ".");
+                return Plain(
+                    "Questo bottone non risponde alla domanda che ti ho fatto. " +
+                    "Ricomincia con /valuta.");
+        }
+
+        dialog.TouchedUtc = _clock();
+        return Ask(dialog);
+    }
+
+    /// <summary>Opens a guided flow for this chat, replacing whatever it had open.</summary>
+    private Reply Start(long chatId)
+    {
+        var dialog = new Dialog { TouchedUtc = _clock() };
+        _dialogs[chatId] = dialog;
+        return Ask(dialog);
+    }
+
+    /// <summary>
+    /// The first field still unanswered, with the buttons that answer it. Four of the six
+    /// fields of a piece are enumerable — eight rarities, five types, five elements, skill
+    /// or no skill — and a button is the difference between a field that cannot be got
+    /// wrong and one that can.
+    /// </summary>
+    private static Reply Ask(Dialog dialog)
+    {
+        if (dialog.Grade is null)
+        {
+            return new Reply(MarkdownV2.Escape("Che rarità è il pezzo?"), GradeButtons);
+        }
+
+        if (dialog.Type is null)
+        {
+            return new Reply(MarkdownV2.Escape("Che tipo di pezzo è?"), TypeButtons);
+        }
+
+        if (dialog.Element is null)
+        {
+            return new Reply(MarkdownV2.Escape("Che elemento ha?"), ElementButtons);
+        }
+
+        if (dialog.HasSkill is null)
+        {
+            return new Reply(MarkdownV2.Escape("Ha una skill?"), SkillButtons);
+        }
+
+        return new Reply(
+            MarkdownV2.Escape("Ultimo passo: scrivimi le opzioni, per esempio ") +
+            MarkdownV2.Code("ATK 1.404.374 DEF 3.359.312") +
+            MarkdownV2.Escape(".\nSe vuoi, aggiungi anche il livello (") +
+            MarkdownV2.Code("+7") +
+            MarkdownV2.Escape(") e il combat point (") +
+            MarkdownV2.Code("CP 151.216.255") +
+            MarkdownV2.Escape(")."),
+            OptionButtons);
     }
 
     /// <summary>
@@ -363,15 +632,31 @@ public sealed class TelegramBot
     /// it could not read and why: this is a conversation, and an exception raised inside
     /// a polling loop would reach the sender as a silence.
     /// </summary>
-    private string Valuation(string text)
-    {
-        if (!ValuationRequestParser.TryParse(
-                text, _defaults.Planet, out var parsed, out var error))
-        {
-            return error!;
-        }
+    private Reply Valuation(string text) =>
+        ValuationRequestParser.TryParse(text, _defaults.Planet, out var parsed, out var error)
+            ? Valuation(parsed!)
+            : Plain(error!);
 
-        var query = parsed! with
+    /// <summary>The range, with the buttons that take it apart or widen it.</summary>
+    private Reply Valuation(ValuationQuery query) =>
+        Measure(query, (settled, result) => new Reply(
+            ValuationMessage.Echo(settled) + "\n\n" + ValuationMessage.Answer(settled, result),
+            Follow(settled, result)));
+
+    /// <summary>The listings behind the range: the same measurement, said in full.</summary>
+    private Reply Listing(ValuationQuery query) =>
+        Measure(query, (settled, result) =>
+            new Reply(ValuationMessage.Comparables(settled, result)));
+
+    /// <summary>
+    /// Runs a valuation and says it. The settings of the running bot are applied here and
+    /// not by the callers, so that a query typed out and the same query pressed on a
+    /// button are measured the same way — and so that the history window is an instant
+    /// taken now rather than one taken at startup.
+    /// </summary>
+    private Reply Measure(ValuationQuery query, Func<ValuationQuery, ValuationResult, Reply> say)
+    {
+        var settled = query with
         {
             MinSamples = _defaults.MinSamples,
             SinceUtc = _defaults.Days is int days ? _clock().AddDays(-days) : null,
@@ -380,17 +665,79 @@ public sealed class TelegramBot
         try
         {
             using var db = _openDb();
-            var result = new ValuationService(db).Evaluate(query);
-            return ValuationMessage.Echo(query) + "\n\n" + ValuationMessage.Answer(query, result);
+            return say(settled, new ValuationService(db).Evaluate(settled));
         }
         catch (SqliteException e)
         {
             // Almost always the VACUUM of a scheduled prune. It lasts seconds, and saying
             // so is a better answer than a valuation that never arrives.
             Log($"Database non disponibile: {e.Message}");
-            return "Il database è occupato da un altro comando (di solito la manutenzione " +
-                   "periodica): riprova fra qualche secondo.";
+            return Plain(
+                "Il database è occupato da un altro comando (di solito la manutenzione " +
+                "periodica): riprova fra qualche secondo.");
         }
+    }
+
+    /// <summary>
+    /// What is worth offering under an answer. Every button re-asks a question that would
+    /// otherwise cost typing the whole piece out again:
+    /// <list type="bullet">
+    /// <item>the comparables, when there are any — a range from 11 to 333 NCG cannot be
+    /// used until the 333 has been seen for what it is;</item>
+    /// <item>the same piece on every element, but only while the element is still
+    /// narrowing something: on a bucket already widened past it, the button would promise
+    /// a different answer and return the same one;</item>
+    /// <item>the other planet, always. It is the one thing about the question that was
+    /// never in the message.</item>
+    /// </list>
+    /// </summary>
+    private static InlineKeyboard Follow(ValuationQuery query, ValuationResult result)
+    {
+        var buttons = new List<InlineButton>(3);
+
+        if (result.Status == ValuationStatus.Ok && result.Listings.Count > 0)
+        {
+            buttons.Add(new InlineButton(
+                "🔍 Vedi i comparabili",
+                ValuationCallback.Encode(ValuationAction.Comparables, query)));
+        }
+
+        if (result.Step == ValuationStep.Exact)
+        {
+            buttons.Add(new InlineButton(
+                "🌐 Senza elemento",
+                ValuationCallback.Encode(
+                    ValuationAction.Widen,
+                    query with { StartStep = ValuationStep.AnyElement })));
+        }
+
+        var elsewhere = Planet.All.First(p => p.Name != query.Planet.Name);
+        buttons.Add(new InlineButton(
+            "🪐 Su " + elsewhere.Name,
+            ValuationCallback.Encode(
+                ValuationAction.OtherPlanet, query with { Planet = elsewhere })));
+
+        return InlineKeyboard.Column(buttons.ToArray());
+    }
+
+    /// <summary>
+    /// The guided flow of this chat, when there is one and it is still recent enough to be
+    /// the conversation this message belongs to.
+    /// </summary>
+    private bool TryDialog(long chatId, out Dialog dialog)
+    {
+        if (_dialogs.TryGetValue(chatId, out dialog!))
+        {
+            if (_clock() - dialog.TouchedUtc <= _options.DialogExpiry)
+            {
+                return true;
+            }
+
+            _dialogs.Remove(chatId);
+        }
+
+        dialog = null!;
+        return false;
     }
 
     /// <summary>
@@ -428,6 +775,9 @@ public sealed class TelegramBot
         return true;
     }
 
+    /// <summary>Prose, escaped, so Telegram prints it exactly as it reads here.</summary>
+    private static Reply Plain(string text) => new(MarkdownV2.Escape(text));
+
     /// <summary>What one chat has sent lately, and whether it has been told to slow down.</summary>
     private sealed class ChatRate
     {
@@ -435,6 +785,45 @@ public sealed class TelegramBot
 
         public bool Warned { get; set; }
     }
+
+    /// <summary>
+    /// A piece being described one button at a time. It holds the four enumerable fields
+    /// and the instant it was last touched, and nothing else: the options are typed, and
+    /// what is typed goes straight to the parser.
+    /// </summary>
+    private sealed class Dialog
+    {
+        public Grade? Grade { get; set; }
+
+        public EquipmentType? Type { get; set; }
+
+        public ElementalType? Element { get; set; }
+
+        public bool? HasSkill { get; set; }
+
+        public DateTime TouchedUtc { get; set; }
+
+        /// <summary>Whether every button has been pressed, so that only the options are left.</summary>
+        public bool IsComplete =>
+            Grade is not null && Type is not null && Element is not null && HasSkill is not null;
+
+        /// <summary>
+        /// What was pressed, written as the message it stands for. The flow builds no
+        /// <see cref="ValuationKey"/> of its own: it writes the free text a person would
+        /// have typed and hands it to the same parser, so that there is one reading of a
+        /// piece in this project rather than two that can drift apart.
+        /// </summary>
+        public string Prefix() =>
+            $"{Grade} {Type} {Elementals.Name(Element!.Value)} " +
+            $"skill {(HasSkill!.Value ? "si" : "no")}";
+    }
+
+    /// <summary>
+    /// What goes back to a chat: the text, already in MarkdownV2, and what to offer next.
+    /// The keyboard travels with the text because it is part of the same answer — buttons
+    /// sent as a message of their own would be a message that says nothing on its own.
+    /// </summary>
+    private sealed record Reply(string Text, InlineKeyboard? Keyboard = null);
 
     /// <summary>
     /// Where to resume from. Without this a restart either rereads the queue — answering

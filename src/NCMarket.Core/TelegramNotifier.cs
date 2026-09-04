@@ -138,18 +138,50 @@ public sealed class TelegramNotifier : INotificationChannel, IReplyChannel, IDis
             ?? throw new InvalidOperationException(
                 "Questo canale non ha una chat di destinazione: è stato costruito per " +
                 "rispondere a chi scrive (vedi TelegramBot), non per annunciare."),
+            keyboard: null,
             ct);
 
     /// <summary>
-    /// Sends the message to <paramref name="chatId"/>, which is how the bot answers the
-    /// chat that asked: same splitting, same retries, same fallback to unparsed text as
-    /// an alert, because none of that has anything to do with who is being written to.
+    /// Sends the message to <paramref name="chatId"/>, with the buttons of
+    /// <paramref name="keyboard"/> under it, which is how the bot answers the chat that
+    /// asked: same splitting, same retries, same fallback to unparsed text as an alert,
+    /// because none of that has anything to do with who is being written to.
     /// </summary>
     /// <inheritdoc cref="SendAsync(string, CancellationToken)"/>
-    public Task SendAsync(long chatId, string message, CancellationToken ct = default) =>
-        SendAsync(message, chatId.ToString(CultureInfo.InvariantCulture), ct);
+    public Task SendAsync(
+        long chatId,
+        string message,
+        InlineKeyboard? keyboard = null,
+        CancellationToken ct = default) =>
+        SendAsync(message, chatId.ToString(CultureInfo.InvariantCulture), keyboard, ct);
 
-    private async Task SendAsync(string message, string chatId, CancellationToken ct)
+    /// <summary>
+    /// Tells Telegram the press was heard, which is what stops the little clock the
+    /// sender's client spins on the button. It is deliberately neither retried nor
+    /// reported: the answer to the press is already on its way through
+    /// <see cref="SendAsync(long, string, InlineKeyboard?, CancellationToken)"/>, and a
+    /// lost acknowledgement costs a spinner Telegram gives up on by itself — while
+    /// throwing here would cost the answer.
+    /// </summary>
+    public async Task AcknowledgeAsync(string callbackId, CancellationToken ct = default)
+    {
+        var url = $"https://api.telegram.org/bot{_options.Token}/answerCallbackQuery";
+        using var content = new FormUrlEncodedContent(
+            new Dictionary<string, string> { ["callback_query_id"] = callbackId });
+
+        try
+        {
+            using var response = await _http.PostAsync(url, content, ct);
+        }
+        catch (Exception e)
+            when (e is HttpRequestException
+                      or TaskCanceledException && !ct.IsCancellationRequested)
+        {
+        }
+    }
+
+    private async Task SendAsync(
+        string message, string chatId, InlineKeyboard? keyboard, CancellationToken ct)
     {
         var parts = Split(message, MaxMessageLength);
         for (var i = 0; i < parts.Count; i++)
@@ -159,7 +191,10 @@ public sealed class TelegramNotifier : INotificationChannel, IReplyChannel, IDis
                 await Task.Delay(PartDelay, ct);
             }
 
-            await PostAsync(parts[i], chatId, ct);
+            // The keyboard belongs to the message it is about, which is the last part of
+            // it: buttons halfway up a split answer would sit above the range they offer
+            // to take apart.
+            await PostAsync(parts[i], chatId, i == parts.Count - 1 ? keyboard : null, ct);
         }
     }
 
@@ -233,7 +268,8 @@ public sealed class TelegramNotifier : INotificationChannel, IReplyChannel, IDis
         return parts;
     }
 
-    private async Task PostAsync(string text, string chatId, CancellationToken ct)
+    private async Task PostAsync(
+        string text, string chatId, InlineKeyboard? keyboard, CancellationToken ct)
     {
         var url = $"https://api.telegram.org/bot{_options.Token}/sendMessage";
         var delay = TimeSpan.FromSeconds(1);
@@ -264,6 +300,14 @@ public sealed class TelegramNotifier : INotificationChannel, IReplyChannel, IDis
                 if (!_plainText)
                 {
                     form["parse_mode"] = "MarkdownV2";
+                }
+
+                // The buttons are markup of their own and survive the fallback above: a
+                // message Telegram would not parse is worth sending unparsed, and it is
+                // worth sending with the follow-ups it was going to offer.
+                if (keyboard is not null)
+                {
+                    form["reply_markup"] = keyboard.ToJson();
                 }
 
                 using var content = new FormUrlEncodedContent(form);

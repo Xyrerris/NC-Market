@@ -495,7 +495,7 @@ non sono opzioni.
 
 ---
 
-## F5 — Flusso guidato e follow-up
+## F5 — Flusso guidato e follow-up ✅ FATTO
 
 **Dove**: `src/NCMarket.Core/TelegramBot.cs`, `src/NCMarket.Core/ValuationMessage.cs`
 
@@ -533,9 +533,56 @@ ripartire il testo senza `parse_mode`.
 **Fatto quando**: `/valuta` porta a una stima senza che l'utente scriva altro che i
 numeri delle opzioni.
 
-**Verificato da**: casi in `TelegramBotTests` sul giro dei callback e in
-`ValuationMessageTests` sul layout per intero, sul ripiego senza CP, sulla dichiarazione
-del passo di allargamento e sull'escaping del nome dell'item.
+**Fatto**: `InlineKeyboard` (i bottoni e il loro `reply_markup`), `ValuationCallback` (cosa
+portano), il flusso guidato dentro `TelegramBot` e l'elenco dei comparabili in
+`ValuationMessage`. `TelegramUpdateSource` si è iscritto anche ai `callback_query` — un tipo
+di aggiornamento lasciato fuori da `allowed_updates` non è un errore, è silenzio — e
+`TelegramNotifier` ha imparato `reply_markup` e `answerCallbackQuery`. Cinque decisioni che
+il piano lasciava aperte:
+
+- **lo stato per chat sta in memoria, ma i bottoni no.** Il piano diceva "lo stato per chat
+  sta in memoria" e vale per la conversazione, che è una cosa che sta succedendo adesso e
+  che un riavvio può legittimamente perdere. Non vale per un bottone: un messaggio resta sul
+  telefono per settimane, e un bottone che rispondesse "non me lo ricordo più" sarebbe un
+  bottone rotto. Quindi ogni bottone di follow-up **porta con sé la domanda intera** —
+  pianeta, chiave, CP e gradino di partenza in una cinquantina di caratteri, dentro i 64 byte
+  che Telegram concede a `callback_data` — e il bot non conserva niente per rispondergli;
+- **"senza elemento" è un campo della richiesta, non un secondo metodo.** `ValuationQuery`
+  ha ora `StartStep`, e `ValuationService` salta i gradini sotto quello chiesto invece di
+  usare una scala diversa: così un allargamento scelto e uno subìto producono lo stesso
+  identico risultato, e `ValuationResult.Step` resta l'unica cosa che dichiara dov'è stata
+  misurata la stima;
+- **il flusso guidato non costruisce una `ValuationKey`**: riscrive ciò che è stato premuto
+  come il messaggio che una persona avrebbe scritto e lo dà allo stesso parser. C'è una sola
+  lettura di un pezzo in questo progetto, e l'eco che torna indietro è la stessa per
+  entrambe le strade. Da qui anche il caso che il piano non nominava: se durante il flusso
+  arriva un pezzo scritto per intero, vince il pezzo scritto — rispondere "due rarità" a un
+  messaggio perfettamente buono si legge come un bot rotto, non come un bot che aspettava;
+- **la conversazione scade** dopo mezz'ora. È l'unica cosa nel bot che cambia il significato
+  di un messaggio qualunque, e una conversazione dimenticata la settimana scorsa
+  impacchetterebbe il messaggio di oggi dentro il pezzo di allora;
+- **il testo passa da `MarkdownV2.Escape` frase per frase**, non più in un colpo solo alla
+  fine: l'italiano è pieno di punti e parentesi, e un `\` dimenticato non produce un
+  messaggio brutto, produce **nessun** messaggio. Le entità restano dentro la riga, che è ciò
+  che permette a `TelegramNotifier.Split` di tagliare un elenco lungo fra due righe qualsiasi.
+
+Una pressione viene confermata (`answerCallbackQuery`) **prima** della query sul database e
+prima del limite di frequenza: la conferma non è la risposta, è ciò che dice al telefono che
+il bottone è stato sentito, e se fallisce non si porta via la risposta.
+
+**Verificato da**: `TelegramBotTests` — il giro completo del flusso guidato (quattro
+pressioni e una riga di opzioni, con le conferme), l'ultimo passo chiuso col bottone
+"nessuna opzione", i bottoni di una risposta premuti da un **secondo processo** sullo stesso
+database, "senza elemento" che dichiara l'allargamento e poi non si ripropone, l'altro
+pianeta che offre la strada di ritorno, un bottone di una versione precedente che viene
+nominato, una conversazione persa che lo dice, un pezzo scritto durante il flusso che vince,
+un comando che chiude il flusso. `ValuationCallbackTests` — andata e ritorno della domanda
+coi suoi campi facoltativi, il pezzo più largo che sta nei 64 byte, dodici forme di dati che
+nessuno qui ha scritto e che vengono rifiutate, e i due vocabolari che non rispondono l'uno
+per l'altro. `ValuationMessageTests` — eco e risposta con il loro markup per intero,
+l'elenco dei comparabili dal più economico, il taglio oltre venti con quanti ne restano,
+il bucket vuoto, e l'invariante che nessuna entità attraversa un a capo.
+`ValuationServiceTests` — la scala presa da un gradino più in alto.
 
 ---
 

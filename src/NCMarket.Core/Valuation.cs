@@ -207,6 +207,21 @@ public sealed record ValuationQuery
     public int MinSamples { get; init; } = 5;
 
     /// <summary>
+    /// Lowest rung of <see cref="ValuationSteps.Ladder"/> to try. The default
+    /// <see cref="ValuationStep.Exact"/> is the piece as it was described, which is what a
+    /// message asks for; anything higher is a widening somebody <em>chose</em> — the
+    /// "senza elemento" button of the bot — rather than one the ladder was driven to by a
+    /// bucket too small to say anything.
+    /// <para>
+    /// It is a field of the query and not a second method because the answer has to come
+    /// out the same either way: <see cref="ValuationResult.Step"/> declares where the
+    /// range was measured, and whoever reads it cannot tell — and must not have to tell —
+    /// whether that rung was reached or requested.
+    /// </para>
+    /// </summary>
+    public ValuationStep StartStep { get; init; } = ValuationStep.Exact;
+
+    /// <summary>
     /// Keep only listings still on sale after this instant; null uses the whole history.
     /// </summary>
     public DateTime? SinceUtc { get; init; }

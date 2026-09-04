@@ -6,12 +6,27 @@ namespace NCMarket.Core;
 
 /// <summary>
 /// One thing Telegram has to hand over: an update, reduced to what a bot that answers
-/// questions needs. Anything that is not a text message — a photo, someone joining a
-/// group, an edited message — arrives with <see cref="Text"/> null and is still an
-/// update: its <see cref="UpdateId"/> has to advance the offset like any other, or the
-/// next poll asks for it again and the bot never moves past it.
+/// questions needs. Anything that is neither a text message nor a button — a photo,
+/// someone joining a group, an edited message — arrives with everything but
+/// <see cref="UpdateId"/> empty and is still an update: its id has to advance the offset
+/// like any other, or the next poll asks for it again and the bot never moves past it.
 /// </summary>
-public sealed record TelegramUpdate(long UpdateId, long ChatId, string? Text);
+/// <param name="CallbackData">
+/// What a pressed button carries (see <see cref="ValuationCallback"/>), null for an
+/// ordinary message. A text and a press never arrive together, so the two are
+/// alternatives and not a pair.
+/// </param>
+/// <param name="CallbackId">
+/// The press to acknowledge. Telegram keeps a small clock spinning on the phone that sent
+/// it until <c>answerCallbackQuery</c> arrives, which is why the id has to travel as far
+/// as the answer: a button left spinning reads as a bot that did not hear.
+/// </param>
+public sealed record TelegramUpdate(
+    long UpdateId,
+    long ChatId,
+    string? Text,
+    string? CallbackData = null,
+    string? CallbackId = null);
 
 /// <summary>
 /// Where the messages written to the bot come from. It is an interface because the bot's
@@ -79,11 +94,12 @@ public sealed class TelegramUpdateSource : ITelegramUpdateSource, IDisposable
     private const string SafeUrl = "https://api.telegram.org/bot<token>/getUpdates";
 
     /// <summary>
-    /// Only messages are asked for. Telegram sends a bot the update types it subscribes
-    /// to and nothing else, so the button callbacks of F5 will have to be listed here
-    /// too — an update type left out is not an error, it is silence.
+    /// Messages and button presses, and nothing else. Telegram sends a bot the update
+    /// types it subscribes to and no others, so this list is what makes a keyboard work at
+    /// all: a type left out of it is not an error anywhere, it is silence — the button
+    /// spins on the phone and the bot never hears of it.
     /// </summary>
-    private const string AllowedUpdates = "[\"message\"]";
+    private const string AllowedUpdates = "[\"message\",\"callback_query\"]";
 
     private readonly string _token;
     private readonly TimeSpan _pollTimeout;
@@ -179,28 +195,56 @@ public sealed class TelegramUpdateSource : ITelegramUpdateSource, IDisposable
 
             var chatId = 0L;
             string? text = null;
+            string? callbackData = null;
+            string? callbackId = null;
+
             if (element.TryGetProperty("message", out var message)
                 && message.ValueKind == JsonValueKind.Object)
             {
-                if (message.TryGetProperty("chat", out var chat)
-                    && chat.ValueKind == JsonValueKind.Object
-                    && chat.TryGetProperty("id", out var chatIdElement))
+                chatId = ChatOf(message);
+                text = String(message, "text");
+            }
+            else if (element.TryGetProperty("callback_query", out var callback)
+                     && callback.ValueKind == JsonValueKind.Object)
+            {
+                // A press names the message it was made on, and that message is the bot's
+                // own answer: the chat is read from there, because the person who pressed
+                // is not the one who is written back to — the chat is.
+                if (callback.TryGetProperty("message", out var origin)
+                    && origin.ValueKind == JsonValueKind.Object)
                 {
-                    chatIdElement.TryGetInt64(out chatId);
+                    chatId = ChatOf(origin);
                 }
 
-                if (message.TryGetProperty("text", out var textElement)
-                    && textElement.ValueKind == JsonValueKind.String)
-                {
-                    text = textElement.GetString();
-                }
+                callbackData = String(callback, "data");
+                callbackId = String(callback, "id");
             }
 
-            updates.Add(new TelegramUpdate(updateId, chatId, text));
+            updates.Add(new TelegramUpdate(updateId, chatId, text, callbackData, callbackId));
         }
 
         return updates;
     }
+
+    /// <summary>The id of the chat an object belongs to, or zero when it has none.</summary>
+    private static long ChatOf(JsonElement owner)
+    {
+        var id = 0L;
+        if (owner.TryGetProperty("chat", out var chat)
+            && chat.ValueKind == JsonValueKind.Object
+            && chat.TryGetProperty("id", out var chatId))
+        {
+            chatId.TryGetInt64(out id);
+        }
+
+        return id;
+    }
+
+    /// <summary>One string property, or null when it is absent or is not a string.</summary>
+    private static string? String(JsonElement owner, string name) =>
+        owner.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
 
     /// <summary>
     /// The <c>description</c> of a refusal, which is the whole diagnosis. A body that is
