@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net;
 using System.Text;
 using System.Text.Json;
@@ -25,7 +26,13 @@ public sealed record TelegramOptions
 
     public required string Token { get; init; }
 
-    public required string ChatId { get; init; }
+    /// <summary>
+    /// Chat the alerts go to. Null for the bot of <see cref="TelegramBot"/>, which has
+    /// none: it answers whoever wrote to it, so the destination is a property of the
+    /// message and not of the configuration. <see cref="TryFromEnvironment"/> still
+    /// requires it, because a job that announces has to know where.
+    /// </summary>
+    public string? ChatId { get; init; }
 
     /// <summary>
     /// Reads the configuration from the environment. Returns false — naming the variables
@@ -76,7 +83,7 @@ public sealed record TelegramOptions
 /// machine running the job needs no public address, no inbound port and no certificate.
 /// </para>
 /// </summary>
-public sealed class TelegramNotifier : INotificationChannel, IDisposable
+public sealed class TelegramNotifier : INotificationChannel, IReplyChannel, IDisposable
 {
     /// <summary>
     /// Characters Telegram accepts in one message. A longer text is not truncated by the
@@ -124,7 +131,57 @@ public sealed class TelegramNotifier : INotificationChannel, IDisposable
     /// Telegram refused the message (wrong token, unknown chat, a bot the recipient never
     /// started) or kept failing after three attempts.
     /// </exception>
-    public async Task SendAsync(string message, CancellationToken ct = default)
+    public Task SendAsync(string message, CancellationToken ct = default) =>
+        SendAsync(
+            message,
+            _options.ChatId
+            ?? throw new InvalidOperationException(
+                "Questo canale non ha una chat di destinazione: è stato costruito per " +
+                "rispondere a chi scrive (vedi TelegramBot), non per annunciare."),
+            keyboard: null,
+            ct);
+
+    /// <summary>
+    /// Sends the message to <paramref name="chatId"/>, with the buttons of
+    /// <paramref name="keyboard"/> under it, which is how the bot answers the chat that
+    /// asked: same splitting, same retries, same fallback to unparsed text as an alert,
+    /// because none of that has anything to do with who is being written to.
+    /// </summary>
+    /// <inheritdoc cref="SendAsync(string, CancellationToken)"/>
+    public Task SendAsync(
+        long chatId,
+        string message,
+        InlineKeyboard? keyboard = null,
+        CancellationToken ct = default) =>
+        SendAsync(message, chatId.ToString(CultureInfo.InvariantCulture), keyboard, ct);
+
+    /// <summary>
+    /// Tells Telegram the press was heard, which is what stops the little clock the
+    /// sender's client spins on the button. It is deliberately neither retried nor
+    /// reported: the answer to the press is already on its way through
+    /// <see cref="SendAsync(long, string, InlineKeyboard?, CancellationToken)"/>, and a
+    /// lost acknowledgement costs a spinner Telegram gives up on by itself — while
+    /// throwing here would cost the answer.
+    /// </summary>
+    public async Task AcknowledgeAsync(string callbackId, CancellationToken ct = default)
+    {
+        var url = $"https://api.telegram.org/bot{_options.Token}/answerCallbackQuery";
+        using var content = new FormUrlEncodedContent(
+            new Dictionary<string, string> { ["callback_query_id"] = callbackId });
+
+        try
+        {
+            using var response = await _http.PostAsync(url, content, ct);
+        }
+        catch (Exception e)
+            when (e is HttpRequestException
+                      or TaskCanceledException && !ct.IsCancellationRequested)
+        {
+        }
+    }
+
+    private async Task SendAsync(
+        string message, string chatId, InlineKeyboard? keyboard, CancellationToken ct)
     {
         var parts = Split(message, MaxMessageLength);
         for (var i = 0; i < parts.Count; i++)
@@ -134,7 +191,10 @@ public sealed class TelegramNotifier : INotificationChannel, IDisposable
                 await Task.Delay(PartDelay, ct);
             }
 
-            await PostAsync(parts[i], ct);
+            // The keyboard belongs to the message it is about, which is the last part of
+            // it: buttons halfway up a split answer would sit above the range they offer
+            // to take apart.
+            await PostAsync(parts[i], chatId, i == parts.Count - 1 ? keyboard : null, ct);
         }
     }
 
@@ -208,7 +268,8 @@ public sealed class TelegramNotifier : INotificationChannel, IDisposable
         return parts;
     }
 
-    private async Task PostAsync(string text, CancellationToken ct)
+    private async Task PostAsync(
+        string text, string chatId, InlineKeyboard? keyboard, CancellationToken ct)
     {
         var url = $"https://api.telegram.org/bot{_options.Token}/sendMessage";
         var delay = TimeSpan.FromSeconds(1);
@@ -227,7 +288,7 @@ public sealed class TelegramNotifier : INotificationChannel, IDisposable
             {
                 var form = new Dictionary<string, string>
                 {
-                    ["chat_id"] = _options.ChatId,
+                    ["chat_id"] = chatId,
                     ["text"] = text,
                     ["disable_web_page_preview"] = "true",
                 };
@@ -239,6 +300,14 @@ public sealed class TelegramNotifier : INotificationChannel, IDisposable
                 if (!_plainText)
                 {
                     form["parse_mode"] = "MarkdownV2";
+                }
+
+                // The buttons are markup of their own and survive the fallback above: a
+                // message Telegram would not parse is worth sending unparsed, and it is
+                // worth sending with the follow-ups it was going to offer.
+                if (keyboard is not null)
+                {
+                    form["reply_markup"] = keyboard.ToJson();
                 }
 
                 using var content = new FormUrlEncodedContent(form);
