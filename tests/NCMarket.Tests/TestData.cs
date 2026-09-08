@@ -48,6 +48,11 @@ internal sealed class TempDatabase : IDisposable
 internal static class TestData
 {
     /// <summary>A listing with plausible defaults; override only what the test is about.</summary>
+    /// <param name="optionStats">
+    /// lib9c <c>StatType</c> values the crafting options rolled. Passing any of them also
+    /// gives the piece its base stat, which is what a real listing carries and what a
+    /// valuation key has to leave out.
+    /// </param>
     public static ItemProduct Product(
         int itemId = 10100000,
         int level = 0,
@@ -56,7 +61,11 @@ internal static class TestData
         int grade = 3,
         int itemSubType = (int)EquipmentType.Ring,
         int optionCount = 1,
-        Guid? productId = null) =>
+        Guid? productId = null,
+        int elementalType = 0,
+        int[]? optionStats = null,
+        bool hasSkill = false,
+        bool byCustomCraft = false) =>
         new()
         {
             ProductId = productId ?? Guid.NewGuid(),
@@ -66,14 +75,37 @@ internal static class TestData
             ItemSubType = itemSubType,
             Level = level,
             CombatPoint = combatPoint,
+            ElementalType = elementalType,
             Price = price,
             Quantity = 1m,
             UnitPrice = price,
             OptionCountFromCombination = optionCount,
+            ByCustomCraft = byCustomCraft,
+            StatModels = BuildStats(optionStats),
+            SkillModels = hasSkill
+                ? new List<SkillModel> { new() { SkillId = 100000, Chance = 35 } }
+                : new List<SkillModel>(),
             SellerAgentAddress = "0xagent",
             SellerAvatarAddress = "0xavatar",
             RegisteredBlockIndex = 1,
         };
+
+    /// <summary>
+    /// The stats of a piece: the base stat of the item, which no option rolled, followed
+    /// by one additional stat per option.
+    /// </summary>
+    private static List<StatModel> BuildStats(int[]? optionStats)
+    {
+        if (optionStats is null)
+        {
+            return new List<StatModel>();
+        }
+
+        var stats = new List<StatModel> { new() { Type = 2, Value = 39548, Additional = false } };
+        stats.AddRange(optionStats.Select(
+            type => new StatModel { Type = type, Value = 1974, Additional = true }));
+        return stats;
+    }
 
     /// <summary>
     /// Creates a snapshot, fills it and marks it complete. Defaults to a full capture of

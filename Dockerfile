@@ -29,4 +29,13 @@ RUN chown -R $APP_UID:$APP_UID /data
 USER $APP_UID
 
 ENTRYPOINT ["/usr/local/bin/entrypoint"]
+
+# Default invariato: il container resta vivo e aspetta gli Scheduled Task. Il bot
+# e' un processo lungo e potrebbe essere il processo del container, ma allora un
+# token sbagliato o un 409 lo farebbero uscire, e con lui se ne andrebbe il
+# container in cui gli Scheduled Task entrano via `docker exec`.
+#
+# La stessa immagine fa quindi due ruoli, scelti da NCMARKET_ROLE (vedi
+# docker/entrypoint): 'idle' per la risorsa dei job, 'bot' per quella del bot. Un
+# comando esplicito (`docker run <immagine> snapshot ...`) vince su entrambi.
 CMD ["idle"]

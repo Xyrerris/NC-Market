@@ -45,12 +45,22 @@ sezione P3. Il resto dei prossimi passi è invariato.
 resta il primo dei prossimi passi; gli altri due sono estensioni. Ripulita anche la
 lista dei branch: restano `main` e `feature/docker-deploy`.
 
+**Aggiornato il 2026-09-04**: chiusa la nuova sezione P4 — "quanto vale questo pezzo?"
+chiesto al bot Telegram — nelle sue cinque voci, che erano le cinque fasi di
+`PIANO-VALUTAZIONE.md`: il piano è stato ripiegato qui alla chiusura dell'ultima, come
+prevedeva, e il file è sparito perché due copie delle stesse decisioni divergono. Il
+progetto ora riceve su Telegram e non solo annuncia. Da 177 a 343 test. I prossimi passi
+sono stati riscritti: P4.1 ha chiuso la metà "filtri" del vecchio punto 2, e le tre cose
+che la v1 di P4 non fa sono diventate voci a sé.
+
 Legenda priorità:
 
 - **P0** — bug che corrompono i dati o li nascondono; da fare prima di aggiungere feature.
 - **P1** — limiti concettuali del motore di valutazione; è qui che sta il valore.
 - **P2** — infrastruttura e debito tecnico; abilitano il lavoro successivo.
 - **P3** — quello che il motore, una volta corretto, permette di fare.
+- **P4** — la stessa domanda posta al contrario: non "cosa conviene comprare" su tutto il
+  mercato, ma "quanto vale questo", su un pezzo solo e da chi ce l'ha in mano.
 
 ---
 
@@ -665,15 +675,439 @@ ragionata e non una taratura.
 
 ---
 
+## P4 — Quanto vale questo pezzo?
+
+Fino a P3.1 il progetto parlava su Telegram in una direzione sola: `TelegramNotifier` fa
+`POST` su `sendMessage` e non c'era niente che ricevesse. Un chatbot riceve, ed è quello
+il salto architetturale di questa sezione — non la stima, che è una query.
+
+La feature è nata come piano a cinque fasi del 2026-08-25 (`PIANO-VALUTAZIONE.md`,
+ripiegato qui alla chiusura dell'ultima), eseguite una per volta: i filtri del servizio, il
+motore, il parser, il bot, i bottoni. Si scrive al bot il pezzo come lo si legge
+sull'oggetto, a righe libere:
+
+```
+Transcendent          rarità (nome o 1-8)
+Sword Fire            tipo + elemento
++7                    livello, facoltativo, default +0
+ATK 1.404.374         opzioni, 1-4
+DEF 3.359.312
+skill si              facoltativo, default no
+CP 151.216.255        facoltativo
+```
+
+e la risposta è l'eco di come è stato letto più l'intervallo di prezzo dei comparabili,
+con sotto i bottoni che lo aprono.
+
+### Cosa dicono i dati (misure del 2026-08-25 su 40.408 inserzioni heimdall)
+
+Quattro fatti misurati e non dedotti. Ogni decisione di P4.2 e P4.3 discende da uno di
+questi, ed è il motivo per cui la misura è venuta prima del codice.
+
+**1. La terna (tipo, grado, elemento) identifica l'item ai gradi 7 e 8.** Verificato su
+tutti e cinque i sottotipi: `Transcendent Sword Fire` è `item_id` 10181000 e nient'altro.
+Ai gradi ≤6 la stessa terna copre fino a 3 `item_id` (57 terne su 167), quindi lì il
+bucket accorpa varianti diverse dello stesso grado e la risposta deve dirlo. È il motivo
+per cui l'elemento è obbligatorio: senza, al grado 8 si mescolano cinque item con prezzi
+su scale diverse.
+
+**2. `option_count` non è ricostruibile da ciò che l'utente vede.** Su 15.099 weapon,
+4.646 (31%) hanno `option_count` maggiore delle opzioni visibili — il caso tipico è
+`option_count = 4` con 2 stat aggiuntive e 1 skill (3.402 righe): due tiri sono caduti
+sulla stessa stat e il servizio li restituisce fusi in una riga sola. Conseguenza: la
+valutazione **non può usare `BaselineKey`**, che su `OptionCount` è costruita.
+
+**3. La chiave proposta partiziona bene.** Bucketizzando su
+`(tipo, grado, elemento, livello, insieme delle stat-opzione, skill sì/no)`: 2.167 bucket,
+**94,2% delle inserzioni in un bucket con ≥5 comparabili** (91,3% guardando i soli gradi
+≥6). Il livello si può non chiedere: il 92% delle inserzioni è `+0`.
+
+**4. Dentro un bucket, il prezzo non segue né il CP né il valore delle opzioni.**
+Correlazione di rango nei bucket più popolati di grado ≥6: da `-0,42` a `+0,03`. Il bucket
+dell'esempio — Transcendent Sword, ATK+DEF, con skill — ha 7 comparabili tra 11 e 333 NCG,
+mediana 41. **Da qui la risposta a intervallo**: un numero solo su questa dispersione
+sarebbe una precisione inventata.
+
+### Il vincolo che nessuna fase risolve
+
+Il database aveva **2 snapshot presi a 3 minuti di distanza**. Nessuna sparizione è
+osservabile, quindi la popolazione `sold` non esiste e si valuta sui prezzi *richiesti*.
+Le cinque voci costruiscono il meccanismo; la qualità della stima la costruisce
+`snapshot-job` girando per settimane. Per questo il bot dichiara su cosa sta rispondendo a
+**ogni** messaggio, e non una volta nella documentazione.
+
+### P4.1 — I filtri del market service erano citati, non provati ✅ FATTO
+
+**Dove**: [src/NCMarket.Core/MarketClient.cs](src/NCMarket.Core/MarketClient.cs),
+[src/NCMarket.Core/ListingFilter.cs](src/NCMarket.Core/ListingFilter.cs),
+[src/NCMarket.Core/IMarketListingSource.cs](src/NCMarket.Core/IMarketListingSource.cs),
+[src/NCMarket.Cli/CommandLine.cs](src/NCMarket.Cli/CommandLine.cs),
+[src/NCMarket.Cli/Program.cs](src/NCMarket.Cli/Program.cs),
+[src/NCMarket.Cli/HelpText.cs](src/NCMarket.Cli/HelpText.cs)
+
+Era il punto 2 dei prossimi passi, e viene per primo perché sblocca la metà della risposta
+che è disponibile subito. Il bot ha due domande da soddisfare, con disponibilità opposte:
+*quanto lo chiedono adesso?* si risponde dal mercato live dal primo giorno, *quanto vale?*
+dallo storico dopo settimane di snapshot. Senza filtro per `itemIds[]` la prima costa la
+paginazione di un sottotipo intero — ~60.000 inserzioni per le sole Weapon su Odin — cioè
+non è una risposta di chat.
+
+Il primo compito era una **verifica**, non un'implementazione: accertare con una chiamata
+reale a `b.9capi.com` la forma che il servizio accetta per i parametri di collezione, che
+il README citava dalla documentazione e non da una prova. Utile che sia stata fatta per
+prima, perché due presupposti su tre erano sbagliati.
+
+| Parametro | Esito |
+|---|---|
+| `itemIds` | funziona, **ripetuto una volta per valore** |
+| `iconIds` | funziona, stessa forma |
+| `isCustom` | funziona, ma non insieme agli id |
+| `stat` | **inerte**, non esposto |
+
+- la forma `itemIds[]=1` che il README citava riceve `200` ed è **ignorata**: la risposta è
+  l'intero listino con l'aspetto di una risposta filtrata. `itemIds=1,2` invece è un `422`.
+  Delle due forme sbagliate, una si nota subito e l'altra mai;
+- `stat` non restringe nulla in nessuna forma provata — per nome, per valore numerico di
+  `StatType`, sotto `statType` o `stats` — e `stat=PIPPO` riceve `200` col listino intero.
+  Non viene esposto: un'opzione che non si applica in silenzio è ciò che P0.4 esiste per
+  impedire, quindi `fetch --stat` è un errore e non un filtro;
+- `isCustom=true` **sovrascrive** `itemIds` e `iconIds`: chiesti insieme, gli id
+  spariscono. `itemIds=10181000` da solo dà l'item 10181000; con `isCustom=true` dà
+  20160003 e 20160004. La combinazione viene rifiutata da `ListingFilter.Validate` prima di
+  raggiungere la rete. `isCustom=false` con gli id si combina regolarmente.
+
+**Fatto**: `fetch --item-ids`, `--icon-ids`, `--custom true|false`; il filtro viaggia su
+ogni pagina della paginazione; l'intestazione di `fetch` dichiara il restringimento
+applicato, perché una risposta filtrata che si legge come una intera è lo stesso errore in
+cui il servizio cade da sé.
+
+**Verificato da**: `MarketClientTests` — forma esatta della query string col parametro
+ripetuto, `isCustom=false` che raggiunge l'URL invece di essere assenza di filtro, id e
+custom craft insieme rifiutati senza che parta la richiesta, id e `isCustom=false` come
+coppia valida, filtro su ogni pagina. `CommandLineTests` — le nuove opzioni di `fetch`,
+`--stat` rifiutata per nome. Provato anche end-to-end sul servizio reale.
+
+### P4.2 — Una chiave fatta di ciò che si legge sull'oggetto ✅ FATTO
+
+**Dove**: [src/NCMarket.Core/ElementalType.cs](src/NCMarket.Core/ElementalType.cs) (nuovo),
+[src/NCMarket.Core/Valuation.cs](src/NCMarket.Core/Valuation.cs) (nuovo),
+[src/NCMarket.Core/ValuationService.cs](src/NCMarket.Core/ValuationService.cs) (nuovo),
+[src/NCMarket.Core/MarketDb.cs](src/NCMarket.Core/MarketDb.cs)
+
+È il valore vero della feature e non dipende da Telegram: si sviluppa e si verifica
+interamente con `dotnet test`. `ValuationKey` è `BaselineKey` vista da **fuori** dal
+servizio, e ogni differenza discende da chi sta chiedendo: niente `ItemId`, perché chi
+scrive al bot non lo conosce (fatto 1); niente `OptionCount`, che non è ricostruibile
+(fatto 2), ma l'insieme dei *tipi* di stat delle opzioni, che è ciò che si legge
+sull'oggetto; il `Grade`, che in `BaselineKey` è deliberatamente assente perché lì è una
+proprietà dell'`item_id` e non partizionerebbe nulla, mentre qui l'`item_id` non c'è. I
+*valori* delle opzioni non entrano nella chiave: non predicono il prezzo (fatto 4), e
+servono a collocare il pezzo dentro l'intervallo.
+
+Il **custom craft** è nella chiave, ed è un risultato di P4.1: un pezzo da custom craft ha
+un item id suo (gamma `2016…`/`2046…`) ma condivide sottotipo, grado ed elemento con quelli
+ordinari, e nel database sono **55 le terne che contengono entrambe le popolazioni** — 55
+bucket che senza quel campo accorperebbero due item diversi.
+
+Con meno di `min-samples` comparabili (default 5, la soglia di `deals`) il servizio allarga
+di un passo e **registra quale**:
+
+| # | Bucket | Come si dichiara |
+|---|---|---|
+| 0 | chiave esatta | — |
+| 1 | senza elemento | *stimato su tutti gli elementi* |
+| 2 | livelli accorpati | *livelli diversi accorpati* |
+| 3 | stesso numero di opzioni invece dello stesso insieme | *opzioni diverse dalle tue* |
+| 4 | solo tipo + grado + skill | *stima larga* |
+
+Oltre il passo 4 si risponde "non ho abbastanza dati", che è una risposta: un intervallo
+inventato su due campioni è peggio del silenzio, perché sembra uguale a uno buono.
+`ValuationResult` non ha un campo "prezzo stimato", e non averlo nel tipo è ciò che
+impedisce a un chiamante di inventarselo.
+
+**Fatto**: `ElementalType` col parser costruito invertendo `GameEnums.ElementalTypeName`;
+`ValuationKey` con uguaglianza strutturale scritta a mano — il compilatore confronterebbe
+l'insieme delle stat per riferimento, e due chiavi fatte delle stesse opzioni diventerebbero
+due bucket senza che niente lo mostri; `MarketDb.GetComparables` con l'indice
+`ix_listings_valuation`, stretto perché di filtro e non di copertura (`stats_json` va letto
+dalla tabella comunque), e con la SQL che porta solo i predicati effettivamente chiesti,
+perché `$p IS NULL OR col = $p` non è sargable e la scala ne toglie uno alla volta. Tre
+decisioni che il piano lasciava aperte:
+
+- **il passo 2 accorpa i livelli, non li riporta a +0.** Confrontare un +7 con dei +0 non è
+  allargare il bucket, è cambiarlo. Ogni passo toglie un predicato e contiene quello prima:
+  è ciò che rende la scala una scala e permette al passo, da solo, di dire cosa è stato
+  lasciato cadere;
+- **il ripiego su `Listed` avviene prima di allargare, non dopo.** L'ordine inverso è la
+  lettura naturale — prima il bucket, poi la popolazione — ed è sbagliato oggi e per un
+  pezzo: con due snapshot nessuna inserzione risulta conclusa, quindi ogni domanda
+  riceverebbe una *stima larga* mentre il bucket esatto sta lì inutilizzato. Prezzi
+  richiesti del pezzo giusto dicono più di vendite di un pezzo all'incirca simile;
+- **la chiave nel risultato è il pezzo come è stato descritto**, non il bucket misurato:
+  una `ValuationKey` non sa dire "qualunque elemento". A dirlo è il passo, e i due insieme
+  nominano il bucket esattamente.
+
+Una **misura ha cambiato la query**, ed è lo stesso genere di errore di P2.7. Con la
+finestra temporale scritta per esteso, `EXPLAIN QUERY PLAN` risponde `SEARCH listings USING
+INDEX ix_listings_baseline (planet=? AND last_seen_at_utc>?)`: `ix_listings_valuation` non
+viene mai usato e la valutazione visita una per una tutte le inserzioni recenti del
+pianeta, perché né il grado né l'elemento stanno in quell'indice. Il termine viaggia quindi
+come `+last_seen_at_utc >= $since` — il più unario lo tiene fuori dalla scelta dell'indice
+senza toccarne il valore — così vincono le cinque uguaglianze e la finestra si applica
+sulle poche righe rimaste. Nessun risultato sbagliato lo avrebbe segnalato.
+
+**Verificato da**: `ValuationServiceTests` — bucket esatto sufficiente, i quattro passi
+presi uno alla volta solo quando servono e sempre riportati con la loro dichiarazione,
+esaurimento della scala che risponde `InsufficientData` senza intervallo, `Sold` misurato
+quando i campioni bastano e ripiego su `Listed` dichiarato al passo esatto quando non
+bastano, percentile con e senza CP, opzioni/skill/custom craft che tengono fuori dal bucket
+una pila di inserzioni care, un altro pianeta che non è un passo della scala.
+`ValuationKeyTests` — la stat base che non è un'opzione, la stessa stat tirata due volte che
+è una sola, uguaglianza e hash strutturali. `MarketDbTests` — comparabili raccolti per
+terna, filtro sulle opzioni dal JSON, finestra temporale, e il piano di query che passa da
+`ix_listings_valuation` e non da `ix_listings_baseline`. `ElementalsTests` — nomi, valori
+lib9c, e i nomi parsati che sono quelli mostrati.
+
+### P4.3 — Dal messaggio libero alla richiesta ✅ FATTO
+
+**Dove**: [src/NCMarket.Core/ValuationRequestParser.cs](src/NCMarket.Core/ValuationRequestParser.cs) (nuovo),
+[src/NCMarket.Core/ValuationMessage.cs](src/NCMarket.Core/ValuationMessage.cs) (nuovo)
+
+L'unica parte della valutazione che legge qualcosa scritto da una persona, e sta in `Core`
+senza conoscere Telegram: è una funzione da testo a `ValuationQuery`, quindi ogni messaggio
+storto che deve sopravvivere è uno unit test e non una sessione di bot.
+
+**Si classificano i token, non le righe.** L'ordine libero era la richiesta; classificare
+per token la soddisfa e in più fa funzionare `Sword Fire` sulla stessa riga e tutto il
+pezzo su una riga sola, che è come si scrive da un telefono. Quattro regole sono decisioni
+e non meccanica: i separatori delle migliaia si ignorano dentro un numero, perché
+`1.404.374` è quello che il gioco mostra e nessuno lo riscrive; gli alias delle stat
+derivano da `GameEnums.StatTypeName` letto all'indietro, così una stat aggiunta a lib9c
+domani è parsabile oggi; un numero nudo è un errore e non un'ipotesi, perché
+`Grades.TryParse` accetta `"8"` e un `8` isolato diventerebbe in silenzio *Transcendent*;
+l'elemento mancante è un errore e non un ripiego silenzioso, perché quel ripiego esiste ma
+è il passo 1 della scala, che si sceglie col bottone di P4.5 e non per distrazione.
+
+**L'eco dell'interpretazione** è di questa voce, non della presentazione. Su testo libero
+una lettura sbagliata non produce un errore visibile: produce la valutazione di un altro
+pezzo, giusta in tutto tranne che nel pezzo. Una riga costa quasi niente e rende visibile
+ogni errore di lettura — lo stesso principio di P0.4, dove `deals --dicount 30` è un errore
+e non un filtro che non si applica.
+
+**Fatto**: `ValuationRequestParser.TryParse(messaggio, pianeta, out query, out errore)`,
+nella forma che `CommandLine.TryParse` usa già — un messaggio storto è un errore che nomina
+il token, non un'eccezione da catturare nel ciclo di polling — e `ValuationMessage.Echo`.
+Sei decisioni che il piano lasciava aperte:
+
+- **il pianeta è un parametro, non un token.** Il messaggio descrive un pezzo, non dove
+  cercarlo: il pianeta lo sa la chat, e sull'altro ci si sposta col bottone di P4.5 senza
+  riscrivere niente;
+- **l'eco chiama il tipo `Weapon`, non `Sword`.** Un'eco che restituisce la parola di chi
+  scrive non conferma niente, e `Sword` suggerirebbe per giunta che l'item è stato
+  identificato — cioè esattamente ciò che una valutazione senza `item_id` non può fare;
+- **i numeri escono nel formato del progetto**, `CP 151,216,255`, non in quello del gioco da
+  cui sono entrati. Il parser accetta tutte e tre le grafie perché è il gioco a mostrarne
+  una; l'eco ne stampa una sola, la stessa di un alert e di un CSV;
+- **zero opzioni è un pezzo, non un errore.** Rifiutarlo per intercettare le righe di
+  opzione che non sono arrivate rifiuterebbe anche la domanda legittima: a distinguere i due
+  casi è l'eco, che scrive *senza opzioni*;
+- **`skill` da solo vale sì, e un sì/no isolato si lega in avanti**, così `con skill` — le
+  parole con cui l'eco stessa lo dice — si può rimandare indietro come correzione. Un'eco
+  che non si può rimandare indietro è una conversazione a senso unico;
+- **il valore di una stat è facoltativo.** Serve a essere consumato — è ciò che impedisce a
+  `1.404.374` di ricadere nella regola del numero nudo — ma non entra nella chiave e viene
+  buttato: `ATK DEF HIT` descrive lo stesso bucket, e rifiutarlo sarebbe chiedere dati che
+  non vengono usati.
+
+**Verificato da**: `ValuationRequestParserTests` — messaggio d'esempio letto campo per
+campo, ordine delle righe invertito, tutto su una riga, separatori nelle tre forme, valore
+dell'opzione consumato e buttato, alias e sinonimi (compreso uno preso da `GameEnums` e mai
+scritto nel parser), le grafie del sì/no, custom craft, stessa stat due volte, pezzo senza
+opzioni, `Normal` che riempie il campo ancora libero, elemento assente respinto nominando
+gli elementi, numero nudo respinto nominando i tre modi in cui poteva essere scritto, campo
+risposto due volte respinto invece che sovrascritto, messaggio vuoto che riceve un esempio.
+`ValuationMessageTests` — l'eco per intero, i campi mai scritti che ci sono lo stesso, il
+tipo che è `Weapon` e non l'alias, il CP che rientra nella grafia del progetto da tutte e
+tre le sue.
+
+### P4.4 — Il verbo `bot` ✅ FATTO
+
+**Dove**: [src/NCMarket.Core/TelegramBot.cs](src/NCMarket.Core/TelegramBot.cs) (nuovo),
+[src/NCMarket.Core/TelegramUpdateSource.cs](src/NCMarket.Core/TelegramUpdateSource.cs) (nuovo),
+[src/NCMarket.Core/TelegramNotifier.cs](src/NCMarket.Core/TelegramNotifier.cs),
+[src/NCMarket.Cli/Program.cs](src/NCMarket.Cli/Program.cs),
+[Dockerfile](Dockerfile)
+
+È infrastruttura: nessuna decisione sulla stima, tutte le decisioni su cosa succede quando
+il processo sta in piedi per giorni e chiunque può scrivergli. **Long polling, non
+webhook**, per la stessa ragione per cui una notifica è una `POST`: nessun indirizzo
+pubblico, nessuna porta in ingresso, nessun certificato. Un `409` significa due processi
+sullo stesso token — tipicamente un redeploy che ha lasciato vivo il vecchio container — e
+va riconosciuto e detto, non ritentato finché uno dei due vince a caso.
+
+**L'allowlist è obbligatoria**, e sostituisce la chat di destinazione invece di
+affiancarla: `NCMARKET_TELEGRAM_CHAT_ID` non vuol dire niente per un bot che risponde a chi
+scrive, quindi `TelegramOptions.ChatId` è diventato facoltativo e `TelegramNotifier` ha
+imparato a scrivere a una chat data — una sola implementazione di `sendMessage`, stesso
+spezzettamento, stessi tentativi, stesso ripiego senza `parse_mode`. Nell'altro verso è
+obbligatoria: senza `NCMARKET_TELEGRAM_ALLOWED_CHATS` il comando esce con codice 2
+all'avvio, perché un bot in ascolto risponde a chiunque ne trovi lo username e ogni
+messaggio è una query su SQLite. I messaggi dalle altre chat sono ignorati **in silenzio**;
+"non sei autorizzato" conferma che il bot esiste e invita a insistere.
+
+**Fatto**: `ncmarket bot`, `TelegramUpdateSource` e `TelegramBot`. Le decisioni che il
+piano lasciava aperte:
+
+- **il database si apre per messaggio e si richiude**, invece che in sola lettura. Le due
+  strade che il piano indicava non erano equivalenti: read-only non regge, perché l'offset è
+  una scrittura ed è proprio lo stato che il bot deve conservare, e `DbLock` è peggio del
+  problema che risolve, perché metterebbe le domande in coda dietro a uno snapshot da trenta
+  minuti — una risposta che non arriva è indistinguibile da un bot fermo. Aprire e chiudere
+  intorno a ogni messaggio costa millisecondi su una cosa che parte da una persona, lascia
+  il `VACUUM` libero, e la domanda che capita proprio lì dentro riceve "riprova fra qualche
+  secondo" invece di far cadere il processo;
+- **l'offset avanza anche sui messaggi a cui non si risponde**: chat fuori allowlist,
+  messaggi oltre il limite di frequenza, aggiornamenti senza testo, e perfino quelli la cui
+  gestione è finita in eccezione. Un messaggio letto è un messaggio consumato: l'alternativa
+  è che uno solo blocchi la coda per sempre;
+- **il limite di frequenza spiega il silenzio una volta per finestra**, poi tace. La
+  risposta a troppi messaggi non può essere altri messaggi, ma un silenzio senza causa fa
+  riscrivere;
+- **il testo della risposta è di questa voce, non della successiva.** "Rispondere con l'eco
+  e l'intervallo" non si può fare senza dire l'intervallo: `ValuationMessage.Answer` scrive
+  minimo, mediana e massimo, i comparabili, la popolazione, la finestra, il passo di
+  allargamento quando c'è e il percentile quando il CP è stato dato.
+
+Il modello di deploy è cambiato, ma **non** nel modo che il piano dava per scontato. Il
+piano diceva che il bot "diventa il comando di default dell'immagine"; farlo legherebbe i
+job al bot, perché un processo lungo che esce su `409` o su un token rifiutato porterebbe
+via il container in cui gli Scheduled Task entrano con `docker exec` — un problema di
+credenziali Telegram fermerebbe gli snapshot, che con Telegram non c'entrano niente. Il
+default resta `idle`, e la stessa immagine fa due ruoli scelti da `NCMARKET_ROLE`, in due
+risorse distinte sullo stesso volume: WAL, `busy_timeout` e il lock su `<database>.lock`
+valgono fra processi e quindi anche fra container. Ctrl+C e SIGTERM sono lo stesso ordine —
+l'uno di una persona, l'altro di Docker — e in entrambi i casi il ciclo esce dopo aver
+scritto l'offset dell'ultimo messaggio risposto.
+
+**Verificato da**: `TelegramBotTests` su un `HttpMessageHandler` finto, come già fa
+`TelegramNotifierTests` — pezzo risposto con eco e intervallo, chat fuori allowlist ignorata
+senza risposta ma con l'offset avanzato, offset scritto e riletto da un secondo processo che
+riparte da lì, `409` riportato senza ritentare e senza il token nel messaggio, limite di
+frequenza con un solo avviso, dispatch dei comandi compresa la menzione `/valuta@NomeDelBot`
+di un gruppo, errore del parser che diventa un messaggio mentre il ciclo prosegue,
+aggiornamento senza testo che avanza l'offset in silenzio, errore di rete ritentato invece
+che fatale, allowlist assente che non fa partire il bot. `ValuationMessageTests` — il testo
+della risposta per intero, il passo di allargamento dichiarato, il percentile assente senza
+CP, i dati insufficienti che dicono quanto hanno trovato e non danno alcun prezzo.
+`CommandLineTests` — le opzioni di `bot`, e le credenziali che non sono opzioni.
+
+### P4.5 — Flusso guidato e follow-up ✅ FATTO
+
+**Dove**: [src/NCMarket.Core/InlineKeyboard.cs](src/NCMarket.Core/InlineKeyboard.cs) (nuovo),
+[src/NCMarket.Core/ValuationCallback.cs](src/NCMarket.Core/ValuationCallback.cs) (nuovo),
+[src/NCMarket.Core/TelegramBot.cs](src/NCMarket.Core/TelegramBot.cs),
+[src/NCMarket.Core/TelegramUpdateSource.cs](src/NCMarket.Core/TelegramUpdateSource.cs),
+[src/NCMarket.Core/TelegramNotifier.cs](src/NCMarket.Core/TelegramNotifier.cs),
+[src/NCMarket.Core/ValuationMessage.cs](src/NCMarket.Core/ValuationMessage.cs),
+[src/NCMarket.Core/Valuation.cs](src/NCMarket.Core/Valuation.cs),
+[src/NCMarket.Core/ValuationService.cs](src/NCMarket.Core/ValuationService.cs)
+
+Il testo libero è il percorso veloce per chi ha preso la mano. `/valuta` senza argomenti
+apre quello guidato: rarità, tipo, elemento e skill coi bottoni — quattro campi su sei senza
+possibilità di sbagliarli — e restano da scrivere solo le opzioni, o nemmeno quelle. Sotto
+ogni risposta stanno i comparabili su cui l'intervallo è costruito (un `11 – 333 NCG` senza
+dettaglio è inutilizzabile; col dettaglio si vede subito che i 333 sono un fuori scala e la
+mediana no), la stessa stima senza elemento e l'altro pianeta.
+
+**Fatto**: `InlineKeyboard` porta i bottoni e il loro `reply_markup`, `ValuationCallback`
+porta cosa dicono, `TelegramUpdateSource` si è iscritto anche ai `callback_query` — un tipo
+di aggiornamento lasciato fuori da `allowed_updates` non è un errore, è silenzio — e
+`TelegramNotifier` ha imparato `reply_markup` e `answerCallbackQuery`. Cinque decisioni che
+il piano lasciava aperte:
+
+- **lo stato per chat sta in memoria, ma i bottoni no.** Il piano diceva "lo stato per chat
+  sta in memoria" e vale per la conversazione, che è una cosa che sta succedendo adesso e che
+  un riavvio può legittimamente perdere. Non vale per un bottone: un messaggio resta sul
+  telefono per settimane, e un bottone che rispondesse "non me lo ricordo più" sarebbe un
+  bottone rotto. Quindi ogni bottone di follow-up **porta con sé la domanda intera** —
+  pianeta, chiave, CP e gradino di partenza in una cinquantina di caratteri, dentro i 64 byte
+  che Telegram concede a `callback_data` — e il bot non conserva niente per rispondergli.
+  Restano fuori campioni minimi, finestra e popolazione: sono configurazione del bot in
+  esecuzione, non proprietà del pezzo;
+- **"senza elemento" è un campo della richiesta, non un secondo metodo.** `ValuationQuery`
+  ha ora `StartStep`, e `ValuationService` salta i gradini sotto quello chiesto invece di
+  usare una scala diversa: un allargamento scelto e uno subìto danno lo stesso identico
+  risultato, e `ValuationResult.Step` resta l'unica cosa che dichiara dov'è stata misurata
+  la stima;
+- **il flusso guidato non costruisce una `ValuationKey`**: riscrive ciò che è stato premuto
+  come il messaggio che una persona avrebbe scritto e lo dà allo stesso parser. C'è una sola
+  lettura di un pezzo in questo progetto, e l'eco che torna indietro è la stessa per entrambe
+  le strade. Da qui anche il caso che il piano non nominava: se durante il flusso arriva un
+  pezzo scritto per intero, vince il pezzo scritto — rispondere "due rarità" a un messaggio
+  perfettamente buono si legge come un bot rotto, non come un bot che aspettava;
+- **la conversazione scade** dopo mezz'ora. È l'unica cosa nel bot che cambia il significato
+  di un messaggio qualunque, e una conversazione dimenticata la settimana scorsa
+  impacchetterebbe il messaggio di oggi dentro il pezzo di allora;
+- **il testo passa da `MarkdownV2.Escape` frase per frase**, non più in un colpo solo alla
+  fine: l'italiano è pieno di punti e parentesi, e un `\` dimenticato non produce un
+  messaggio brutto, produce **nessun** messaggio. Le entità restano dentro la riga, che è ciò
+  che permette a `TelegramNotifier.Split` di tagliare un elenco lungo fra due righe qualsiasi
+  — la stessa invariante di P3.1.
+
+Una pressione viene confermata (`answerCallbackQuery`) **prima** della query sul database e
+prima del limite di frequenza: la conferma non è la risposta, è ciò che dice al telefono che
+il bottone è stato sentito, e se fallisce viene registrata e lasciata cadere, perché costa
+una rotella che gira e non una valutazione.
+
+**Verificato da**: `TelegramBotTests` — il giro completo del flusso guidato (quattro
+pressioni e una riga di opzioni, con le conferme), l'ultimo passo chiuso col bottone
+"nessuna opzione", i bottoni di una risposta premuti da un **secondo processo** sullo stesso
+database, "senza elemento" che dichiara l'allargamento e poi non si ripropone, l'altro
+pianeta che offre la strada di ritorno, un bottone di una versione precedente che viene
+nominato, una conversazione persa che lo dice, un pezzo scritto durante il flusso che vince,
+un comando che chiude il flusso. `ValuationCallbackTests` — andata e ritorno della domanda
+coi suoi campi facoltativi, il pezzo più largo che sta nei 64 byte, dodici forme di dati che
+nessuno qui ha scritto e che vengono rifiutate, i due vocabolari che non rispondono l'uno per
+l'altro. `ValuationMessageTests` — eco e risposta col loro markup per intero, l'elenco dei
+comparabili dal più economico, il taglio oltre venti con quanti ne restano, il bucket vuoto,
+e l'invariante che nessuna entità attraversa un a capo. `ValuationServiceTests` — la scala
+presa da un gradino più in alto.
+
+### Cosa la v1 non fa
+
+**L'affinamento sul valore delle opzioni.** I dati non lo giustificano (fatto 4) e ci sono
+due snapshot: prima si accumula storico, poi si rimisura la correlazione, e solo se compare
+si aggiunge un modello. Nel frattempo il percentile è informazione onesta a costo zero —
+dice dov'è il pezzo nel gruppo, non quanto vale.
+
+**Il riconoscimento dell'item ai gradi bassi.** Sotto il grado 7 la terna copre più varianti
+(fatto 1): la risposta lo dichiara e basta. Chiedere il nome dell'item per un pezzo da 1 NCG
+non conviene a nessuno.
+
+**La valutazione da `product_id`.** Un `/valuta <product-id>` per un pezzo già a mercato
+salterebbe il parser per intero e risponderebbe alla domanda opposta — *conviene comprarlo?*
+— a costo quasi nullo ora che P4.1 e P4.2 ci sono. È un'aggiunta, non un prerequisito: sta
+qui perché è la prima cosa da fare dopo, non perché manchi qualcosa alla v1.
+
+**Il rischio che resta aperto** è quello che nessuna di queste voci poteva chiudere: lo
+storico corto. Finché `snapshot-job` non ha girato per settimane la stima vale quanto un
+listino, e l'unica difesa è che il bot dichiari popolazione, campioni e finestra a ogni
+risposta — cosa che fa.
+
+---
+
 ## Prossimi passi
 
 | # | Intervento | Costo | Perché in questa posizione |
 |---|---|---|---|
-| 1 | Taratura di `--sale-margin` su dati reali | basso | La soglia di default (20%) è una scelta ragionata, non una misura: con qualche giorno di snapshot si può verificare come si sposta la composizione della popolazione. Si accumula da sé mentre il job di notifica di P3.1 gira |
-| 2 | Filtri avanzati API (`stat`, `itemIds[]`, `isCustom`) + output `--json` | basso | Già in roadmap; il JSON abilita la dashboard |
-| 3 | Mediana + MAD, o vendite on-chain via 9cscan/mimir | medio-alto | I due modi di migliorare ancora la stima, ora che la popolazione è quella giusta |
+| 1 | Taratura di `--sale-margin` su dati reali | basso | La soglia di default (20%) è una scelta ragionata, non una misura: con qualche giorno di snapshot si può verificare come si sposta la composizione della popolazione. Si accumula da sé mentre i job di P3.1 e le domande al bot di P4 girano |
+| 2 | `/valuta <product-id>` per un pezzo già a mercato | basso | Salta il parser per intero e risponde alla domanda opposta — *conviene comprarlo?* — riusando P4.1 e P4.2 così come sono |
+| 3 | Output `--json` dei comandi di lettura | basso | Resto del vecchio punto 2, di cui P4.1 ha chiuso la metà dei filtri; abilita la dashboard |
+| 4 | Rimisura della correlazione fra opzioni e prezzo | basso | È la condizione che il fatto 4 di P4 pone all'affinamento della stima: si rifà quando lo storico è lungo, e solo se compare qualcosa si aggiunge un modello |
+| 5 | Mediana + MAD, o vendite on-chain via 9cscan/mimir | medio-alto | I due modi di migliorare ancora la stima, ora che la popolazione è quella giusta |
 
 Con P1.1 chiuso non restano interventi che cambiano la correttezza del motore, con P2.7 il
-debito è chiuso e con P3.1 il risultato arriva a destinazione: il punto 1 è una misura da
-fare sui dati veri — e adesso i dati si accumulano da soli, perché `snapshot-job` e
-`deals-job` girano sul server — gli altri due sono estensioni.
+debito è chiuso, con P3.1 il risultato arriva a destinazione e con P4 si può chiedere il
+prezzo di un pezzo che si ha in mano. Quello che resta dipende quasi tutto dal tempo: il
+punto 1 e il punto 4 sono misure da fare sui dati veri, e i dati si accumulano da soli
+perché `snapshot-job` e `deals-job` girano sul server. Gli altri sono estensioni.
