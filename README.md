@@ -402,13 +402,21 @@ che lo circonda in un modo che il testo semplice non permette. Ogni inserzione o
 quattro righe — cosa è, com'è fatta, quanto costa, perché è a buon mercato — e una riga 🔎
 dichiara i filtri quando ce ne sono.
 
+La riga di *com'è fatta* porta anche l'**elemento** e la **skill**, che sono parte di cosa
+il pezzo è e non un dettaglio: lo stesso item in `Fire` e in `Normal` sono due oggetti con
+due prezzi, e il bucket contro cui lo sconto è misurato (item + livello + opzioni) non
+separa né l'uno né l'altra — chi legge lo vede solo se il messaggio lo dice. L'elemento c'è
+sempre, `Normal` compreso; la skill solo quando c'è, e segnalarla basta: quale sia e con
+che probabilità scatti è roba da `fetch --details`, non da una notifica che si decide in
+pochi secondi.
+
 ```
 🏷️ *NC\-Market* — 2 nuove occasioni su `heimdall`
 🔎 Ring · rarità Legendary · storico dal 2026\-08\-14
 _Sconto ≥ 25% sulla mediana delle inserzioni concluse per item \+ livello \+ opzioni \(campioni ≥ 5\)_
 
 *1\. Guardian Ring \+7*
-Ring · grado 5 · 4 opzioni · CP `12,450`
+Ring · Fire · grado 5 · 4 opzioni · con skill · CP `12,450`
 💰 `142.50 NCG` — sconto `41.2%` su NCG/CP \(`38.0%` sul prezzo\)
 📊 `87` CP/NCG vs mediana `148` su `12` inserzioni
 ```
