@@ -17,9 +17,15 @@ public sealed class DealMessageTests
     /// 1.000 CP. With a combat point the comparison is on NCG/CP, without one it falls
     /// back to the plain price, which is the distinction the message has to carry.
     /// </summary>
-    private static Deal Deal(decimal price = 50m, int combatPoint = 1000)
+    private static Deal Deal(
+        decimal price = 50m,
+        int combatPoint = 1000,
+        int elementalType = (int)ElementalType.Normal,
+        bool hasSkill = false)
     {
-        var product = TestData.Product(price: price, combatPoint: combatPoint);
+        var product = TestData.Product(
+            price: price, combatPoint: combatPoint,
+            elementalType: elementalType, hasSkill: hasSkill);
         var priceDiscount = (1 - (double)price / 100) * 100;
         var usesCp = combatPoint > 0;
         var pricePerCp = usesCp ? (double)price / combatPoint : (double?)null;
@@ -64,7 +70,7 @@ public sealed class DealMessageTests
             "\\+ opzioni \\(campioni ≥ 5\\)_\n" +
             "\n" +
             "*1\\. 10100000 \\+0*\n" +
-            "Ring · grado 3 · 1 opzione · CP `1,000`\n" +
+            "Ring · Normal · grado 3 · 1 opzione · CP `1,000`\n" +
             "💰 `50.00 NCG` — sconto `50.0%` su NCG/CP \\(`50.0%` sul prezzo\\)\n" +
             "📊 `20` CP/NCG vs mediana `10` su `12` inserzioni\n",
             text);
@@ -79,6 +85,37 @@ public sealed class DealMessageTests
         Assert.Contains("nessun CP confrontabile", text, StringComparison.Ordinal);
         Assert.Contains("📊 mediana `100.00 NCG`", text, StringComparison.Ordinal);
         Assert.DoesNotContain("CP/NCG", text, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Elemento e skill sono parte di cosa è il pezzo, non un dettaglio: lo stesso item
+    /// in Fire e in Normal sono due oggetti con due prezzi, e il bucket contro cui lo
+    /// sconto è misurato non separa né l'uno né l'altra — chi legge lo vede solo se il
+    /// messaggio lo dice. L'elemento c'è sempre, la skill solo quando c'è.
+    /// </summary>
+    [Fact]
+    public void The_element_is_always_said_and_a_skill_when_there_is_one()
+    {
+        var deal = Deal(elementalType: (int)ElementalType.Fire, hasSkill: true);
+
+        var text = DealMessage.Format(new[] { deal }, Query(), NameProvider.Empty, 10);
+
+        Assert.Contains(
+            "Ring · Fire · grado 3 · 1 opzione · con skill · CP `1,000`",
+            text, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Un pezzo senza skill non dice niente: "senza skill" su ogni inserzione sarebbe una
+    /// parola ripetuta finché non la si legge più, e la segnalazione si legge di corsa.
+    /// </summary>
+    [Fact]
+    public void A_listing_without_a_skill_says_nothing_about_skills()
+    {
+        var text = DealMessage.Format(new[] { Deal() }, Query(), NameProvider.Empty, 10);
+
+        Assert.Contains("Ring · Normal · grado 3", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("skill", text, StringComparison.Ordinal);
     }
 
     [Fact]

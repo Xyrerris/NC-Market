@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using NCMarket.Core.Models;
 
 namespace NCMarket.Core;
 
@@ -90,11 +91,29 @@ public static class DealMessage
           .Append(" \\+").Append(p.Level.ToString(Culture))
           .Append("*\n");
 
+        // The element sits next to the type because the two together are what the piece
+        // is: at grades 7 and 8 they determine the item id, and below they are still the
+        // first thing read off the object. It is written for every listing, Normal
+        // included — a field left out when its value is the common one reads like a field
+        // that could not be filled in.
         sb.Append(MarkdownV2.Escape(((EquipmentType)p.ItemSubType).ToString()))
+          .Append(" · ")
+          .Append(MarkdownV2.Escape(GameEnums.ElementalTypeName(p.ElementalType)))
           .Append(" · grado ").Append(p.Grade.ToString(Culture))
           .Append(" · ").Append(p.OptionCountFromCombination.ToString(Culture))
-          .Append(p.OptionCountFromCombination == 1 ? " opzione" : " opzioni")
-          .Append(" · CP ").Append(MarkdownV2.Code(p.CombatPoint.ToString("N0", Culture)))
+          .Append(p.OptionCountFromCombination == 1 ? " opzione" : " opzioni");
+
+        // A skill is announced, not described: which one it is and how often it fires need
+        // the skill names, and they take more room than an alert meant to be decided on in
+        // a few seconds can spend. Said only when there is one — "senza skill" on every
+        // other listing would be a word repeated until it stops being read, and the bucket
+        // this discount is measured against does not separate the two anyway.
+        if (p.SkillModels.Count > 0)
+        {
+            sb.Append(" · con skill");
+        }
+
+        sb.Append(" · CP ").Append(MarkdownV2.Code(p.CombatPoint.ToString("N0", Culture)))
           .Append('\n');
 
         sb.Append("💰 ")

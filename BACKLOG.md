@@ -647,6 +647,17 @@ caratteri — e il ripiego del canale: a un `400` di parsing il testo riparte se
 `parse_mode`, perché qualche backslash a vista costa meno di una segnalazione persa che
 nessuna esecuzione successiva recupera.
 
+**Cosa sta nella riga di com'è fatta.** Tipo, elemento, grado, opzioni, skill, CP. Elemento
+e skill ci sono per una ragione che il resto della riga non ha: il bucket contro cui lo
+sconto è misurato è `(item, livello, opzioni)` e non separa né l'uno né l'altra, quindi
+sono esattamente i due campi che un pezzo può avere diversi dai suoi comparabili senza che
+la cifra dello sconto lo dica. L'elemento è scritto sempre, `Normal` compreso — un campo
+che sparisce quando vale la cosa più comune si legge come un campo che non si è riusciti a
+riempire — mentre la skill è scritta solo quando c'è: "senza skill" su ogni inserzione
+sarebbe una parola ripetuta finché non la si legge più. Ed è segnalata, non descritta: quale
+sia e con che probabilità scatti vuole i nomi delle skill, che l'alert non carica, e righe
+che una notifica decisa in pochi secondi non ha.
+
 **Il prezzo**: `deals` diventa un comando che scrive, cosa che prima non era. La scrittura
 è una `INSERT` per occasione e non prende il lock del database — prenderlo vorrebbe dire
 serializzare contro il job di snapshot anche i minuti del download, che avvengono prima —
@@ -660,8 +671,9 @@ registrate, ricerca senza risposta, ricerca senza occasioni), `TelegramNotifierT
 casi: destinazione e corpo della richiesta, `parse_mode` dichiarato, ripiego senza markup
 su un rifiuto di parsing e nessun ripiego su un rifiuto di altro tipo, rifiuto definitivo
 non ritentato e senza token nel messaggio, taglio del messaggio sopra i 4096 caratteri e
-invio di tutte le parti, lettura delle credenziali), `DealMessageTests` (6 casi: contenuto,
-layout per intero, ripiego sul prezzo senza CP confrontabile, occasioni contate e non
+invio di tutte le parti, lettura delle credenziali), `DealMessageTests` (8 casi: contenuto,
+layout per intero, elemento ed eventuale skill nella riga del pezzo, silenzio sulla skill
+quando non c'è, ripiego sul prezzo senza CP confrontabile, occasioni contate e non
 elencate, filtri dichiarati, nome item sfuggito), `MarkdownV2Tests` (3 casi: caratteri
 speciali, testo che non ne ha, entità code) e due casi in `MarketDbTests` per la retention
 delle segnalazioni e l'idempotenza della registrazione.
