@@ -655,8 +655,8 @@ bool TryGetGrades(out HashSet<int>? grades)
         if (!Grades.TryParse(token, out var grade))
         {
             Console.Error.WriteLine(
-                $"Rarità non valida: '{token}'. Valori ammessi: 1-8 oppure " +
-                "normal, rare, epic, unique, legendary, divinity, mythic, transcendent.");
+                $"Rarità non valida: '{token}'. Valori ammessi: 1-9 oppure " +
+                "normal, rare, epic, unique, legendary, divinity, mythic, transcendent, ultimate.");
             return false;
         }
 

@@ -293,8 +293,8 @@ dotnet run --project src/NCMarket.Cli -- deals --sale-margin 10
 # finestra --days per avere abbastanza campioni
 dotnet run --project src/NCMarket.Cli -- deals --type ring --from-snapshot --min-samples 3 --days 14
 
-# Solo le rarità indicate (numero 1-8 o nome lib9c: normal, rare, epic, unique,
-# legendary, divinity, mythic, transcendent)
+# Solo le rarità indicate (numero 1-9 o nome lib9c: normal, rare, epic, unique,
+# legendary, divinity, mythic, transcendent, ultimate)
 dotnet run --project src/NCMarket.Cli -- deals --grade legendary,mythic
 
 # Segnalazione su Telegram delle sole occasioni mai notificate prima: è la forma che

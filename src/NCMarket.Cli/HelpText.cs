@@ -54,9 +54,9 @@ internal static class HelpText
           deals      Occasioni: inserzioni correnti sotto la mediana storica del
                      database (metrica primaria: NCG per punto CP, per item+livello+opzioni)
                        --type <tipo>         filtro opzionale (default: tutti i tipi)
-                       --grade <g[,g...]>    filtro rarità: 1-8 o normal, rare, epic,
+                       --grade <g[,g...]>    filtro rarità: 1-9 o normal, rare, epic,
                                              unique, legendary, divinity, mythic,
-                                             transcendent (default: tutte)
+                                             transcendent, ultimate (default: tutte)
                        --discount <pct>      sconto minimo percentuale (0-100), default: 25
                        --min-samples <n>     inserzioni storiche minime per confronto, default: 5
                        --days <n>            finestra storica in giorni (default: tutto lo storico)

@@ -687,7 +687,7 @@ motore, il parser, il bot, i bottoni. Si scrive al bot il pezzo come lo si legge
 sull'oggetto, a righe libere:
 
 ```
-Transcendent          rarità (nome o 1-8)
+Transcendent          rarità (nome o 1-9)
 Sword Fire            tipo + elemento
 +7                    livello, facoltativo, default +0
 ATK 1.404.374         opzioni, 1-4

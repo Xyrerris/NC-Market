@@ -313,7 +313,7 @@ public static class ValuationRequestParser
             else
             {
                 error = $"Non ho riconosciuto '{token}'. Mi aspetto la rarità " +
-                        "(Normal…Transcendent), il tipo (Weapon, Armor, Belt, Necklace, " +
+                        "(Normal…Ultimate), il tipo (Weapon, Armor, Belt, Necklace, " +
                         "Ring), l'elemento (Normal, Fire, Water, Land, Wind), le opzioni " +
                         "col loro valore ('ATK 1.404.374'), e se vuoi '+7', 'skill si', " +
                         "'custom craft si', 'CP 151.216.255'.";
@@ -324,7 +324,7 @@ public static class ValuationRequestParser
         var missing = new List<string>(3);
         if (grade is null)
         {
-            missing.Add("la rarità (Normal…Transcendent, oppure 1-8)");
+            missing.Add("la rarità (Normal…Ultimate, oppure 1-9)");
         }
 
         if (type is null)
