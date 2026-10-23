@@ -134,7 +134,7 @@ public sealed class ValuationMessageTests
     public void A_rarity_without_a_name_is_shown_by_its_number()
     {
         Assert.StartsWith(
-            "🏷️ Ho letto: *grado 9 Weapon*", ValuationMessage.Echo(Query(grade: 9)),
+            "🏷️ Ho letto: *grado 10 Weapon*", ValuationMessage.Echo(Query(grade: 10)),
             StringComparison.Ordinal);
     }
 

@@ -180,7 +180,7 @@ public sealed class ValuationCallbackTests
                 g.ToString(), ValuationCallback.Encode(DialogField.Grade, (int)g))),
             perRow: 3);
 
-        Assert.Equal(new[] { 3, 3, 2 }, keyboard.Rows.Select(r => r.Count));
+        Assert.Equal(new[] { 3, 3, 3 }, keyboard.Rows.Select(r => r.Count));
         Assert.Equal(Grades.All.Length, keyboard.Buttons.Count());
         Assert.Contains("\"inline_keyboard\"", keyboard.ToJson(), StringComparison.Ordinal);
     }

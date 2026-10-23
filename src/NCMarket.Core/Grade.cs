@@ -13,6 +13,7 @@ public enum Grade
     Divinity = 6,
     Mythic = 7,
     Transcendent = 8,
+    Ultimate = 9,
 }
 
 public static class Grades
@@ -27,11 +28,12 @@ public static class Grades
         Grade.Divinity,
         Grade.Mythic,
         Grade.Transcendent,
+        Grade.Ultimate,
     };
 
     /// <summary>
     /// Parses a grade from a name ("normal", "rare", ..., "divine" as an alias of
-    /// "divinity") or its numeric value (1-8).
+    /// "divinity") or its numeric value (1-9).
     /// </summary>
     public static bool TryParse(string text, out Grade grade)
     {
@@ -69,6 +71,10 @@ public static class Grades
             case "transcendent":
             case "8":
                 grade = Grade.Transcendent;
+                return true;
+            case "ultimate":
+            case "9":
+                grade = Grade.Ultimate;
                 return true;
             default:
                 grade = default;
