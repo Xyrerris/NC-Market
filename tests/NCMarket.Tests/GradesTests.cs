@@ -18,6 +18,7 @@ public sealed class GradesTests
     [InlineData("divine", Grade.Divinity)]
     [InlineData("mythic", Grade.Mythic)]
     [InlineData("transcendent", Grade.Transcendent)]
+    [InlineData("ultimate", Grade.Ultimate)]
     public void A_name_names_its_grade(string text, Grade expected)
     {
         Assert.True(Grades.TryParse(text, out var grade));
@@ -53,7 +54,7 @@ public sealed class GradesTests
     [InlineData("   ")]
     [InlineData("common")]
     [InlineData("0")]
-    [InlineData("9")]
+    [InlineData("10")]
     [InlineData("-1")]
     public void What_is_not_a_grade_is_refused_and_leaves_nothing_behind(string text)
     {
